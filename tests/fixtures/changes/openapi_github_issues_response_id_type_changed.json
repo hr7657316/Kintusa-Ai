@@ -1,0 +1,35 @@
+{
+  "name": "openapi_github_issues_response_id_type_changed",
+  "display_name": null,
+  "event": {
+    "source_id": "33333333-3333-4333-8333-333333333333",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "type_changed",
+        "path": "/paths/~1repos~1{owner}~1{repo}~1issues/get/responses/200/content/application~1json/schema/items/properties/id",
+        "before": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "after": {
+          "type": "string"
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "type_change"
+  },
+  "rule_hits_expected": [
+    "type_changed"
+  ],
+  "affected_paths_expected": [
+    "GET /repos/{owner}/{repo}/issues"
+  ]
+}

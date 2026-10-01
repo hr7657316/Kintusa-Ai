@@ -1,0 +1,28 @@
+{
+  "name": "openapi_github_servers_url_changed_text_only",
+  "display_name": null,
+  "event": {
+    "source_id": "33333333-3333-4333-8333-333333333333",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/servers/0/url",
+        "before": "https://api.github.com",
+        "after": "https://api.github.com/v4"
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "unknown",
+    "category": "behaviour"
+  },
+  "rule_hits_expected": [
+    "text_only"
+  ],
+  "note": "a base URL change is not something the rules decide; the model sees it"
+}

@@ -1,0 +1,325 @@
+# Seeded sources for the hosted watcher (python -m kintsua.seed).
+#
+# Every openapi / discovery / changelog URL below returned HTTP 200 on 2026-10-01 and every
+# public MCP server answered `initialize` + `tools/list` without credentials. MCP servers
+# that require OAuth are listed with `meta.auth_env`: set that environment variable to a
+# bearer token on the worker and they are polled too; until then they fail with a clear
+# "environment variable X is not set" error and back off.
+#
+# Fields: kind (openapi|mcp|pypi|npm|changelog), locator, display_name, vendor,
+#         poll_interval_s (optional; defaults: mcp 6h, openapi 24h, pypi/npm 6h, changelog 24h),
+#         meta (adapter hints: format, headers, auth_env, transport, args, env, quiet, paid).
+
+sources:
+  # ---------------------------------------------------------------- OpenAPI specs
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json
+    display_name: Stripe API (OpenAPI 3)
+    vendor: stripe
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json
+    display_name: GitHub REST API (OpenAPI 3)
+    vendor: github
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/slackapi/slack-api-specs/master/web-api/slack_web_openapi_v2.json
+    display_name: Slack Web API (OpenAPI)
+    vendor: slack
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/twilio/twilio-oai/main/spec/json/twilio_api_v2010.json
+    display_name: Twilio API v2010 (OpenAPI 3)
+    vendor: twilio
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/twilio/twilio-oai/main/spec/json/twilio_messaging_v1.json
+    display_name: Twilio Messaging v1 (OpenAPI 3)
+    vendor: twilio
+  - kind: openapi
+    locator: https://developer.atlassian.com/cloud/jira/platform/swagger-v3.v3.json
+    display_name: Jira Cloud Platform REST API v3
+    vendor: atlassian
+  - kind: openapi
+    locator: https://developer.atlassian.com/cloud/confluence/swagger.v3.json
+    display_name: Confluence Cloud REST API
+    vendor: atlassian
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/HEAD/PublicApiSpecs/CRM/Contacts/Rollouts/424/v3/contacts.json
+    display_name: HubSpot CRM Contacts v3
+    vendor: hubspot
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/HEAD/PublicApiSpecs/CRM/Companies/Rollouts/424/v3/companies.json
+    display_name: HubSpot CRM Companies v3
+    vendor: hubspot
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/HubSpot/HubSpot-public-api-spec-collection/HEAD/PublicApiSpecs/CRM/Deals/Rollouts/424/v3/deals.json
+    display_name: HubSpot CRM Deals v3
+    vendor: hubspot
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/openai/openai-openapi/manual_spec/openapi.yaml
+    display_name: OpenAI API (OpenAPI 3)
+    vendor: openai
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/discord/discord-api-spec/main/specs/openapi.json
+    display_name: Discord API (OpenAPI 3)
+    vendor: discord
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/digitalocean/openapi/main/specification/DigitalOcean-public.v2.yaml
+    display_name: DigitalOcean API v2
+    vendor: digitalocean
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/PagerDuty/api-schema/main/reference/REST/openapiv3.json
+    display_name: PagerDuty REST API
+    vendor: pagerduty
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/box/box-openapi/main/openapi.json
+    display_name: Box Platform API
+    vendor: box
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/plaid/plaid-openapi/master/2020-09-14.yml
+    display_name: Plaid API
+    vendor: plaid
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/asana/openapi/master/defs/asana_oas.yaml
+    display_name: Asana API
+    vendor: asana
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/intercom/Intercom-OpenAPI/main/descriptions/2.11/api.intercom.io.yaml
+    display_name: Intercom API 2.11
+    vendor: intercom
+  - kind: openapi
+    locator: https://api.supabase.com/api/v1-json
+    display_name: Supabase Management API
+    vendor: supabase
+  - kind: openapi
+    locator: https://raw.githubusercontent.com/APIs-guru/openapi-directory/main/APIs/slack.com/1.7.0/openapi.yaml
+    display_name: Slack Web API (APIs.guru mirror)
+    vendor: slack
+
+  # ------------------------------------------------- Google Workspace discovery docs
+  - kind: openapi
+    locator: https://www.googleapis.com/discovery/v1/apis/drive/v3/rest
+    display_name: Google Drive API v3 (discovery)
+    vendor: google
+    meta: {format: discovery}
+  - kind: openapi
+    locator: https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest
+    display_name: Gmail API v1 (discovery)
+    vendor: google
+    meta: {format: discovery}
+  - kind: openapi
+    locator: https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest
+    display_name: Google Calendar API v3 (discovery)
+    vendor: google
+    meta: {format: discovery}
+  - kind: openapi
+    locator: https://www.googleapis.com/discovery/v1/apis/sheets/v4/rest
+    display_name: Google Sheets API v4 (discovery)
+    vendor: google
+    meta: {format: discovery}
+  - kind: openapi
+    locator: https://www.googleapis.com/discovery/v1/apis/docs/v1/rest
+    display_name: Google Docs API v1 (discovery)
+    vendor: google
+    meta: {format: discovery}
+  - kind: openapi
+    locator: https://www.googleapis.com/discovery/v1/apis/youtube/v3/rest
+    display_name: YouTube Data API v3 (discovery)
+    vendor: google
+    meta: {format: discovery}
+
+  # ---------------------------------------------------------------- Changelog pages
+  - kind: changelog
+    locator: https://developers.notion.com/page/changelog
+    display_name: Notion API changelog
+    vendor: notion
+  - kind: changelog
+    locator: https://linear.app/changelog
+    display_name: Linear changelog
+    vendor: linear
+  - kind: changelog
+    locator: https://shopify.dev/docs/api/release-notes
+    display_name: Shopify API release notes
+    vendor: shopify
+  - kind: changelog
+    locator: https://shopify.dev/changelog
+    display_name: Shopify developer changelog
+    vendor: shopify
+  - kind: changelog
+    locator: https://docs.stripe.com/changelog
+    display_name: Stripe API changelog
+    vendor: stripe
+  - kind: changelog
+    locator: https://api.slack.com/changelog
+    display_name: Slack platform changelog
+    vendor: slack
+  - kind: changelog
+    locator: https://developers.hubspot.com/changelog
+    display_name: HubSpot developer changelog
+    vendor: hubspot
+  - kind: changelog
+    locator: https://docs.github.com/en/rest/overview/breaking-changes
+    display_name: GitHub REST API breaking changes
+    vendor: github
+  - kind: changelog
+    locator: https://developer.atlassian.com/cloud/jira/platform/changelog/
+    display_name: Jira Cloud Platform changelog
+    vendor: atlassian
+  - kind: changelog
+    locator: https://www.twilio.com/en-us/changelog
+    display_name: Twilio changelog
+    vendor: twilio
+  - kind: changelog
+    locator: https://platform.openai.com/docs/changelog
+    display_name: OpenAI API changelog
+    vendor: openai
+  - kind: changelog
+    locator: https://docs.claude.com/en/release-notes/api
+    display_name: Claude Platform API release notes
+    vendor: anthropic
+  - kind: changelog
+    locator: https://modelcontextprotocol.io/specification/2025-11-25/changelog
+    display_name: MCP specification changelog
+    vendor: modelcontextprotocol
+  - kind: changelog
+    locator: https://developers.google.com/gmail/api/release-notes
+    display_name: Gmail API release notes
+    vendor: google
+
+  # --------------------------------------------------- Remote MCP servers (public)
+  - kind: mcp
+    locator: https://mcp.deepwiki.com/mcp
+    display_name: DeepWiki MCP
+    vendor: deepwiki
+  - kind: mcp
+    locator: https://docs.mcp.cloudflare.com/mcp
+    display_name: Cloudflare Docs MCP
+    vendor: cloudflare
+  - kind: mcp
+    locator: https://mcp.context7.com/mcp
+    display_name: Context7 MCP
+    vendor: context7
+  - kind: mcp
+    locator: https://huggingface.co/mcp
+    display_name: Hugging Face MCP
+    vendor: huggingface
+  - kind: mcp
+    locator: https://mcp.exa.ai/mcp
+    display_name: Exa Search MCP
+    vendor: exa
+  - kind: mcp
+    locator: https://mcp.grep.app
+    display_name: grep.app MCP
+    vendor: grep
+  - kind: mcp
+    locator: https://mcp.firecrawl.dev/mcp
+    display_name: Firecrawl MCP
+    vendor: firecrawl
+
+  # ------------------------------------------- Remote MCP servers (OAuth / token)
+  - kind: mcp
+    locator: https://mcp.linear.app/mcp
+    display_name: Linear MCP
+    vendor: linear
+    meta: {auth_env: LINEAR_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.notion.com/mcp
+    display_name: Notion MCP
+    vendor: notion
+    meta: {auth_env: NOTION_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.stripe.com
+    display_name: Stripe MCP
+    vendor: stripe
+    meta: {auth_env: STRIPE_MCP_TOKEN}
+  - kind: mcp
+    locator: https://api.githubcopilot.com/mcp/
+    display_name: GitHub MCP (Copilot)
+    vendor: github
+    meta: {auth_env: GITHUB_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.sentry.dev/mcp
+    display_name: Sentry MCP
+    vendor: sentry
+    meta: {auth_env: SENTRY_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.atlassian.com/v1/mcp
+    display_name: Atlassian Rovo MCP
+    vendor: atlassian
+    meta: {auth_env: ATLASSIAN_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.semgrep.ai/mcp
+    display_name: Semgrep MCP
+    vendor: semgrep
+    meta: {auth_env: SEMGREP_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.hubspot.com/anthropic
+    display_name: HubSpot MCP
+    vendor: hubspot
+    meta: {auth_env: HUBSPOT_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.paypal.com/mcp
+    display_name: PayPal MCP
+    vendor: paypal
+    meta: {auth_env: PAYPAL_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.cloudflare.com/mcp
+    display_name: Cloudflare MCP
+    vendor: cloudflare
+    meta: {auth_env: CLOUDFLARE_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.supabase.com/mcp
+    display_name: Supabase MCP
+    vendor: supabase
+    meta: {auth_env: SUPABASE_MCP_TOKEN}
+  - kind: mcp
+    locator: https://mcp.vercel.com
+    display_name: Vercel MCP
+    vendor: vercel
+    meta: {auth_env: VERCEL_MCP_TOKEN}
+
+  # ------------------------------------------------------- Stdio MCP servers
+  - kind: mcp
+    locator: npx -y @modelcontextprotocol/server-filesystem /tmp
+    display_name: MCP filesystem server (stdio)
+    vendor: modelcontextprotocol
+    meta: {transport: stdio, quiet: true, timeout_s: 180}
+  - kind: mcp
+    locator: npx -y @modelcontextprotocol/server-everything
+    display_name: MCP everything server (stdio)
+    vendor: modelcontextprotocol
+    meta: {transport: stdio, quiet: true, timeout_s: 180}
+  - kind: mcp
+    locator: uvx mcp-server-fetch
+    display_name: MCP fetch server (stdio)
+    vendor: modelcontextprotocol
+    meta: {transport: stdio, quiet: true, timeout_s: 180}
+
+  # ------------------------------------------------------------------ PyPI
+  - {kind: pypi, locator: openai, display_name: openai (PyPI), vendor: openai}
+  - {kind: pypi, locator: anthropic, display_name: anthropic (PyPI), vendor: anthropic}
+  - {kind: pypi, locator: stripe, display_name: stripe (PyPI), vendor: stripe}
+  - {kind: pypi, locator: slack_sdk, display_name: slack_sdk (PyPI), vendor: slack}
+  - {kind: pypi, locator: twilio, display_name: twilio (PyPI), vendor: twilio}
+  - {kind: pypi, locator: hubspot-api-client, display_name: hubspot-api-client (PyPI), vendor: hubspot}
+  - {kind: pypi, locator: notion-client, display_name: notion-client (PyPI), vendor: notion}
+  - {kind: pypi, locator: google-api-python-client, display_name: google-api-python-client (PyPI), vendor: google}
+  - {kind: pypi, locator: langchain, display_name: langchain (PyPI), vendor: langchain}
+  - {kind: pypi, locator: langgraph, display_name: langgraph (PyPI), vendor: langchain}
+  - {kind: pypi, locator: mcp, display_name: mcp (PyPI), vendor: modelcontextprotocol}
+  - {kind: pypi, locator: crewai, display_name: crewai (PyPI), vendor: crewai}
+  - {kind: pypi, locator: google-adk, display_name: google-adk (PyPI), vendor: google}
+  - {kind: pypi, locator: openai-agents, display_name: openai-agents (PyPI), vendor: openai}
+  - {kind: pypi, locator: PyGithub, display_name: PyGithub (PyPI), vendor: github}
+  - {kind: pypi, locator: jira, display_name: jira (PyPI), vendor: atlassian}
+
+  # ------------------------------------------------------------------- npm
+  - {kind: npm, locator: openai, display_name: openai (npm), vendor: openai}
+  - {kind: npm, locator: "@anthropic-ai/sdk", display_name: "@anthropic-ai/sdk (npm)", vendor: anthropic}
+  - {kind: npm, locator: stripe, display_name: stripe (npm), vendor: stripe}
+  - {kind: npm, locator: "@slack/web-api", display_name: "@slack/web-api (npm)", vendor: slack}
+  - {kind: npm, locator: "@modelcontextprotocol/sdk", display_name: "@modelcontextprotocol/sdk (npm)", vendor: modelcontextprotocol}
+  - {kind: npm, locator: "@notionhq/client", display_name: "@notionhq/client (npm)", vendor: notion}
+  - {kind: npm, locator: twilio, display_name: twilio (npm), vendor: twilio}
+  - {kind: npm, locator: "@linear/sdk", display_name: "@linear/sdk (npm)", vendor: linear}
+  - {kind: npm, locator: axios, display_name: axios (npm), vendor: axios}
+  - {kind: npm, locator: "@hubspot/api-client", display_name: "@hubspot/api-client (npm)", vendor: hubspot}
+  - {kind: npm, locator: "@octokit/rest", display_name: "@octokit/rest (npm)", vendor: github}
+  - {kind: npm, locator: "@shopify/shopify-api", display_name: "@shopify/shopify-api (npm)", vendor: shopify}

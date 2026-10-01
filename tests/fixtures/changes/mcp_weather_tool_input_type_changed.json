@@ -1,0 +1,42 @@
+{
+  "name": "mcp_weather_tool_input_type_changed",
+  "display_name": null,
+  "event": {
+    "source_id": "44444444-4444-4444-8444-444444444444",
+    "source_kind": "mcp",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "type_changed",
+        "path": "/tools/get_weather/inputSchema/properties/days",
+        "before": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 7
+        },
+        "after": {
+          "type": "string",
+          "enum": [
+            "1",
+            "3",
+            "7"
+          ]
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "type_change"
+  },
+  "rule_hits_expected": [
+    "type_changed"
+  ],
+  "affected_paths_expected": [
+    "tool:get_weather"
+  ],
+  "summary_contains": "days"
+}

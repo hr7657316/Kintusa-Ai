@@ -1,0 +1,120 @@
+{
+  "kind": "discovery#restDescription",
+  "discoveryVersion": "v1",
+  "id": "drive:v3",
+  "name": "drive",
+  "version": "v3",
+  "title": "Google Drive API",
+  "description": "The Google Drive API allows clients to access resources from Google Drive.",
+  "revision": "20260925",
+  "rootUrl": "https://www.googleapis.com/",
+  "servicePath": "drive/v3/",
+  "baseUrl": "https://www.googleapis.com/drive/v3/",
+  "auth": {
+    "oauth2": {
+      "scopes": {
+        "https://www.googleapis.com/auth/drive": {"description": "See, edit, create, and delete all of your Google Drive files"},
+        "https://www.googleapis.com/auth/drive.readonly": {"description": "See and download all your Google Drive files"}
+      }
+    }
+  },
+  "parameters": {
+    "fields": {"type": "string", "location": "query", "description": "Selector specifying which fields to include in a partial response."}
+  },
+  "schemas": {
+    "File": {
+      "id": "File",
+      "type": "object",
+      "description": "The metadata for a file.",
+      "properties": {
+        "id": {"type": "string", "description": "The ID of the file."},
+        "name": {"type": "string"},
+        "mimeType": {"type": "string"},
+        "size": {"type": "string", "format": "int64"},
+        "parents": {"type": "array", "items": {"type": "string"}},
+        "owners": {"type": "array", "items": {"$ref": "User"}}
+      }
+    },
+    "FileList": {
+      "id": "FileList",
+      "type": "object",
+      "properties": {
+        "files": {"type": "array", "items": {"$ref": "File"}},
+        "nextPageToken": {"type": "string"},
+        "kind": {"type": "string", "default": "drive#fileList"}
+      }
+    },
+    "User": {"id": "User", "type": "object", "properties": {"emailAddress": {"type": "string"}, "displayName": {"type": "string"}}}
+  },
+  "resources": {
+    "files": {
+      "methods": {
+        "list": {
+          "id": "drive.files.list",
+          "path": "files",
+          "flatPath": "files",
+          "httpMethod": "GET",
+          "description": "Lists the user's files.",
+          "parameters": {
+            "pageSize": {"type": "integer", "format": "int32", "location": "query", "minimum": "1", "maximum": "1000", "default": "100"},
+            "q": {"type": "string", "location": "query", "description": "A query for filtering the file results."},
+            "corpus": {"type": "string", "location": "query", "enum": ["domain", "user"], "enumDescriptions": ["Files shared to the user's domain.", "Files owned by or shared to the user."], "deprecated": true},
+            "spaces": {"type": "string", "location": "query", "repeated": true}
+          },
+          "parameterOrder": [],
+          "response": {"$ref": "FileList"},
+          "scopes": ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.readonly"]
+        },
+        "get": {
+          "id": "drive.files.get",
+          "path": "files/{fileId}",
+          "flatPath": "files/{fileId}",
+          "httpMethod": "GET",
+          "parameters": {
+            "fileId": {"type": "string", "location": "path", "required": true, "description": "The ID of the file."},
+            "acknowledgeAbuse": {"type": "boolean", "location": "query", "default": "false"}
+          },
+          "parameterOrder": ["fileId"],
+          "response": {"$ref": "File"},
+          "scopes": ["https://www.googleapis.com/auth/drive"]
+        },
+        "create": {
+          "id": "drive.files.create",
+          "path": "files",
+          "flatPath": "files",
+          "httpMethod": "POST",
+          "parameters": {"ignoreDefaultVisibility": {"type": "boolean", "location": "query"}},
+          "request": {"$ref": "File"},
+          "response": {"$ref": "File"},
+          "scopes": ["https://www.googleapis.com/auth/drive"]
+        }
+      },
+      "resources": {
+        "comments": {
+          "methods": {
+            "list": {
+              "id": "drive.files.comments.list",
+              "path": "files/{fileId}/comments",
+              "flatPath": "files/{fileId}/comments",
+              "httpMethod": "GET",
+              "parameters": {"fileId": {"type": "string", "location": "path", "required": true}},
+              "parameterOrder": ["fileId"],
+              "response": {"$ref": "FileList"}
+            }
+          }
+        }
+      }
+    },
+    "about": {
+      "methods": {
+        "get": {
+          "id": "drive.about.get",
+          "path": "about",
+          "flatPath": "about",
+          "httpMethod": "GET",
+          "response": {"$ref": "User"}
+        }
+      }
+    }
+  }
+}

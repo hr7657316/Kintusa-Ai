@@ -1,0 +1,31 @@
+{
+  "name": "openapi_stripe_charges_type_changed_generic_text",
+  "display_name": null,
+  "event": {
+    "source_id": "11111111-1111-4111-8111-111111111111",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/paths/~1v1~1charges/post/requestBody/content/application~1x-www-form-urlencoded/schema/properties/amount/type",
+        "before": "integer",
+        "after": "string"
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "type_change"
+  },
+  "rule_hits_expected": [
+    "type_changed"
+  ],
+  "affected_paths_expected": [
+    "POST /v1/charges"
+  ],
+  "note": "a generic key-wise diff reports the /type leaf as text_changed; the rules normalise it"
+}

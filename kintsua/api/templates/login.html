@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Kintsua{% endblock %}
+{% block content %}
+<section class="narrow">
+  <h1>Sign in with GitHub</h1>
+  {% if not configured %}
+  <div class="notice notice-warn">
+    <p><strong>GitHub sign-in is not configured on this server.</strong></p>
+    <p>Set <code>GITHUB_OAUTH_CLIENT_ID</code> and <code>GITHUB_OAUTH_CLIENT_SECRET</code> to the OAuth credentials of the Kintsua GitHub App and restart. The App's callback URL must be <code>{{ redirect_uri }}</code>.</p>
+    <p>No App yet? <a href="/setup/github">Create it in one click from the manifest</a>; the result page prints every variable to copy into <code>.env</code>.</p>
+  </div>
+  {% if dev_login %}
+  <form method="post" action="/auth/dev?next={{ next | urlencode }}">
+    <button class="button primary" type="submit">Dev login (DEV_LOGIN_INSTALLATION_ID)</button>
+  </form>
+  {% endif %}
+  {% else %}
+  <p><a class="button primary" href="/login?next={{ next | urlencode }}">Continue with GitHub</a></p>
+  {% endif %}
+  <p class="muted">A session is scoped to the GitHub App installations you can see. Kintsua asks for no org-member or email scopes.</p>
+</section>
+{% endblock %}

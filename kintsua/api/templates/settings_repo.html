@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.full_name }} · Kintsua{% endblock %}
+{% block content %}
+<p class="crumbs"><a href="/settings">Settings</a> / {{ org.name }}</p>
+<h1>{{ repo.full_name }}
+  <span class="badge plan-{{ org.plan }}">{{ org.plan }}</span>
+  {% if not repo.active %}<span class="badge grey">inactive</span>{% endif %}
+</h1>
+<p class="muted">
+  Default branch <code>{{ repo.default_branch }}</code>
+  {% if repo.indexed_at %} · indexed {{ repo.indexed_at | dt }}{% if depmap.head_sha %} at <code>{{ depmap.head_sha[:7] }}</code>{% endif %}{% else %} · not indexed yet{% endif %}
+  {% if repo.install_issue_number %} · <a href="https://github.com/{{ repo.full_name }}/issues/{{ repo.install_issue_number }}">install issue #{{ repo.install_issue_number }}</a>{% endif %}
+  · <a href="https://github.com/{{ repo.full_name }}">GitHub</a>
+</p>
+{% if depmap.index_error %}<div class="notice notice-error">Last index failed: {{ depmap.index_error }}</div>{% endif %}
+{% if depmap.config_error %}<div class="notice notice-warn">.kintsua.yml could not be parsed: {{ depmap.config_error }}</div>{% endif %}
+{% if billing_warning %}<div class="notice notice-warn">Billing: the last payment failed{% if billing_warning.hosted_invoice_url %} · <a href="{{ billing_warning.hosted_invoice_url }}">open the invoice</a>{% endif %}.</div>{% endif %}
+
+<section id="dependencies">
+  <h2>Dependency map
+    <span class="muted small">{{ depmap.totals.external }} external · {{ depmap.totals.call_sites }} call sites · <span class="badge watched">{{ depmap.totals.watched }} watched</span> <span class="badge unwatched">{{ depmap.totals.unwatched }} unwatched</span></span>
+  </h2>
+  <table class="depmap">
+    <thead><tr><th>Dependency</th><th>Kind</th><th>Vendor</th><th>Watch status</th><th class="num">Call sites</th></tr></thead>
+    <tbody>
+    {% for e in depmap.external %}
+    <tr class="{% if e.watched %}row-watched{% else %}row-unwatched{% endif %}">
+      <td><code>{{ e.name }}</code>{% if e.display_name and e.display_name != e.name %} <span class="muted">{{ e.display_name }}</span>{% endif %}{% if e.discovered_at_runtime %} <span class="badge grey" title="first seen by the runtime SDK">runtime</span>{% endif %}</td>
+      <td>{{ e.kind }}</td>
+      <td>{{ e.vendor or "" }}</td>
+      <td>{% if e.watched %}<span class="badge watched">watched</span> <span class="muted small">{{ e.source_kind }}{% if e.transport %} · {{ e.transport }}{% endif %}</span>{% else %}<span class="badge unwatched">unwatched</span>{% if e.kind == "http" %} <span class="muted small">no spec or changelog known for this host</span>{% endif %}{% endif %}</td>
+      <td class="num">{{ e.call_site_count }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">Nothing indexed yet. The dependency map lands within an hour of install, and on every push to <code>{{ repo.default_branch }}</code>.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if depmap.library %}
+  <details><summary>{{ depmap.library | length }} other declared package(s) that are not external APIs</summary>
+    <p class="muted">{% for e in depmap.library %}<code>{{ e.name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+  </details>
+  {% endif %}
+
+  <h3>Add a spec, changelog or MCP server</h3>
+  <p class="muted small">Point Kintsua at a source the indexer missed. It is polled right away and stored in this repo's configuration (same as <code>sources:</code> in <code>.kintsua.yml</code>).</p>
+  <form class="row" hx-post="/v1/repos/{{ repo.id }}/sources" hx-target="#source-notice" hx-swap="innerHTML">
+    <select name="kind">
+      <option value="openapi">OpenAPI spec URL</option>
+      <option value="changelog">Changelog page URL</option>
+      <option value="mcp">MCP server (URL or stdio command)</option>
+    </select>
+    <input type="text" name="url" placeholder="https://api.vendor.com/openapi.json" required>
+    <input type="text" name="display_name" placeholder="display name (optional)">
+    <input type="text" name="hosts" placeholder="hosts it covers, comma-separated (optional)">
+    <button class="button" type="submit">Watch it</button>
+  </form>
+  <div id="source-notice"></div>
+  {% if sources %}
+  <p class="muted small">Configured sources: {% for s in sources %}<code>{{ s.kind }}: {{ s.url or s.command }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Changes affecting this repo</h2>
+  {% if drafts %}
+  <div class="notice notice-warn">
+    {{ drafts | length }} draft issue(s) are waiting for review{% if not auto_issue %} (issues open automatically once <code>auto_issue</code> is on for this org){% endif %}.
+    <button class="button small" hx-post="/v1/repos/{{ repo.id }}/issues/open" hx-target="#changes" hx-swap="outerHTML" hx-confirm="Open a GitHub issue for every draft?">Open all drafts</button>
+  </div>
+  {% endif %}
+  {% include "partials/changes.html" %}
+</section>
+
+<section class="grid">
+  <div>
+    <h2>Mute rules</h2>
+    <p class="muted small">Patterns like <code>stripe:/v1/legacy/*</code>, <code>tool:get_*</code> or a bare vendor name. Open issues that a new rule fully covers are closed with a comment.</p>
+    {% include "partials/mutes.html" %}
+  </div>
+  <div>
+    <h2>Fix mode</h2>
+    {% include "partials/fix_mode.html" %}
+  </div>
+</section>
+
+<section class="grid">
+  <div>
+    <h2>Runtime SDK key</h2>
+    <p class="muted small">One key per org, shown once, stored hashed. Put it in <code>KINTSUA_KEY</code> and wrap your MCP session or HTTP client:</p>
+    <pre><code>{{ sdk_snippet }}</code></pre>
+    <div id="sdk-key">
+      {% if key.has_key %}
+      <p>Current key <code>{{ key.prefix }}…</code> created {{ key.created_at[:10] }}.</p>
+      <button class="button" hx-post="/v1/keys" hx-vals='{"org_id": "{{ org.id }}"}' hx-target="#sdk-key" hx-swap="outerHTML" hx-confirm="Rotate the key? Processes using the old key stop reporting.">Rotate key</button>
+      {% else %}
+      <p class="muted">No key yet.</p>
+      <button class="button primary" hx-post="/v1/keys" hx-vals='{"org_id": "{{ org.id }}"}' hx-target="#sdk-key" hx-swap="outerHTML">Create SDK key</button>
+      {% endif %}
+    </div>
+  </div>
+  <div>
+    <h2>.kintsua.yml</h2>
+    <p class="muted small">Optional, at the root of the repo. Everything on this page can also be set from the file (it wins on the next push).</p>
+    <pre><code>{{ kintsua_yml }}</code></pre>
+  </div>
+</section>
+
+<section class="grid">
+  <div>
+    <h2>Plan</h2>
+    <p>{{ org.name }} is on <strong>{{ org.plan }}</strong> with {{ watched }} watched integration(s).</p>
+    <p class="muted small">{{ pricing_line }}</p>
+    {% if billing_enabled and org.plan != "pro" %}
+    <button class="button primary" hx-post="/v1/billing/checkout" hx-vals='{"org_id": "{{ org.id }}"}' hx-swap="none">Upgrade to Pro</button>
+    {% endif %}
+  </div>
+  <div id="danger" class="danger">
+    <h2>Delete this repo's data</h2>
+    <p class="muted small">Removes every runtime event, call site, dependency and impact Kintsua holds for <code>{{ repo.full_name }}</code>. GitHub issues and PRs are not touched. The next push re-indexes from scratch.</p>
+    <button class="button danger" hx-delete="/v1/repos/{{ repo.id }}/data" hx-target="#danger" hx-swap="outerHTML" hx-confirm="Delete all runtime and index data for {{ repo.full_name }}? This cannot be undone.">Delete data</button>
+  </div>
+</section>
+{% endblock %}

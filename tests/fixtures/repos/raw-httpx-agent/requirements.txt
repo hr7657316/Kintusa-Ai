@@ -1,0 +1,4 @@
+# pinned for deploy
+-e .
+httpx>=0.27
+anthropic>=0.40
