@@ -90,6 +90,7 @@ ignore = ["E501", "B008", "SIM108", "B904", "SIM117", "SIM102", "B007"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not network'"  # live upstream checks run on demand: pytest -m network
 asyncio_mode = "auto"
 timeout = 300
 markers = [
