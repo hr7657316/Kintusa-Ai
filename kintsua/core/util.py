@@ -50,7 +50,8 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)sk-ant-[0-9a-zA-Z\-_]{20,}"),
     re.compile(r"(?i)sk-[0-9a-zA-Z]{20,}"),
     re.compile(
-        r"(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*[\"']?[^\s\"',}]{6,}"
+        r"(?i)(api[_-]?key|token|secret|password|authorization|client_secret|private_key)"
+        r"[\"']?\s*[:=]\s*(bearer\s+)?[\"']?[^\s\"',}]{6,}"
     ),
     re.compile(r"eyJ[0-9a-zA-Z_\-]{10,}\.[0-9a-zA-Z_\-]{10,}\.[0-9a-zA-Z_\-]{10,}"),
 ]

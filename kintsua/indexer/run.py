@@ -560,6 +560,13 @@ def index_repo(
         repo.last_indexed_sha = head
         repo.indexed_at = utcnow()
         repo.last_index_error = None
+        repo.index_stats = {
+            "files_parsed": extracted.stats.files_parsed,
+            "parse_errors": extracted.stats.parse_errors,
+            "head_sha": head,
+            "reason": reason,
+            "indexed_at": repo.indexed_at.isoformat(),
+        }
         for sid in resolved.new_source_ids:
             enqueue(
                 session, JOB_POLL_SOURCE, {"source_id": str(sid)}, dedupe_key=f"poll_source:{sid}"

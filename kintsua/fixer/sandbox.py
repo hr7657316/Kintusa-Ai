@@ -501,7 +501,11 @@ class LocalSandbox(Sandbox):
     def _clone(self, clone_url: str, branch: str, dest: str, sha: str | None) -> None:
         """Run ``git clone``; tests replace this to copy a fixture tree instead."""
         args = self._git_clone_args(clone_url, branch, dest, sha)
-        res = self.run(args, timeout_s=min(600.0, self.deadline.remaining()), cwd=str(self.root))
+        res = self.run(
+            args,
+            timeout_s=min(float(self.settings.fix_test_timeout_s), self.deadline.remaining()),
+            cwd=str(self.root),
+        )
         if res.timed_out:
             raise SandboxTimeout("git clone timed out")
         if not res.ok:
@@ -771,7 +775,7 @@ class DockerSandbox(Sandbox):
 
     def egress_hosts(self) -> dict[str, str]:
         """Allowlisted host -> resolved IP (resolution happens on the worker)."""
-        proxy = os.environ.get("SANDBOX_HTTPS_PROXY")
+        proxy = self.settings.sandbox_https_proxy or os.environ.get("SANDBOX_HTTPS_PROXY")
         names = list(self.settings.sandbox_egress_allowlist)
         if proxy:
             host = urlsplit(proxy).hostname
@@ -792,7 +796,7 @@ class DockerSandbox(Sandbox):
 
     def _network_env(self) -> dict[str, str]:
         env = dict(self._env_base)
-        proxy = os.environ.get("SANDBOX_HTTPS_PROXY")
+        proxy = self.settings.sandbox_https_proxy or os.environ.get("SANDBOX_HTTPS_PROXY")
         if proxy:
             env.update(
                 {
@@ -814,7 +818,9 @@ class DockerSandbox(Sandbox):
         # inherits that ownership; only the scratch dir has to exist
         self._networked_run(["mkdir", "-p", self.SCRATCH_DIR], timeout_s=60)
         args = self._git_clone_args(clone_url, branch, self.REPO_DIR, sha)
-        res = self._networked_run(args, timeout_s=min(600.0, self.deadline.remaining()))
+        res = self._networked_run(
+            args, timeout_s=min(float(self.settings.fix_test_timeout_s), self.deadline.remaining())
+        )
         if res.timed_out:
             raise SandboxTimeout("git clone timed out")
         if not res.ok:

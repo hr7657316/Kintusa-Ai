@@ -1,6 +1,6 @@
 """A tiny MCP server over stdio for the watcher integration test.
 
-``KINTSUA_MCP_VARIANT=v1`` (default) or ``v2``:
+``KINTSUA_MCP_VARIANT=v1`` (default), ``units-required`` or ``v2``:
 
 * v1: tools ``get_weather(city: str, units: str = "metric", days: int = 1)`` and
   ``search(query: str, limit: int = 10)``; one resource.
@@ -22,12 +22,24 @@ except ImportError:  # mcp 1.x
 
 VARIANT = os.environ.get("KINTSUA_MCP_VARIANT", "v1")
 
-srv = MCPServer("kintsua-fixture", version="1.0.0" if VARIANT == "v1" else "2.0.0")
+VERSIONS = {"v1": "1.0.0", "units-required": "1.1.0"}
+srv = MCPServer("kintsua-fixture", version=VERSIONS.get(VARIANT, "2.0.0"))
 
 if VARIANT == "v1":
 
     @srv.tool(description="Get the current weather for a city")
     def get_weather(city: str, units: str = "metric", days: int = 1) -> str:
+        return f"{city} {units} {days}"
+
+    @srv.tool(description="Search the knowledge base")
+    def search(query: str, limit: int = 10) -> str:
+        return f"{query} {limit}"
+
+elif VARIANT == "units-required":
+    # Only one change: ``units`` becomes required (the fixer's required_param case).
+
+    @srv.tool(description="Get the current weather for a city")
+    def get_weather(city: str, units: str, days: int = 1) -> str:
         return f"{city} {units} {days}"
 
     @srv.tool(description="Search the knowledge base")

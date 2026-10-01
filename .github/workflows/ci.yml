@@ -60,5 +60,13 @@ jobs:
       - run: uv sync --frozen
       - name: kintsua watch snapshot + diff against the fixture MCP server
         run: |
-          uv run kintsua watch snapshot --server "uv run python tests/fixtures/watchers/mcp_server.py"
-          uv run kintsua watch diff --server "uv run python tests/fixtures/watchers/mcp_server.py" --github-action
+          uv run kintsua watch snapshot --server "uv run python tests/fixtures/watchers/mcp_server.py" --name fixture
+          uv run kintsua watch diff --server "uv run python tests/fixtures/watchers/mcp_server.py" --name fixture --github-action
+      - name: a breaking schema change must fail the gate (exit 1)
+        run: |
+          set +e
+          uv run kintsua watch diff --server "uv run python tests/fixtures/watchers/mcp_server.py" --name fixture --env KINTSUA_MCP_VARIANT=v2 --github-action
+          code=$?
+          set -e
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          uv run kintsua watch report --since 1d

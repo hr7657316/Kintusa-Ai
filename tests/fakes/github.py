@@ -20,6 +20,9 @@ class FakeComment:
     body: str
     id: int = 0
 
+    def edit(self, body: str) -> None:
+        self.body = body
+
 
 @dataclass
 class FakeLabel:
@@ -41,6 +44,9 @@ class FakeIssue:
         self.comments.append(c)
         return c
 
+    def get_comments(self):
+        return list(self.comments)
+
     def edit(self, **kw: Any) -> None:
         for k, v in kw.items():
             setattr(self, k, v)
@@ -55,8 +61,23 @@ class FakeIssue:
 
 
 @dataclass
+class FakeRef:
+    ref: str = ""
+    sha: str = "0" * 40
+
+    def __str__(self) -> str:
+        return self.ref
+
+    def __eq__(self, other: object) -> bool:
+        return other == self.ref or (isinstance(other, FakeRef) and other.ref == self.ref)
+
+    def startswith(self, prefix: str) -> bool:
+        return self.ref.startswith(prefix)
+
+
+@dataclass
 class FakePull(FakeIssue):
-    head: str = ""
+    head: Any = ""
     base: str = "main"
     merged: bool = False
     merged_at: Any = None
@@ -139,7 +160,7 @@ class FakeRepo:
     # pulls -------------------------------------------------------------------------
     def create_pull(self, title: str, body: str, head: str, base: str, **_: Any) -> FakePull:
         n = self._next()
-        pr = FakePull(number=n, title=title, body=body, head=head, base=base)
+        pr = FakePull(number=n, title=title, body=body, head=FakeRef(ref=head), base=base)
         pr.html_url = f"{self.html_url}/pull/{n}"
         self.pulls[n] = pr
         return pr

@@ -87,6 +87,9 @@ class Settings(BaseSettings):
         ]
     )
     fix_concurrency: int = 3
+    fix_defer_delay_s: int = 60  # re-queue delay when the concurrency cap is hit
+    fix_test_timeout_s: int = 600
+    sandbox_https_proxy: str | None = None  # a proxy makes the egress allowlist real
     fix_max_steps: int = 12
     fix_max_changed_lines: int = 300
     fix_import_radius: int = 1

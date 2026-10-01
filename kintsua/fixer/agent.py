@@ -316,7 +316,9 @@ class ToolRunner:
         plan = self.ctx.test_plan
         if plan is None or not plan.command:
             raise SandboxError("this repository has no test command; rely on static checks")
-        res = self.sandbox.run(plan.command, timeout_s=600.0)
+        from kintsua.fixer.validate import _test_timeout_s
+
+        res = self.sandbox.run(plan.command, timeout_s=_test_timeout_s())
         self.tests_ran = True
         self.last_test_exit = res.exit_code
         status = "timed out" if res.timed_out else f"exit {res.exit_code}"
