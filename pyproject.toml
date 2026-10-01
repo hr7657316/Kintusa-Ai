@@ -86,7 +86,7 @@ extend-exclude = ["alembic/versions", "tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501", "B008", "SIM108", "B904", "UP038", "SIM117", "SIM102", "B007"]
+ignore = ["E501", "B008", "SIM108", "B904", "SIM117", "SIM102", "B007"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

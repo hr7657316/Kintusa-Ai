@@ -113,7 +113,6 @@ from kintsua.watchers.schemadiff import diff_json_schema # (before_schema, after
 from kintsua.classify.rules import classify_by_rules     # (event: ChangeEvent) -> Classification | None   (pure; None means "route to model")
 from kintsua.classify.rules import classify_event        # (event) -> Classification (rules, else severity=unknown/category=docs_only placeholder) — what the CLI uses
 from kintsua.classify.run import classify_change_event   # (session, change_event_row) -> Classification row (rules then LLM); registered handler
-from kintsua.classify.run import synthesize_observed_event  # (session, repo, tool_name, mismatch_events) -> (ChangeEventRow, Classification)
 
 # indexer -> api
 from kintsua.indexer.depmap import dependency_map        # (session, repo) -> DependencyMap (pydantic: dependencies[], call_site_count, watched, unwatched, generated_at)
@@ -121,6 +120,7 @@ from kintsua.indexer.depmap import render_install_issue  # (repo, depmap) -> (ti
 from kintsua.indexer.config import parse_kintsua_yml     # (text) -> dict (validated)  ; used by indexer on clone and by webhooks
 
 # matcher -> fixer/api
+from kintsua.matcher.runtime import synthesize_observed_event  # (session, repo, tool_name, mismatch_events) -> (ChangeEventRow, Classification); source_kind 'observed'
 from kintsua.matcher.issues import create_issue_for_impact   # (session, impact) -> int (issue number); idempotent
 from kintsua.matcher.issues import comment_on_impact         # (session, impact, body) -> None
 from kintsua.matcher.issues import build_issue_body          # (impact, change_event_row, classification, repo) -> (title, body)
