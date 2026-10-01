@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.env
+*.log
+.kintsua/
+/tmp/
+sandbox_runs/
+node_modules/
