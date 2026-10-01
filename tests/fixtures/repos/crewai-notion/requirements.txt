@@ -1,0 +1,4 @@
+crewai>=0.80
+crewai-tools
+requests
+slack_sdk

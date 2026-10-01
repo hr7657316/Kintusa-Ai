@@ -1,0 +1,54 @@
+{
+  "ref": "refs/heads/main",
+  "before": "6113728f27ae82c7b1a177c8d03f9e96e0adf246",
+  "after": "0000000000000000000000000000000000000abc",
+  "repository": {
+    "id": 186853002,
+    "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+    "name": "support-agent",
+    "full_name": "acme/support-agent",
+    "private": true,
+    "owner": {"login": "acme", "id": 583231, "type": "Organization"},
+    "html_url": "https://github.com/acme/support-agent",
+    "description": "Customer support agent",
+    "fork": false,
+    "default_branch": "main",
+    "master_branch": "main"
+  },
+  "pusher": {"name": "octocat", "email": "octocat@github.com"},
+  "sender": {"login": "octocat", "id": 1, "type": "User"},
+  "installation": {"id": 12345678, "node_id": "MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uMTIzNDU2Nzg="},
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "base_ref": null,
+  "compare": "https://github.com/acme/support-agent/compare/6113728f27ae...0000000000ab",
+  "commits": [
+    {
+      "id": "0000000000000000000000000000000000000abc",
+      "tree_id": "f9d2a07e9488b91af2641b26b9407fe22a451433",
+      "distinct": true,
+      "message": "Charge in the right currency",
+      "timestamp": "2026-10-01T12:34:56Z",
+      "url": "https://github.com/acme/support-agent/commit/0000000000000000000000000000000000000abc",
+      "author": {"name": "Octo Cat", "email": "octocat@github.com", "username": "octocat"},
+      "committer": {"name": "GitHub", "email": "noreply@github.com", "username": "web-flow"},
+      "added": ["app/refunds.py"],
+      "removed": [],
+      "modified": ["app/billing.py"]
+    }
+  ],
+  "head_commit": {
+    "id": "0000000000000000000000000000000000000abc",
+    "tree_id": "f9d2a07e9488b91af2641b26b9407fe22a451433",
+    "distinct": true,
+    "message": "Charge in the right currency",
+    "timestamp": "2026-10-01T12:34:56Z",
+    "url": "https://github.com/acme/support-agent/commit/0000000000000000000000000000000000000abc",
+    "author": {"name": "Octo Cat", "email": "octocat@github.com", "username": "octocat"},
+    "committer": {"name": "GitHub", "email": "noreply@github.com", "username": "web-flow"},
+    "added": ["app/refunds.py"],
+    "removed": [],
+    "modified": ["app/billing.py"]
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Pets API", "version": "2.0.0", "description": "After"},
+  "servers": [{"url": "https://api.example.com/v2"}],
+  "security": [{"oauth2": ["pets:read"]}],
+  "x-vendor-generated-at": "2026-02-01T00:00:00Z",
+  "paths": {
+    "/v1/pets": {
+      "get": {
+        "operationId": "listPets",
+        "summary": "List all pets",
+        "parameters": [
+          {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["available", "pending", "adopted"]}},
+          {"name": "sort", "in": "query", "schema": {"type": "string"}, "description": "Sort order (asc|desc)"},
+          {"name": "page", "in": "query", "schema": {"type": "string"}, "description": "Page cursor"},
+          {"name": "tenant", "in": "query", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Pet"}}}}
+          }
+        }
+      },
+      "post": {
+        "operationId": "createPet",
+        "summary": "Create a pet",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/NewPet"}}}},
+        "responses": {"201": {"description": "created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}}}
+      }
+    },
+    "/v1/pets/{id}": {
+      "parameters": [{"$ref": "#/components/parameters/PetId"}],
+      "get": {
+        "operationId": "getPet",
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}}}
+      },
+      "delete": {
+        "operationId": "deletePet",
+        "deprecated": true,
+        "responses": {"204": {"description": "deleted"}}
+      }
+    },
+    "/v1/pets/{id}/photos": {
+      "post": {
+        "operationId": "uploadPhoto",
+        "parameters": [{"$ref": "#/components/parameters/PetId"}],
+        "requestBody": {"content": {"multipart/form-data": {"schema": {"type": "object", "properties": {"file": {"type": "string", "format": "binary"}}}}}},
+        "responses": {"201": {"description": "created"}}
+      }
+    },
+    "/v1/owners/{ownerId}": {
+      "get": {
+        "operationId": "getOwner",
+        "parameters": [{"name": "ownerId", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "security": [{"oauth2": ["owners:read"]}],
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Owner"}}}}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "PetId": {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+    },
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "string"},
+          "name": {"type": "string"},
+          "tag": {"type": "string", "description": "A free-form tag"},
+          "weight_kg": {"type": "string"},
+          "owner": {"$ref": "#/components/schemas/Owner"}
+        }
+      },
+      "NewPet": {
+        "type": "object",
+        "required": ["name", "species"],
+        "properties": {
+          "name": {"type": "string"},
+          "tags": {"type": "string"},
+          "species": {"type": "string", "enum": ["dog", "cat"]},
+          "birth_date": {"type": "string", "format": "date"}
+        }
+      },
+      "Owner": {
+        "type": "object",
+        "properties": {
+          "email": {"type": "string"},
+          "pet": {"$ref": "#/components/schemas/Pet"}
+        }
+      }
+    },
+    "securitySchemes": {
+      "oauth2": {"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "https://api.example.com/oauth/token", "scopes": {"pets:read": "read pets", "owners:read": "read owners"}}}}
+    }
+  }
+}

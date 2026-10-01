@@ -1,0 +1,61 @@
+{
+  "name": "mcp_get_weather_units_invalid_value",
+  "description": "Same required_param break as mcp_get_weather_units_required, but the agent passes a value outside the enum. Tests still pass (the fake client accepts anything), so only the JSON Schema check of the synthetic call catches it.",
+  "source": {
+    "kind": "mcp",
+    "locator": "https://mcp.weather.example/mcp",
+    "display_name": "Weather MCP",
+    "vendor": "weather"
+  },
+  "event": {
+    "source_kind": "mcp",
+    "from_version": "1.4.0",
+    "to_version": "1.5.0",
+    "ops": [
+      {
+        "op": "required_added",
+        "path": "/tools/get_weather/inputSchema/required",
+        "before": ["city"],
+        "after": ["city", "units"]
+      }
+    ],
+    "text": null
+  },
+  "classification": {
+    "severity": "breaking",
+    "category": "required_param",
+    "summary": "MCP tool get_weather now requires the `units` input",
+    "affected_paths": ["tool:get_weather"],
+    "migration_hint": "Pass units='metric' or 'imperial' in every get_weather call.",
+    "rule_hits": ["required_added"]
+  },
+  "dependency": {"kind": "mcp", "name": "https://mcp.weather.example/mcp", "meta": {"vendor": "weather"}},
+  "tool_name": "get_weather",
+  "new_input_schema": {
+    "type": "object",
+    "properties": {
+      "city": {"type": "string"},
+      "units": {"type": "string", "enum": ["metric", "imperial"], "default": "metric"}
+    },
+    "required": ["city", "units"],
+    "additionalProperties": false
+  },
+  "call_sites": [
+    {
+      "file_path": "agent/weather.py",
+      "line": 14,
+      "symbol": "client.call_tool",
+      "operation": "get_weather",
+      "args_shape": {"keys": ["city"]}
+    }
+  ],
+  "patch": [
+    {
+      "path": "agent/weather.py",
+      "old": "    result = client.call_tool(\"get_weather\", {\"city\": city})\n",
+      "new": "    result = client.call_tool(\"get_weather\", {\"city\": city, \"unit\": \"celsius\"})\n"
+    }
+  ],
+  "agent_reason": "Added a units argument.",
+  "expected_verdict": {"ok": false, "reason_contains": "inputSchema"}
+}

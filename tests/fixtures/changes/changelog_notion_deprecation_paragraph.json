@@ -1,0 +1,28 @@
+{
+  "name": "changelog_notion_deprecation_paragraph",
+  "display_name": "Notion changelog",
+  "event": {
+    "source_id": "77777777-7777-4777-8777-777777777777",
+    "source_kind": "changelog",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/paragraphs/12",
+        "before": null,
+        "after": "September 25, 2026: Deprecating the `databases.query` filter `text` property. Starting November 1, 2026, filters must use `rich_text` instead of `text`; requests using `text` will return a 400 validation_error."
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": "September 25, 2026: Deprecating the `databases.query` filter `text` property. Starting November 1, 2026, filters must use `rich_text` instead of `text`; requests using `text` will return a 400 validation_error."
+  },
+  "expected": {
+    "severity": "unknown",
+    "category": "behaviour"
+  },
+  "rule_hits_expected": [
+    "text_only"
+  ],
+  "note": "every changelog change is text_changed and goes straight to the model"
+}

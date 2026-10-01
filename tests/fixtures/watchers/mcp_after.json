@@ -1,0 +1,73 @@
+{
+  "server": {
+    "name": "weather-server",
+    "version": "2.0.0",
+    "protocolVersion": "2025-06-18",
+    "capabilities": {"tools": {"listChanged": false}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {"listChanged": false}}
+  },
+  "tools": {
+    "get_weather": {
+      "description": "Get the current weather for a city. Units default to metric.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"},
+          "units": {"type": "string", "enum": ["metric", "imperial", "kelvin"], "default": "metric"},
+          "days": {"type": "string", "minimum": 1, "maximum": 14}
+        },
+        "required": ["city", "units"]
+      },
+      "annotations": {"readOnlyHint": true}
+    },
+    "search": {
+      "description": "Search the knowledge base",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"},
+          "filters": {
+            "type": "object",
+            "properties": {
+              "lang": {"type": "string", "enum": ["en", "de"]},
+              "country": {"type": "string"}
+            }
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    "send_email": {
+      "description": "Send an email (deprecated, use send_message)",
+      "inputSchema": {
+        "type": "object",
+        "deprecated": true,
+        "properties": {"to": {"type": "string"}, "body": {"type": "string"}},
+        "required": ["to", "body"]
+      }
+    },
+    "send_message": {
+      "description": "Send a message",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"to": {"type": "string"}, "body": {"type": "string"}, "channel": {"type": "string"}},
+        "required": ["to", "body"]
+      }
+    },
+    "stable_tool": {
+      "description": "Never changes",
+      "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}
+    }
+  },
+  "resources": {
+    "weather://cities": {"name": "cities", "description": "Known cities (updated weekly)", "mimeType": "application/json"},
+    "weather://alerts": {"name": "alerts", "mimeType": "application/json"}
+  },
+  "resourceTemplates": {},
+  "prompts": {
+    "forecast": {
+      "description": "Write a forecast",
+      "arguments": [{"name": "city", "required": true}, {"name": "tone", "required": true}]
+    },
+    "alert": {"description": "Write an alert", "arguments": [{"name": "city", "required": true}]}
+  }
+}

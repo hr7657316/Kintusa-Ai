@@ -1,0 +1,53 @@
+{
+  "action": "completed",
+  "check_run": {
+    "id": 4500000001,
+    "node_id": "CR_kwDOCyLn7M8AAAABDC-bAQ",
+    "head_sha": "4f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+    "external_id": "abc123",
+    "url": "https://api.github.com/repos/acme/support-agent/check-runs/4500000001",
+    "html_url": "https://github.com/acme/support-agent/runs/4500000001",
+    "details_url": "https://github.com/acme/support-agent/actions/runs/1001/job/2002",
+    "status": "completed",
+    "conclusion": "failure",
+    "started_at": "2026-10-01T13:05:00Z",
+    "completed_at": "2026-10-01T13:09:00Z",
+    "output": {
+      "title": "2 tests failed",
+      "summary": "2 failed, 41 passed in 38.2s",
+      "text": "FAILED tests/test_billing.py::test_charge - KeyError: 'currency'\nFAILED tests/test_billing.py::test_refund - AssertionError\nAuthorization: Bearer ghs_abcdefghijklmnopqrstuvwxyz0123456789",
+      "annotations_count": 2,
+      "annotations_url": "https://api.github.com/repos/acme/support-agent/check-runs/4500000001/annotations"
+    },
+    "name": "pytest",
+    "check_suite": {
+      "id": 9000000001,
+      "head_branch": "kintsua/stripe-1a2b3c4d",
+      "head_sha": "4f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+      "status": "completed",
+      "conclusion": "failure",
+      "app": {"id": 15368, "slug": "github-actions", "name": "GitHub Actions"}
+    },
+    "app": {"id": 15368, "slug": "github-actions", "name": "GitHub Actions"},
+    "pull_requests": [
+      {
+        "url": "https://api.github.com/repos/acme/support-agent/pulls/42",
+        "id": 1234567890,
+        "number": 42,
+        "head": {"ref": "kintsua/stripe-1a2b3c4d", "sha": "4f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d", "repo": {"id": 186853002, "name": "support-agent"}},
+        "base": {"ref": "main", "sha": "6113728f27ae82c7b1a177c8d03f9e96e0adf246", "repo": {"id": 186853002, "name": "support-agent"}}
+      }
+    ]
+  },
+  "repository": {
+    "id": 186853002,
+    "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+    "name": "support-agent",
+    "full_name": "acme/support-agent",
+    "private": true,
+    "owner": {"login": "acme", "id": 583231, "type": "Organization"},
+    "default_branch": "main"
+  },
+  "installation": {"id": 12345678, "node_id": "MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uMTIzNDU2Nzg="},
+  "sender": {"login": "github-actions[bot]", "id": 41898282, "type": "Bot"}
+}

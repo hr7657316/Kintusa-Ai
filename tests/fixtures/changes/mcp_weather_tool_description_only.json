@@ -1,0 +1,31 @@
+{
+  "name": "mcp_weather_tool_description_only",
+  "display_name": "Weather MCP",
+  "event": {
+    "source_id": "44444444-4444-4444-8444-444444444444",
+    "source_kind": "mcp",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/tools/get_weather/description",
+        "before": "Current conditions for a location.",
+        "after": "Current conditions for a location. Results are cached for 10 minutes; pass refresh=true to bypass."
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "unknown",
+    "category": "docs_only"
+  },
+  "rule_hits_expected": [
+    "text_only"
+  ],
+  "affected_paths_expected": [
+    "tool:get_weather"
+  ],
+  "note": "schema unchanged, description changed: recorded, routed to the model"
+}

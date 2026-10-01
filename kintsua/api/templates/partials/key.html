@@ -1,0 +1,7 @@
+<div id="sdk-key">
+  <div class="notice notice-ok">
+    <p><strong>{% if rotated %}Key rotated.{% else %}Key created.{% endif %} Copy it now; it is not shown again.</strong></p>
+    <pre><code>KINTSUA_KEY={{ key }}</code></pre>
+    <p class="muted small">Prefix <code>{{ info.prefix }}</code> · org {{ info.org }} · created {{ info.created_at[:19] }} UTC</p>
+  </div>
+</div>

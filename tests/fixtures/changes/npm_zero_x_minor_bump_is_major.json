@@ -1,0 +1,31 @@
+{
+  "name": "npm_zero_x_minor_bump_is_major",
+  "display_name": "@anthropic-ai/mcp-tools",
+  "event": {
+    "source_id": "55555555-5555-4555-8555-555555555555",
+    "source_kind": "npm",
+    "from_version": "0.4.2",
+    "to_version": "0.5.0",
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/latest",
+        "before": "0.4.2",
+        "after": "0.5.0"
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "degraded",
+    "category": "deprecation"
+  },
+  "rule_hits_expected": [
+    "major_bump"
+  ],
+  "affected_paths_expected": [
+    "package:@anthropic-ai/mcp-tools"
+  ],
+  "note": "0.x minor bumps break caret ranges, so they count as major"
+}

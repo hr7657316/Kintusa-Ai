@@ -1,0 +1,52 @@
+{
+  "name": "mcp_weather_tool_renamed_levenshtein_pair",
+  "display_name": null,
+  "event": {
+    "source_id": "44444444-4444-4444-8444-444444444444",
+    "source_kind": "mcp",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "removed",
+        "path": "/tools/getWeather",
+        "before": {
+          "name": "getWeather",
+          "inputSchema": {
+            "type": "object"
+          }
+        },
+        "after": null
+      },
+      {
+        "op": "added",
+        "path": "/tools/get_weather",
+        "before": null,
+        "after": {
+          "name": "get_weather",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "rename"
+  },
+  "rule_hits_expected": [
+    "renamed"
+  ],
+  "affected_paths_expected": [
+    "tool:getWeather"
+  ],
+  "migration_hint_contains": "Rename getWeather to get_weather"
+}

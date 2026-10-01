@@ -1,0 +1,92 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Pets API", "version": "1.0.0", "description": "Before"},
+  "servers": [{"url": "https://api.example.com"}],
+  "externalDocs": {"url": "https://example.com/docs"},
+  "security": [{"apiKey": []}],
+  "x-vendor-generated-at": "2026-01-01T00:00:00Z",
+  "paths": {
+    "/v1/pets": {
+      "get": {
+        "operationId": "listPets",
+        "summary": "List pets",
+        "parameters": [
+          {"name": "limit", "in": "query", "schema": {"type": "integer"}, "x-internal": true},
+          {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["available", "pending", "sold"]}},
+          {"name": "sort", "in": "query", "schema": {"type": "string"}, "description": "Sort order"}
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Pet"}}, "example": [{"id": "p1"}]}}
+          }
+        }
+      },
+      "post": {
+        "operationId": "createPet",
+        "summary": "Create a pet",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/NewPet"}}}},
+        "responses": {"201": {"description": "created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}}}
+      }
+    },
+    "/v1/pets/{id}": {
+      "parameters": [{"$ref": "#/components/parameters/PetId"}],
+      "get": {
+        "operationId": "getPet",
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}}}
+      },
+      "delete": {
+        "operationId": "deletePet",
+        "responses": {"204": {"description": "deleted"}}
+      }
+    },
+    "/v1/legacy/export": {
+      "get": {"operationId": "legacyExport", "responses": {"200": {"description": "ok"}}}
+    },
+    "/v1/owners/{ownerId}": {
+      "get": {
+        "operationId": "getOwner",
+        "parameters": [{"name": "ownerId", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "security": [{"apiKey": []}],
+        "responses": {"200": {"description": "ok", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Owner"}}}}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "PetId": {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
+    },
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "string"},
+          "name": {"type": "string"},
+          "tag": {"type": "string", "description": "A tag"},
+          "weight_kg": {"type": "number"},
+          "owner": {"$ref": "#/components/schemas/Owner"}
+        }
+      },
+      "NewPet": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string"},
+          "tag": {"type": "string"},
+          "birth_date": {"type": "string", "format": "date"}
+        }
+      },
+      "Owner": {
+        "type": "object",
+        "properties": {
+          "email": {"type": "string"},
+          "pet": {"$ref": "#/components/schemas/Pet"}
+        }
+      }
+    },
+    "securitySchemes": {
+      "apiKey": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    }
+  }
+}
