@@ -100,6 +100,8 @@ class Repo(Base):
     install_issue_number: Mapped[int | None] = mapped_column(Integer)
     indexed_at: Mapped[datetime | None] = _ts()
     last_index_error: Mapped[str | None] = mapped_column(Text)
+    # last index run: {"files_parsed", "parse_errors", "head_sha", "reason", "phases", "duration_s"}
+    index_stats: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _created_at()
 
     org: Mapped[Org] = relationship(back_populates="repos")

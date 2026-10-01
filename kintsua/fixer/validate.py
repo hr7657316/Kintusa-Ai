@@ -48,7 +48,17 @@ from kintsua.fixer.testcmd import TestPlan
 
 log = logging.getLogger(__name__)
 
-TEST_TIMEOUT_S = 600.0
+
+def _test_timeout_s() -> float:
+    try:
+        from kintsua.core.config import get_settings
+
+        return float(get_settings().fix_test_timeout_s)
+    except Exception:  # noqa: BLE001
+        return 600.0
+
+
+TEST_TIMEOUT_S = 600.0  # fallback; the live value comes from Settings.fix_test_timeout_s
 STATIC_TIMEOUT_S = 300.0
 MAX_GRAPH_FILES = 4000
 PY_EXTS = (".py",)

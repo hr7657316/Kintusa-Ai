@@ -17,6 +17,7 @@ is logged per job.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any
 from uuid import UUID
@@ -371,7 +372,7 @@ def handle_fix_impact(session: Session, payload: dict[str, Any]) -> dict[str, An
             session,
             JOB_FIX_IMPACT,
             {"impact_id": str(impact.id)},
-            delay_s=DEFER_DELAY_S,
+            delay_s=settings.fix_defer_delay_s,
             dedupe_key=fix_impact_dedupe_key(impact.id),
         )
         session.commit()
@@ -385,6 +386,10 @@ def handle_fix_impact(session: Session, payload: dict[str, Any]) -> dict[str, An
 
     assert cls is not None  # refusal_reason guarantees it
     impact.status = "fixing"
+    job_id = payload.get("_job_id")
+    if job_id:
+        with contextlib.suppress(ValueError):
+            impact.fix_job_id = UUID(str(job_id))
     session.commit()
     return _run_fix(session, settings, impact, repo, org, row, cls, source)
 

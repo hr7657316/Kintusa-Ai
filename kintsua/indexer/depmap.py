@@ -168,8 +168,8 @@ def dependency_map(
         watched=sum(1 for e in external if e.watched),
         unwatched=sum(1 for e in external if not e.watched),
         runtime_discovered=sum(1 for e in entries if e.discovered_at_runtime),
-        files_parsed=stats.files_parsed if stats else None,
-        parse_errors=stats.parse_errors if stats else None,
+        files_parsed=stats.files_parsed if stats else (repo.index_stats or {}).get("files_parsed"),
+        parse_errors=stats.parse_errors if stats else (repo.index_stats or {}).get("parse_errors"),
     )
     if org_settings is None:
         try:

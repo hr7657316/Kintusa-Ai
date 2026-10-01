@@ -161,9 +161,11 @@ def run_job(session: Session, job: Job) -> Any:
     handler = HANDLERS.get(job.kind)
     if handler is None:
         raise RuntimeError(f"no handler registered for job kind {job.kind!r}")
+    payload = dict(job.payload)
+    payload.setdefault("_job_id", str(job.id))
     if inspect.iscoroutinefunction(handler):
-        return asyncio.run(handler(session, dict(job.payload)))
-    result = handler(session, dict(job.payload))
+        return asyncio.run(handler(session, payload))
+    result = handler(session, payload)
     if inspect.isawaitable(result):
         return asyncio.run(_await(result))
     return result
