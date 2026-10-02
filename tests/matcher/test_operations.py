@@ -106,6 +106,15 @@ def test_parse_kinds():
         # unknown symbol never matches an http path
         ("acme.Client.frobnicate", "POST /v1/frob", False),
         ("", "POST /v1/charges", False),
+        # dotted MCP tool names parse as sdk symbols but match their tool: path in full
+        ("browser.navigate", "tool:browser.navigate", True),
+        ("tool:browser.navigate", "browser.navigate", True),
+        ("jira.create_issue", "tool:jira.create_issue", True),
+        # ... and an SDK chain that merely ends in a tool's name is not that tool
+        ("notion_client.Client.search", "tool:search", False),
+        ("notion_client.Client.search", "search", False),
+        ("search", "notion_client.Client.search", False),
+        ("stripe.Charge.create", "tool:create", False),
     ],
 )
 def test_operations_match(site, affected, expected):
@@ -132,3 +141,8 @@ def test_pointer_operation():
     assert pointer_operation("/prompts/summarise") == "prompt:summarise"
     assert pointer_operation("/versions/12.0.0") is None
     assert pointer_operation("") is None
+
+
+def test_malformed_urls_do_not_raise():
+    assert normalize_operation("GET http://[::1/x") == "GET /x"
+    assert normalize_operation("http://[bad/v1/charges?x=1") == "/v1/charges"

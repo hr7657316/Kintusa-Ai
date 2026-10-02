@@ -4,15 +4,20 @@ The raw body is verified against ``X-Hub-Signature-256`` first (401 on failure, 
 secret is configured), then dispatched on ``X-GitHub-Event``:
 
 * ``installation`` created -> Org + Repo rows + ``index_repo`` jobs; deleted -> org and repos
-  inactive and sources no other active org depends on stop being polled; suspend /
-  unsuspend toggle the org.
+  inactive and sources no active repo depends on any more stop being polled; suspend /
+  unsuspend toggle the org. A reinstall (GitHub issues a new installation id) re-points the
+  org already recorded for the same GitHub account, so its plan, SDK key and billing carry
+  over, and the sources its repos depend on are polled again.
 * ``installation_repositories`` added / removed.
+* ``repository`` renamed / transferred / edited / privatized / publicized -> the repo row
+  follows (every repo-scoped event also refreshes ``full_name`` from its payload).
 * ``push`` to the default branch -> ``index_repo`` debounced by ``settings.push_debounce_s``
   (a queued run is rescheduled, never duplicated); ``.kintsua.yml`` in the changed files
   marks the reason ``config``.
 * ``pull_request`` closed / reopened on a ``kintsua/`` branch -> ``pr_outcome`` job.
-* ``issues`` closed by a human on an issue Kintsua opened -> impact dismissed; reopened ->
-  issued again.
+* ``issues`` closed by a human on an issue Kintsua opened -> impact dismissed (unless a Kintsua
+  PR is open for it and the issue was closed as completed, which is what merging that PR
+  does: the ``pull_request`` event records the outcome); reopened -> issued again.
 * ``check_run`` / ``check_suite`` / ``workflow_run`` completed on a ``kintsua/`` branch ->
   ``record_ci_result``.
 * ``ping`` -> 200.
@@ -32,12 +37,15 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from kintsua.api.repos import hosted_watcher_polls
 from kintsua.core.config import get_settings
 from kintsua.core.db import get_db
 from kintsua.core.github import BRANCH_PREFIX, LABEL, get_github_app, verify_webhook_signature
@@ -54,6 +62,7 @@ router = APIRouter(tags=["webhooks"])
 WEBHOOK_EVENTS: list[str] = [
     "installation",
     "installation_repositories",
+    "repository",
     "push",
     "pull_request",
     "issues",
@@ -62,6 +71,9 @@ WEBHOOK_EVENTS: list[str] = [
 ]
 CONFIG_FILE = ".kintsua.yml"
 DEFAULT_ORG_SETTINGS: dict[str, Any] = {"fix_mode": "issue_only", "auto_issue": False}
+# Org.settings key holding the GitHub account id: a reinstall gets a new installation id,
+# the account id is what ties it back to the same org
+ACCOUNT_ID_KEY = "github_account_id"
 MAX_DEFAULT_BRANCH_LOOKUPS = 25
 MARKER_RE = re.compile(r"<!--\s*kintsua:change_event:([0-9a-fA-F-]{36})\s*-->")
 
@@ -120,19 +132,56 @@ def _account(payload: dict[str, Any]) -> tuple[str, str | None]:
     return login, (str(acct["type"]) if acct.get("type") else None)
 
 
+def _account_id(payload: dict[str, Any]) -> int | None:
+    inst = payload.get("installation") if isinstance(payload.get("installation"), dict) else {}
+    acct = inst.get("account") if isinstance(inst.get("account"), dict) else {}
+    return _int(acct.get("id"))
+
+
 def org_for_installation(session: Session, installation_id: int) -> Org | None:
     return session.scalar(select(Org).where(Org.github_installation_id == installation_id))
 
 
-def upsert_org(session: Session, installation_id: int, login: str, account_type: str | None) -> Org:
+def org_for_account(session: Session, account_id: int) -> Org | None:
+    """The org recorded for a GitHub account id (the most recent, preferring active)."""
+    return session.scalar(
+        select(Org)
+        .where(Org.settings[ACCOUNT_ID_KEY].astext == str(account_id))
+        .order_by(Org.active.desc(), Org.created_at.desc())
+        .limit(1)
+    )
+
+
+def upsert_org(
+    session: Session,
+    installation_id: int,
+    login: str,
+    account_type: str | None,
+    account_id: int | None = None,
+) -> Org:
     org = org_for_installation(session, installation_id)
+    if org is None and account_id is not None:
+        # a reinstall: GitHub allows one installation per account, so the org recorded for
+        # this account under an older installation id is this one (keeps plan, key, billing)
+        org = org_for_account(session, account_id)
+        if org is not None:
+            log.info(
+                "org %s re-pointed from installation %s to %s",
+                org.name,
+                org.github_installation_id,
+                installation_id,
+            )
+            org.github_installation_id = installation_id
     if org is None:
+        settings = dict(DEFAULT_ORG_SETTINGS)
+        if account_id is not None:
+            settings[ACCOUNT_ID_KEY] = account_id
         org = Org(
             github_installation_id=installation_id,
             name=login,
             account_type=account_type,
             plan="free",
-            settings=dict(DEFAULT_ORG_SETTINGS),
+            settings=settings,
             active=True,
         )
         session.add(org)
@@ -144,6 +193,8 @@ def upsert_org(session: Session, installation_id: int, login: str, account_type:
     if account_type:
         org.account_type = account_type
     merged = {**DEFAULT_ORG_SETTINGS, **(org.settings or {})}
+    if account_id is not None:
+        merged[ACCOUNT_ID_KEY] = account_id
     if merged != (org.settings or {}):
         org.settings = merged
     session.flush()
@@ -209,6 +260,24 @@ def upsert_repos(
     return out
 
 
+def sync_repo_identity(repo: Repo, info: dict[str, Any]) -> bool:
+    """Follow a rename / transfer / visibility change carried by a repository payload."""
+    changed = False
+    full_name = info.get("full_name")
+    if isinstance(full_name, str) and "/" in full_name and full_name != repo.full_name:
+        log.info("repo %s is now %s", repo.full_name, full_name)
+        repo.full_name = full_name
+        changed = True
+    if isinstance(info.get("private"), bool) and info["private"] != repo.private:
+        repo.private = info["private"]
+        changed = True
+    branch = info.get("default_branch")
+    if isinstance(branch, str) and branch and branch != repo.default_branch:
+        repo.default_branch = branch
+        changed = True
+    return changed
+
+
 def _repo_from_payload(session: Session, payload: dict[str, Any]) -> Repo | None:
     info = payload.get("repository")
     if not isinstance(info, dict):
@@ -217,6 +286,7 @@ def _repo_from_payload(session: Session, payload: dict[str, Any]) -> Repo | None
     if gh_id is not None:
         repo = repo_by_github_id(session, gh_id)
         if repo is not None:
+            sync_repo_identity(repo, info)  # matched by id, so the payload's name is current
             return repo
     full_name = info.get("full_name")
     if full_name:
@@ -242,8 +312,9 @@ def _seeded_locators() -> set[tuple[str, str]]:
 
 
 def deactivate_orphan_sources(session: Session, org: Org) -> int:
-    """Stop polling sources only this org's repos depend on (seeded sources keep running for
-    the public weekly report)."""
+    """Stop polling sources this org's repos depended on that no active repo (of any org,
+    this one included) depends on any more. Seeded sources keep running for the public
+    weekly report. Call after flagging the removed repos (or the org) inactive."""
     ours = set(
         session.scalars(
             select(Dependency.source_id)
@@ -260,7 +331,6 @@ def deactivate_orphan_sources(session: Session, org: Org) -> int:
             .join(Repo, Repo.id == Dependency.repo_id)
             .join(Org, Org.id == Repo.org_id)
             .where(
-                Org.id != org.id,
                 Org.active.is_(True),
                 Repo.active.is_(True),
                 Dependency.source_id.in_(list(ours)),
@@ -272,11 +342,43 @@ def deactivate_orphan_sources(session: Session, org: Org) -> int:
     n = 0
     for sid in ours - still_used:
         src = session.get(Source, sid)
-        if src is None or not src.active or (src.kind, src.locator) in seeded:
+        if src is None or not src.active or src.trusted or (src.kind, src.locator) in seeded:
             continue
         src.active = False
         n += 1
-        log.info("source %s %s deactivated: no active org depends on it", src.kind, src.locator)
+        log.info("source %s %s deactivated: no active repo depends on it", src.kind, src.locator)
+    return n
+
+
+def reactivate_sources(session: Session, repos: list[Repo]) -> int:
+    """Poll again the sources (re)installed repos already depend on that an uninstall or a
+    repo removal switched off. Never revives pushed / synthetic sources or stdio commands the
+    hosted watcher must not run."""
+    if not repos:
+        return 0
+    deps = session.scalars(select(Dependency).where(Dependency.repo_id.in_([r.id for r in repos])))
+    ids: set[Any] = set()
+    for dep in deps:
+        if dep.source_id is not None:
+            ids.add(dep.source_id)
+        for key in ("openapi_source_id", "changelog_source_id"):
+            raw = (dep.meta or {}).get(key)
+            if raw:
+                try:
+                    ids.add(UUID(str(raw)))
+                except ValueError:
+                    continue
+    if not ids:
+        return 0
+    n = 0
+    for src in session.scalars(select(Source).where(Source.id.in_(list(ids)))):
+        if src.active or src.origin not in ("customer", "runtime") or not hosted_watcher_polls(src):
+            continue
+        src.active = True
+        n += 1
+        log.info(
+            "source %s %s reactivated: a reinstalled repo depends on it", src.kind, src.locator
+        )
     return n
 
 
@@ -296,11 +398,17 @@ def handle_installation(session: Session, payload: dict[str, Any]) -> dict[str, 
         raise HTTPException(status_code=400, detail="installation.id missing")
     login, account_type = _account(payload)
     if action == "created":
-        org = upsert_org(session, inst_id, login, account_type)
+        org = upsert_org(session, inst_id, login, account_type, _account_id(payload))
         repos = upsert_repos(session, org, payload.get("repositories") or [])
+        reactivated = reactivate_sources(session, repos)
         for repo in repos:
             enqueue_index_repo(session, repo, "install")
-        return {"org_id": str(org.id), "repos": len(repos), "jobs": len(repos)}
+        return {
+            "org_id": str(org.id),
+            "repos": len(repos),
+            "jobs": len(repos),
+            "sources_reactivated": reactivated,
+        }
     org = org_for_installation(session, inst_id)
     if action == "deleted":
         if org is None:
@@ -330,11 +438,12 @@ def handle_installation_repositories(
         raise HTTPException(status_code=400, detail="installation.id missing")
     login, account_type = _account(payload)
     if action == "added":
-        org = upsert_org(session, inst_id, login, account_type)
+        org = upsert_org(session, inst_id, login, account_type, _account_id(payload))
         repos = upsert_repos(session, org, payload.get("repositories_added") or [])
+        reactivated = reactivate_sources(session, repos)
         for repo in repos:
             enqueue_index_repo(session, repo, "install")
-        return {"org_id": str(org.id), "added": len(repos)}
+        return {"org_id": str(org.id), "added": len(repos), "sources_reactivated": reactivated}
     if action == "removed":
         org = org_for_installation(session, inst_id)
         removed = 0
@@ -345,10 +454,29 @@ def handle_installation_repositories(
                 repo.active = False
                 removed += 1
         session.flush()
-        if org is not None:
-            deactivate_orphan_sources(session, org)
-        return {"org_id": str(org.id) if org else None, "removed": removed}
+        n_sources = deactivate_orphan_sources(session, org) if org is not None else 0
+        return {
+            "org_id": str(org.id) if org else None,
+            "removed": removed,
+            "sources_deactivated": n_sources,
+        }
     return None
+
+
+REPOSITORY_ACTIONS = frozenset({"renamed", "transferred", "edited", "privatized", "publicized"})
+
+
+def handle_repository(session: Session, payload: dict[str, Any]) -> dict[str, Any] | None:
+    if payload.get("action") not in REPOSITORY_ACTIONS:
+        return None
+    info = payload.get("repository")
+    gh_id = _int(info.get("id")) if isinstance(info, dict) else None
+    repo = repo_by_github_id(session, gh_id) if gh_id is not None else None
+    if repo is None or not isinstance(info, dict):
+        return {"skipped": "repo not installed"}
+    changed = sync_repo_identity(repo, info)
+    session.flush()
+    return {"repo_id": str(repo.id), "full_name": repo.full_name, "changed": changed}
 
 
 def _changed_files(payload: dict[str, Any]) -> set[str]:
@@ -475,6 +603,10 @@ def handle_issues(session: Session, payload: dict[str, Any]) -> dict[str, Any] |
     if action == "closed":
         if sender.get("type") == "Bot":
             return {"skipped": "closed by a bot", "impact_id": str(impact.id)}
+        if impact.status == "pr_open" and issue.get("state_reason") != "not_planned":
+            # merging Kintsua's PR ("Closes #N") closes the issue as completed; the
+            # pull_request event (pr_outcome job) records merged / closed for it
+            return {"skipped": "fix PR is open", "impact_id": str(impact.id)}
         if impact.status not in ("merged", "failed", "dismissed"):
             impact.status = "dismissed"
             impact.fix_reason = impact.fix_reason or f"issue #{number} closed by {login}"
@@ -599,6 +731,7 @@ HANDLERS: dict[str, WebhookHandler] = {
     "ping": handle_ping,
     "installation": handle_installation,
     "installation_repositories": handle_installation_repositories,
+    "repository": handle_repository,
     "push": handle_push,
     "pull_request": handle_pull_request,
     "issues": handle_issues,
@@ -611,6 +744,16 @@ HANDLERS: dict[str, WebhookHandler] = {
 # --------------------------------------------------------------------------------------
 # Endpoint
 # --------------------------------------------------------------------------------------
+
+
+def _run_handler(
+    handler: WebhookHandler, session: Session, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Handlers hit Postgres and GitHub synchronously: run them (and the commit) in the
+    threadpool so a slow GitHub call never stalls the event loop."""
+    result = handler(session, payload)
+    session.commit()
+    return result
 
 
 @router.post("/webhooks/github")
@@ -637,8 +780,7 @@ async def github_webhook(request: Request, session: Session = Depends(get_db)) -
     if handler is None:
         log.info("webhook %s ignored (delivery %s)", event or "?", delivery or "-")
         return JSONResponse({"ok": True, "ignored": event or None}, status_code=202)
-    result = handler(session, payload)
-    session.commit()
+    result = await run_in_threadpool(_run_handler, handler, session, payload)
     if delivery:
         deliveries.add(delivery)
     action = payload.get("action")
@@ -657,6 +799,7 @@ async def github_webhook(request: Request, session: Session = Depends(get_db)) -
 
 
 __all__ = [
+    "ACCOUNT_ID_KEY",
     "DEFAULT_ORG_SETTINGS",
     "HANDLERS",
     "WEBHOOK_EVENTS",
@@ -664,8 +807,11 @@ __all__ = [
     "deactivate_orphan_sources",
     "deliveries",
     "github_webhook",
+    "org_for_account",
     "org_for_installation",
+    "reactivate_sources",
     "router",
+    "sync_repo_identity",
     "upsert_org",
     "upsert_repos",
 ]

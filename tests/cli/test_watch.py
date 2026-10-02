@@ -192,10 +192,25 @@ def test_report_json(lock_dir):
     assert data["items"][0]["source_name"] == "kintsua-fixture"
 
 
-def test_diff_without_a_lockfile_exits_two_with_a_hint(tmp_path):
+def test_diff_without_a_lockfile_exits_four_with_a_hint(tmp_path):
     res = watch("diff", "--server", SERVER, "--dir", str(tmp_path / "empty"))
-    assert res.exit_code == 2
+    assert res.exit_code == 4  # its own code: the Action snapshots on 4, never on a usage error
     assert "no lockfile" in res.stderr and "kintsua watch snapshot --server" in res.stderr
+
+
+def test_a_corrupt_lockfile_is_a_usage_error_not_the_gate(tmp_path):
+    d = tmp_path / ".kintsua"
+    assert watch("snapshot", "--server", SERVER, "--dir", str(d)).exit_code == 0
+    (lock,) = d.glob("*.lock.json")
+    text = lock.read_text()
+    lock.write_text(f"<<<<<<< HEAD\n{text}=======\n{text}>>>>>>> branch\n")
+    res = watch("diff", "--server", SERVER, "--dir", str(d))
+    assert res.exit_code == 2, res.output  # never 1, the "breaking change" code
+    assert "is not a valid kintsua lockfile" in res.stderr and lock.name in res.stderr
+    assert "Traceback" not in res.output
+    lock.write_text('{"kintsua_lockfile": 1}\n')  # JSON, but not a lockfile
+    res = watch("diff", "--server", SERVER, "--dir", str(d))
+    assert res.exit_code == 2 and "is not a valid kintsua lockfile" in res.stderr
 
 
 def test_connection_failure_exits_three_and_is_recorded(tmp_path):

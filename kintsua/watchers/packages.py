@@ -13,7 +13,9 @@ Canonical body::
 ``fetch`` (GitHub Releases for the tag ``v<ver>`` / ``<ver>`` via api.github.com, tolerating
 403/404, else the ``<ver>`` section of ``CHANGELOG.md`` from the repo's default branch via
 raw.githubusercontent.com) and stored in ``body["release_notes"]`` keyed by version;
-``diff`` and ``event_text`` read them from there.
+``diff`` and ``event_text`` read them from there. Every body is read with a byte cap
+(``meta["max_bytes"]``, 32 MB; 8 MB for release notes) and guarded sources
+(``meta["_net_guard"]``) have every request checked by ``kintsua.core.netguard``.
 
 Ops when ``latest`` changes: ``text_changed`` at ``/latest`` (old -> new), ``deprecated`` at
 ``/latest`` when the major changed (before = old major, after = new major), ``added`` at
@@ -34,6 +36,13 @@ import httpx
 from packaging.version import InvalidVersion, Version
 
 from kintsua.core.events import CanonicalDoc, ChangeOp, json_pointer
+from kintsua.watchers._http import (
+    ResponseTooLarge,
+    client_kwargs,
+    get_bounded,
+    guard_url,
+    max_bytes_for,
+)
 from kintsua.watchers.base import BaseWatcher, SourceRef, register
 
 log = logging.getLogger(__name__)
@@ -46,6 +55,7 @@ GITHUB_API = "https://api.github.com"
 RAW_GITHUB = "https://raw.githubusercontent.com"
 CHANGELOG_FILES = ("CHANGELOG.md", "CHANGES.md", "HISTORY.md", "CHANGELOG.rst", "CHANGELOG")
 RELEASE_NOTES_LIMIT = 20_000
+RELEASE_FETCH_MAX_BYTES = 8 * 1024 * 1024
 _GITHUB_RE = re.compile(
     r"github\.com[/:]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/#?].*)?$"
 )
@@ -187,8 +197,10 @@ async def fetch_release_notes(
     for tag in tags:
         url = f"{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{quote(tag, safe='@')}"
         try:
-            r = await client.get(url, headers=_github_headers())
-        except httpx.HTTPError as e:
+            r = await get_bounded(
+                client, url, max_bytes=RELEASE_FETCH_MAX_BYTES, headers=_github_headers()
+            )
+        except (httpx.HTTPError, ResponseTooLarge) as e:
             log.debug("release lookup failed %s: %s", url, e)
             break
         if r.status_code == 200:
@@ -209,8 +221,8 @@ async def fetch_release_notes(
     for fname in CHANGELOG_FILES:
         url = f"{RAW_GITHUB}/{owner}/{repo}/HEAD/{fname}"
         try:
-            r = await client.get(url)
-        except httpx.HTTPError as e:
+            r = await get_bounded(client, url, max_bytes=RELEASE_FETCH_MAX_BYTES)
+        except (httpx.HTTPError, ResponseTooLarge) as e:
             log.debug("changelog fetch failed %s: %s", url, e)
             continue
         if r.status_code != 200 or not r.text:
@@ -238,8 +250,13 @@ class _RegistryWatcher(BaseWatcher):
         for k, v in (meta.get("headers") or {}).items():
             headers[str(k)] = os.path.expandvars(str(v))
         timeout = float(meta.get("timeout_s") or DEFAULT_TIMEOUT_S)
+        # guarded sources: every request (registry, GitHub release, CHANGELOG) and every
+        # redirect hop goes through kintsua.core.netguard
         return httpx.AsyncClient(
-            follow_redirects=True, timeout=httpx.Timeout(timeout), headers=headers
+            follow_redirects=True,
+            timeout=httpx.Timeout(timeout),
+            headers=headers,
+            **client_kwargs(meta),
         )
 
     def diff(self, before: CanonicalDoc, after: CanonicalDoc) -> list[ChangeOp]:
@@ -298,8 +315,10 @@ class PyPIWatcher(_RegistryWatcher):
     async def fetch(self, source: SourceRef) -> CanonicalDoc:
         meta = source.meta or {}
         name = source.locator.strip()
+        url = PYPI_URL.format(name=quote(name, safe=""))
+        guard_url(url, meta)
         async with self._client(meta) as client:
-            r = await client.get(PYPI_URL.format(name=quote(name, safe="")))
+            r = await get_bounded(client, url, max_bytes=max_bytes_for(meta))
             r.raise_for_status()
             data = r.json()
             info = data.get("info") or {}
@@ -364,8 +383,10 @@ class NpmWatcher(_RegistryWatcher):
     async def fetch(self, source: SourceRef) -> CanonicalDoc:
         meta = source.meta or {}
         name = source.locator.strip()
+        url = NPM_URL.format(name=quote(name, safe="@"))
+        guard_url(url, meta)
         async with self._client(meta) as client:
-            r = await client.get(NPM_URL.format(name=quote(name, safe="@")))
+            r = await get_bounded(client, url, max_bytes=max_bytes_for(meta))
             r.raise_for_status()
             data = r.json()
             dist_tags = data.get("dist-tags") or {}

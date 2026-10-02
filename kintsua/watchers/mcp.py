@@ -11,11 +11,17 @@ Canonical body::
      "resourceTemplates": {uriTemplate: {...}},
      "prompts":   {name: {"description"?, "arguments": [...], "title"?}}}
 
+Volatile keys (``_meta``, ``icons``, timestamps ...) are dropped only from the server object
+and the top level of each entry, never from schemas or the name-keyed maps. A listing that
+fails with anything but "method not found" fails the fetch.
+
 Diff:
 
 * removed tool -> ``removed`` at ``/tools/<name>``; new tool -> ``added``
 * changed ``inputSchema`` -> ``diff_json_schema`` ops under ``/tools/<name>/inputSchema``
-  (``required_added``, ``type_changed``, ``enum_changed``, ``removed`` ...)
+  (``required_added``, ``type_changed``, ``enum_changed``, ``removed`` ...); an edit it does
+  not model (a ``default``, ``readOnly``) is ``text_changed``, a reordered ``required`` is
+  nothing
 * changed description with an unchanged schema -> ``text_changed`` at
   ``/tools/<name>/description`` (always recorded: the September 2026 research showed drift
   behind unchanged descriptions)
@@ -32,6 +38,7 @@ from typing import Any
 from kintsua.core.events import CanonicalDoc, ChangeOp, canonical_json, json_pointer
 from kintsua.watchers._mcp_compat import (
     MCPError,
+    error_code,
     init_result_of,
     list_prompts_all,
     list_resource_templates_all,
@@ -39,13 +46,26 @@ from kintsua.watchers._mcp_compat import (
     list_tools_all,
     open_session,
 )
-from kintsua.watchers.base import BaseWatcher, SourceRef, register, strip_volatile
-from kintsua.watchers.schemadiff import diff_json_schema, schema_summary
+from kintsua.watchers.base import (
+    VOLATILE_KEYS,
+    BaseWatcher,
+    SourceRef,
+    register,
+    sort_keys,
+    strip_volatile,
+)
+from kintsua.watchers.schemadiff import diff_json_schema, residual_schema_ops, schema_summary
 
 log = logging.getLogger(__name__)
 
-# MCP-specific volatile keys on top of the shared list
+# MCP-specific volatile keys on top of the shared list. They are dropped only at the top
+# level of the server object, of each tool / resource / prompt entry and of an entry's
+# ``annotations`` (e.g. a resource's ``lastModified``), never inside ``inputSchema`` /
+# ``outputSchema`` or from the tool/resource/prompt maps themselves: there the keys are
+# names the server chose (a ``date`` or ``session_id`` property, a tool called ``timestamp``).
 MCP_VOLATILE = frozenset({"_meta", "icons", "ttlMs", "cacheScope", "resultType"})
+ENTRY_VOLATILE = VOLATILE_KEYS | MCP_VOLATILE
+METHOD_NOT_FOUND = -32601
 
 TOOL_KEYS = ("title", "description", "inputSchema", "outputSchema", "annotations")
 RESOURCE_KEYS = ("name", "title", "description", "mimeType", "size", "annotations")
@@ -63,6 +83,9 @@ def _pick(d: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     for k in keys:
         if k in d and d[k] is not None:
             out[k] = d[k]
+    ann = out.get("annotations")
+    if isinstance(ann, dict):
+        out["annotations"] = {k: v for k, v in ann.items() if k not in ENTRY_VOLATILE}
     return out
 
 
@@ -81,7 +104,8 @@ def build_body(
         "name": server_info.get("name"),
         "version": server_info.get("version"),
         "protocolVersion": init.get("protocolVersion"),
-        "capabilities": init.get("capabilities") or {},
+        # protocol-defined keys only: safe to strip volatile ones recursively
+        "capabilities": strip_volatile(init.get("capabilities") or {}, MCP_VOLATILE),
     }
     if init.get("instructions"):
         server["instructions"] = init["instructions"]
@@ -124,7 +148,7 @@ def build_body(
         "resourceTemplates": tmpl_map,
         "prompts": prompt_map,
     }
-    return strip_volatile(body, MCP_VOLATILE)
+    return sort_keys(body)
 
 
 async def fetch_server_snapshot(locator: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -157,13 +181,15 @@ def _has_cap(caps: dict[str, Any], name: str, init: dict[str, Any]) -> bool:
 
 
 async def _tolerant(fn: Any, session: Any, what: str) -> list[dict[str, Any]]:
+    """An optional listing the server does not implement ("method not found") is empty.
+    Anything else (a timeout, a transport or server error) fails the fetch: an empty map
+    would read as every resource / prompt removed, then re-added on the next good poll."""
     try:
         return await fn(session)
-    except MCPError as e:  # method not found / not supported
+    except MCPError as e:
+        if error_code(e) != METHOD_NOT_FOUND:
+            raise
         log.debug("%s not supported by server: %s", what, e)
-        return []
-    except Exception as e:  # noqa: BLE001 - a broken optional listing must not fail the poll
-        log.warning("%s failed (ignored): %s: %s", what, type(e).__name__, e)
         return []
 
 
@@ -171,7 +197,13 @@ async def fetch_tools(locator: str, meta: dict[str, Any] | None = None) -> list[
     """Tool definitions (wire format, with ``inputSchema``) for the indexer and the SDK."""
     async with open_session(locator, dict(meta or {})) as session:
         tools = await list_tools_all(session)
-    return [strip_volatile(t, MCP_VOLATILE) for t in tools if t.get("name")]
+    # wire format minus per-response metadata; inputSchema is untouched so
+    # tool_fingerprint(t["inputSchema"]) equals the SDK's fingerprint of the same tool
+    return [
+        sort_keys({k: v for k, v in t.items() if k not in MCP_VOLATILE})
+        for t in tools
+        if t.get("name")
+    ]
 
 
 # --------------------------------------------------------------------------------------
@@ -232,32 +264,14 @@ def _diff_tools(before: dict[str, Any], after: dict[str, Any], ops: list[ChangeO
         b, a = before[name], after[name]
         b_schema, a_schema = b.get("inputSchema") or {}, a.get("inputSchema") or {}
         if b_schema != a_schema:
+            # edits the semantic differ does not model (a default, readOnly, the order of
+            # `required`) are text_changed or nothing, never a synthetic type change
             schema_ops = diff_json_schema(b_schema, a_schema, base + "/inputSchema")
-            if not schema_ops:
-                schema_ops = [
-                    ChangeOp(
-                        op="type_changed",
-                        path=base + "/inputSchema",
-                        before=schema_summary(b_schema),
-                        after=schema_summary(a_schema),
-                    )
-                ]
-            ops.extend(schema_ops)
-        if (b.get("outputSchema") or {}) != (a.get("outputSchema") or {}):
-            out_ops = diff_json_schema(
-                b.get("outputSchema") or {}, a.get("outputSchema") or {}, base + "/outputSchema"
-            )
-            ops.extend(
-                out_ops
-                or [
-                    ChangeOp(
-                        op="type_changed",
-                        path=base + "/outputSchema",
-                        before=schema_summary(b.get("outputSchema")),
-                        after=schema_summary(a.get("outputSchema")),
-                    )
-                ]
-            )
+            ops.extend(schema_ops or residual_schema_ops(b_schema, a_schema, base + "/inputSchema"))
+        b_out, a_out = b.get("outputSchema") or {}, a.get("outputSchema") or {}
+        if b_out != a_out:
+            out_ops = diff_json_schema(b_out, a_out, base + "/outputSchema")
+            ops.extend(out_ops or residual_schema_ops(b_out, a_out, base + "/outputSchema"))
         # description drift is ALWAYS recorded, schema change or not
         if b.get("description") != a.get("description"):
             ops.append(

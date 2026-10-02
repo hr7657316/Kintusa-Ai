@@ -198,23 +198,25 @@ def test_ingest_large_diff_is_stored_out_of_row(session, settings, tmp_path, mon
 async def test_poll_source_records_failures_with_backoff_then_recovers(
     session, settings, monkeypatch
 ):
-    src = find_or_create_source(session, "mcp", "fake://flaky", poll_interval_s=600)
+    # operator-seeded: the only kind of stdio-style locator the worker may run
+    src = find_or_create_source(session, "mcp", "fake://flaky", poll_interval_s=600, origin="seed")
     session.commit()
     monkeypatch.setattr(
         "kintsua.watchers.run.get_watcher",
         lambda kind: ScriptedMCP(RuntimeError("connection refused")),
     )
 
+    # backoff base = min(poll interval, 15 min), doubling per consecutive failure
     res = await poll_source(session, {"source_id": str(src.id)})
-    assert res["ok"] is False and "connection refused" in res["error"] and res["backoff_s"] == 1200
+    assert res["ok"] is False and "connection refused" in res["error"] and res["backoff_s"] == 600
     session.refresh(src)
     assert src.consecutive_failures == 1
     assert src.last_error.startswith("RuntimeError: connection refused")
     assert src.last_polled_at is None
-    assert src.backoff_until > utcnow() + timedelta(seconds=1200 - 10)
+    assert src.backoff_until > utcnow() + timedelta(seconds=600 - 10)
 
     res = await poll_source(session, {"source_id": str(src.id)})
-    assert res["backoff_s"] == 2400
+    assert res["backoff_s"] == 1200
     session.refresh(src)
     assert src.consecutive_failures == 2
 
@@ -237,7 +239,7 @@ async def test_poll_source_records_failures_with_backoff_then_recovers(
 
 
 async def test_poll_source_emits_change_event_on_second_poll(session, monkeypatch):
-    src = find_or_create_source(session, "mcp", "fake://changing")
+    src = find_or_create_source(session, "mcp", "fake://changing", origin="seed")
     session.commit()
     scripted = ScriptedMCP(mcp_doc("mcp_before.json"), mcp_doc("mcp_after.json"))
     monkeypatch.setattr("kintsua.watchers.run.get_watcher", lambda kind: scripted)
@@ -362,8 +364,8 @@ def test_ensure_tick_job_is_idempotent(session):
 async def test_poll_all_runs_each_source_in_its_own_session(session, db, monkeypatch):
     from kintsua.core.db import new_session
 
-    good = find_or_create_source(session, "mcp", "fake://good")
-    bad = find_or_create_source(session, "mcp", "fake://bad")
+    good = find_or_create_source(session, "mcp", "fake://good", origin="seed")
+    bad = find_or_create_source(session, "mcp", "fake://bad", origin="seed")
     find_or_create_source(session, "pypi", "notpolled")
     session.commit()
 
@@ -415,9 +417,11 @@ def test_failing_sources_flags_only_week_old_failures(session):
     _source(session, "fake://inactive", consecutive_failures=9, active=False)
     _source(session, "fake://healthy", last_polled_at=now - timedelta(days=30))
     session.flush()
-    failing = failing_sources(session)
+    failing = failing_sources(session, public_only=False)
     assert {f.locator for f in failing} == {old.locator, never.locator}
     f = next(f for f in failing if f.locator == old.locator)
     assert f.kind == "mcp" and f.last_error == "boom" and f.consecutive_failures == 3
     assert f.failing_since == old.last_polled_at
-    assert failing_sources(session, days=30) == []
+    assert failing_sources(session, days=30, public_only=False) == []
+    # the default (public) view lists only operator-seeded sources: these are customer ones
+    assert failing_sources(session) == []

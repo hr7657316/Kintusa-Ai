@@ -4,6 +4,13 @@ dismiss impacts whose call sites vanished -> install issue -> enqueue polls.
 Registered as the ``index_repo`` job handler (payload ``{"repo_id", "reason"}``). The whole
 run is bounded by ``Settings.index_budget_s`` (10 minutes) with checks between phases and
 inside the extractors; the clone lives in a temp directory that is always removed.
+
+Nothing from the repo is ever executed: MCP command lines are only read (tool names come
+from an operator-seeded server or an existing snapshot) and http(s) lookups of customer
+URLs go through ``kintsua.core.netguard`` (docs/CONTRACTS.md, "Source trust"). The write
+phase holds a row lock on the repo, so two runs of one repo (an install and a debounced
+push on different workers) write one after the other, and a run whose clone is older than
+the last write steps aside (``IndexResult.superseded``).
 """
 
 from __future__ import annotations
@@ -12,18 +19,19 @@ import argparse
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from kintsua.core.config import get_settings
 from kintsua.core.github import LABEL, get_github_app
 from kintsua.core.models import CallSite, Dependency, Impact, Repo, Snapshot, Source
+from kintsua.core.netguard import BlockedURL, check_url, is_http_locator
 from kintsua.core.queue import (
     JOB_INDEX_REPO,
     JOB_POLL_SOURCE,
@@ -36,7 +44,7 @@ from kintsua.core.storage import get_document
 from kintsua.core.util import utcnow
 from kintsua.indexer import mcp_config, python_extract, ts_extract
 from kintsua.indexer.clone import CloneError, clone_repo, read_repo_file, temp_clone_dir
-from kintsua.indexer.config import parse_kintsua_yml
+from kintsua.indexer.config import merge_api_settings, parse_kintsua_yml
 from kintsua.indexer.depmap import DependencyMap, dependency_map, render_install_issue
 from kintsua.indexer.resolve import resolve_dependencies
 from kintsua.indexer.schema import (
@@ -53,6 +61,21 @@ CONFIG_KEYS = ("sources", "mute", "fix", "test_command")
 OPEN_IMPACT_STATUSES = ("detected", "issued", "fixing", "pr_open")
 INSTALL_ISSUE_TITLE_PREFIX = "Kintsua is watching "
 TOOLS_FETCH_TIMEOUT_S = 30.0
+# Source.meta keys a live tools fetch of a customer URL may use (never ``headers`` /
+# ``auth_env``: those expand worker environment variables into the request)
+_URL_FETCH_META_KEYS = ("transport", "timeout_s", "read_timeout_s")
+RUNTIME_FILE_PATH = "<runtime>"  # matcher.runtime's call-site path for runtime evidence
+# dependency meta kept when a row survives only through runtime call sites
+_RUNTIME_KEPT_META = (
+    "vendor",
+    "display_name",
+    "transport",
+    "host",
+    "server_name",
+    "openapi_source_id",
+    "changelog_source_id",
+)
+MAX_DEPENDENCY_NAME = 512  # Dependency.name is String(512)
 _PERMANENT_CLONE_ERRORS = (
     "repository not found",
     "could not read username",
@@ -83,6 +106,7 @@ class IndexResult:
     install_issue_created: bool = False
     config_error: str | None = None
     error: str | None = None
+    superseded: bool = False  # a run with a newer clone wrote first; nothing was written
     duration_s: float = 0.0
     phases: dict[str, float] = field(default_factory=dict)
 
@@ -91,6 +115,7 @@ class IndexResult:
             "repo_id": str(self.repo_id),
             "reason": self.reason,
             "head_sha": self.head_sha,
+            "superseded": self.superseded,
             "dependencies": self.dependencies,
             "call_sites": self.call_sites,
             "watched": self.watched,
@@ -147,8 +172,15 @@ def known_tools_lookup(
     session: Session, *, allow_network: bool, budget: Budget | None = None
 ) -> Callable[[str], list[str] | None]:
     """``tools_for_locator`` for the MCP extractor: the source's latest snapshot first, the
-    live server (``kintsua.watchers.mcp.fetch_tools``) only when network is allowed."""
+    live server (``kintsua.watchers.mcp.fetch_tools``) only when network is allowed.
+
+    Trust rules (docs/CONTRACTS.md): a locator that is not an http(s) URL is a command line
+    and is fetched (spawned) only when its ``Source`` row is operator-seeded
+    (``Source.trusted``); otherwise only its snapshot is read. An http(s) URL of a source
+    that is not trusted passes ``kintsua.core.netguard.check_url`` first (and every request
+    is guarded) when ``Settings.net_guard`` is on."""
     cache: dict[str, list[str] | None] = {}
+    net_guard = bool(get_settings().net_guard)
 
     def lookup(locator: str) -> list[str] | None:
         if locator in cache:
@@ -167,22 +199,54 @@ def known_tools_lookup(
                     names = _tool_names_from_body(get_document(snap.storage_ref))
                 except Exception as e:  # noqa: BLE001
                     log.info("snapshot for %s unreadable: %s", locator, e)
-        remaining = budget.remaining() if budget is not None else TOOLS_FETCH_TIMEOUT_S * 2
+        remaining = budget.remaining() if budget is not None else float("inf")
         if names is None and allow_network and remaining > 2 * TOOLS_FETCH_TIMEOUT_S:
-            names = _fetch_tool_names(locator, dict(src.meta) if src is not None else None)
+            meta = _live_fetch_meta(locator, src, net_guard=net_guard)
+            if meta is not None:
+                names = _fetch_tool_names(locator, meta)
         cache[locator] = names
         return names
 
     return lookup
 
 
+def _live_fetch_meta(locator: str, src: Source | None, *, net_guard: bool) -> dict[str, Any] | None:
+    """The meta for a live ``fetch_tools`` of ``locator``, or None when it must not be
+    fetched: a command line whose source is not operator-seeded is never spawned, and a
+    guarded URL that points at a non-public address is never requested."""
+    trusted = src is not None and src.trusted
+    if not is_http_locator(locator):
+        if not trusted:
+            log.info("not running untrusted MCP command %r (snapshot only)", locator[:200])
+            return None
+        return dict(src.meta or {}) if src is not None else {}
+    if trusted:
+        meta = dict(src.meta or {}) if src is not None else {}
+    else:
+        meta = {
+            k: v
+            for k, v in ((src.meta if src else None) or {}).items()
+            if k in _URL_FETCH_META_KEYS
+        }
+    if net_guard and not trusted:
+        try:
+            check_url(locator)
+        except BlockedURL as e:
+            log.info("not fetching MCP tools from %s: %s", locator[:200], e)
+            return None
+        meta["_net_guard"] = True
+    return meta
+
+
 def _fetch_tool_names(locator: str, meta: dict[str, Any] | None) -> list[str] | None:
+    """Live ``tools/list``. Callers decide whether the locator may be fetched at all
+    (``_live_fetch_meta``)."""
     try:
         from kintsua.watchers.mcp import fetch_tools
     except ImportError:
         return None
     meta = dict(meta or {})
-    if not locator.startswith(("http://", "https://")):
+    if not is_http_locator(locator):
         meta.setdefault("transport", "stdio")
         meta.setdefault("quiet", True)
     meta.setdefault("timeout_s", TOOLS_FETCH_TIMEOUT_S)
@@ -234,7 +298,9 @@ def write_index(
 ) -> WriteResult:
     """Upsert ``dependency`` by (repo, kind, name) keeping ``first_seen_sha``; replace the
     indexer's ``call_site`` rows (runtime-discovered rows are kept); delete dependencies no
-    longer found unless they were discovered at runtime."""
+    longer found unless they were discovered at runtime. A dependency the code no longer
+    shows but the runtime SDK reported calls on keeps its runtime call sites and becomes a
+    runtime-discovered row instead of being deleted."""
     existing = {
         (d.kind, d.name): d
         for d in session.scalars(select(Dependency).where(Dependency.repo_id == repo.id))
@@ -278,7 +344,24 @@ def write_index(
     for key, row in existing.items():
         if key in rows or row.discovered_at_runtime:
             continue
-        session.execute(delete(CallSite).where(CallSite.dependency_id == row.id))
+        session.execute(
+            delete(CallSite).where(
+                CallSite.dependency_id == row.id, CallSite.discovered_at_runtime.is_(False)
+            )
+        )
+        runtime_sites = session.scalar(
+            select(func.count()).select_from(CallSite).where(CallSite.dependency_id == row.id)
+        )
+        if runtime_sites:
+            # the code no longer shows it (URL moved to config, ...) but the runtime SDK saw
+            # calls: keep the row and that evidence, as a runtime-discovered dependency
+            row.discovered_at_runtime = True
+            row.meta = {
+                k: v
+                for k, v in (row.meta or {}).items()
+                if k.startswith("runtime_") or k in _RUNTIME_KEPT_META
+            }
+            continue
         session.execute(delete(Dependency).where(Dependency.id == row.id))
         session.expunge(row)
         deleted += 1
@@ -350,22 +433,152 @@ def _impact_pairs(impact: Impact) -> list[tuple[str, str]]:
     return pairs
 
 
+@dataclass(frozen=True)
+class _LiveSite:
+    call_site_id: str
+    dependency_id: str
+    dependency: str
+    file_path: str
+    line: int
+    symbol: str | None
+    operation: str
+    in_tests: bool
+    runtime: bool
+
+
+def _live_sites(session: Session, repo: Repo) -> list[_LiveSite]:
+    rows = session.execute(
+        select(
+            CallSite.id,
+            CallSite.dependency_id,
+            Dependency.name,
+            CallSite.file_path,
+            CallSite.line,
+            CallSite.symbol,
+            CallSite.operation,
+            CallSite.args_shape,
+            CallSite.discovered_at_runtime,
+        )
+        .join(Dependency, Dependency.id == CallSite.dependency_id)
+        .where(Dependency.repo_id == repo.id)
+        .order_by(CallSite.file_path, CallSite.line)
+    ).all()
+    return [
+        _LiveSite(
+            call_site_id=str(r[0]),
+            dependency_id=str(r[1]),
+            dependency=str(r[2]),
+            file_path=str(r[3]),
+            line=int(r[4] or 0),
+            symbol=r[5],
+            operation=str(r[6]),
+            in_tests=bool((r[7] or {}).get("in_tests")),
+            runtime=bool(r[8]),
+        )
+        for r in rows
+    ]
+
+
+def _moved_record(old: dict[str, Any], site: _LiveSite) -> dict[str, Any]:
+    rec = {
+        k: v for k, v in old.items() if k not in ("in_tests", "discovered_at_runtime", "moved_from")
+    }
+    rec.update(
+        call_site_id=site.call_site_id,
+        file_path=site.file_path,
+        line=site.line,
+        symbol=site.symbol,
+        operation=site.operation,
+        dependency_id=site.dependency_id,
+        dependency=site.dependency,
+        moved_from=f"{old.get('file_path')}:{old.get('line')}",
+    )
+    if site.in_tests:
+        rec["in_tests"] = True
+    if site.runtime:
+        rec["discovered_at_runtime"] = True
+    return rec
+
+
 def dismiss_vanished_impacts(
-    session: Session, repo: Repo, head_sha: str, new_sites: set[tuple[str, str]]
+    session: Session,
+    repo: Repo,
+    head_sha: str,
+    new_sites: set[tuple[str, str]] | None = None,
+    *,
+    partial_files: Iterable[str] = (),
 ) -> list[Impact]:
-    """Open impacts (detected / issued / fixing / pr_open) none of whose matched call sites
-    (by file_path + operation) exist any more are dismissed; their GitHub issue gets a
-    comment saying why and is closed."""
+    """Dismiss open impacts (detected / issued / fixing / pr_open) whose operations the repo
+    no longer calls; their GitHub issue gets a comment saying why and is closed.
+
+    "No longer calls" is decided per operation and dependency, not per file: a call that
+    moved to another file (rename, refactor) keeps the impact alive and its
+    ``matched_call_sites`` entry is rewritten to the new place. An impact is never dismissed
+    on the strength of a file that still exists but was not fully parsed this run
+    (``partial_files``: over the size limit, binary, syntax errors, extractor error), nor
+    for runtime evidence (``<runtime>`` sites, which a re-index never removes)."""
     impacts = list(
         session.scalars(
             select(Impact).where(Impact.repo_id == repo.id, Impact.status.in_(OPEN_IMPACT_STATUSES))
         )
     )
+    if not impacts:
+        return []
+    live = _live_sites(session, repo)
+    at = {(s.file_path, s.operation) for s in live} | set(new_sites or ())
+    by_dep_id: dict[tuple[str, str], list[_LiveSite]] = {}
+    by_dep_name: dict[tuple[str, str], list[_LiveSite]] = {}
+    by_op: dict[str, list[_LiveSite]] = {}
+    for s in live:
+        by_dep_id.setdefault((s.dependency_id, s.operation), []).append(s)
+        by_dep_name.setdefault((s.dependency, s.operation), []).append(s)
+        by_op.setdefault(s.operation, []).append(s)
+    partial = set(partial_files)
+
+    def elsewhere(m: dict[str, Any], op: str) -> list[_LiveSite]:
+        dep_id, dep_name = m.get("dependency_id"), m.get("dependency")
+        if dep_id or dep_name:
+            return by_dep_id.get((str(dep_id), op)) or by_dep_name.get((str(dep_name), op)) or []
+        return by_op.get(op, [])
+
+    def still_there(m: dict[str, Any]) -> bool:
+        fp, op = str(m.get("file_path")), str(m.get("operation"))
+        return bool(
+            (fp, op) in at
+            or fp == RUNTIME_FILE_PATH
+            or m.get("discovered_at_runtime")
+            or fp in partial
+        )
+
     dismissed: list[Impact] = []
     now = utcnow()
     for imp in impacts:
-        pairs = _impact_pairs(imp)
-        if not pairs or any(p in new_sites for p in pairs):
+        records = [
+            (m, isinstance(m, dict) and bool(m.get("file_path") and m.get("operation")))
+            for m in imp.matched_call_sites or []
+        ]
+        kept = [m for m, ok in records if ok and still_there(m)]
+        alive, moved = bool(kept), False
+        placed = {(str(m["file_path"]), int(m.get("line") or 0), str(m["operation"])) for m in kept}
+        rewritten: list[Any] = []
+        for m, ok in records:
+            if not ok or still_there(m):
+                rewritten.append(m)
+                continue
+            sites = elsewhere(m, str(m["operation"]))
+            if not sites:
+                rewritten.append(m)  # this one is gone; the impact may live through others
+                continue
+            alive = moved = True
+            for s in sites:
+                if (s.file_path, s.line, s.operation) not in placed:
+                    placed.add((s.file_path, s.line, s.operation))
+                    rewritten.append(_moved_record(m, s))
+        if alive:
+            if moved:
+                imp.matched_call_sites = rewritten
+            continue
+        if not _impact_pairs(imp):
             continue
         imp.status = "dismissed"
         imp.resolved_at = now
@@ -473,11 +686,47 @@ def _record_error(session: Session, repo_id: UUID, message: str) -> None:
 
 
 def _merge_config(old: dict[str, Any] | None, new: dict[str, Any]) -> dict[str, Any]:
-    """The file defines the spec keys; anything else on Repo.config (set through the API)
-    survives a re-index."""
+    """The file defines the spec keys; anything else on Repo.config survives a re-index, and
+    the values the settings API set (recorded under ``config["settings"]``) are merged back
+    into the spec keys (``kintsua.indexer.config.merge_api_settings``)."""
     merged = {k: v for k, v in (old or {}).items() if k not in CONFIG_KEYS}
     merged.update(new)
-    return merged
+    return merge_api_settings(merged)
+
+
+def _drop_oversized(extracted: ExtractResult) -> None:
+    """Dependencies whose name (an MCP command line or URL) does not fit ``dependency.name``
+    are left out with an extract error instead of failing the whole run."""
+    keep: list[DependencyInfo] = []
+    dropped: set[tuple[str, str]] = set()
+    for dep in extracted.dependencies:
+        if len(dep.name) <= MAX_DEPENDENCY_NAME:
+            keep.append(dep)
+            continue
+        dropped.add(dep.key)
+        where = str(dep.meta.get("config_file") or "?")
+        extracted.stats.record_error(
+            where, f"{dep.kind} locator longer than {MAX_DEPENDENCY_NAME} characters skipped"
+        )
+    if dropped:
+        extracted.dependencies = keep
+        extracted.call_sites = [c for c in extracted.call_sites if c.dependency_key not in dropped]
+
+
+def _lock_repo_for_write(session: Session, repo: Repo, cloned_at: datetime) -> bool:
+    """Serialise the write phase per repo (``SELECT ... FOR UPDATE`` on the repo row, held
+    until the write commits). Returns False when a run whose clone is newer than ours has
+    already written: this run's tree is stale and must not overwrite it."""
+    stats = session.execute(
+        select(Repo.index_stats).where(Repo.id == repo.id).with_for_update()
+    ).scalar_one_or_none()
+    written = (stats or {}).get("cloned_at") if isinstance(stats, dict) else None
+    if not written:
+        return True
+    try:
+        return datetime.fromisoformat(str(written)) <= cloned_at
+    except (TypeError, ValueError):  # unparsable or naive: treat as older
+        return True
 
 
 def extract_tree(
@@ -516,9 +765,11 @@ def index_repo(
     log.info("index %s (%s) start", repo.full_name, reason)
     try:
         t = time.monotonic()
+        file_config: dict[str, Any] | None = None
         with temp_clone_dir() as tmp:
             dest = tmp / "repo"
             clone_url = get_github_app().clone_url(org.github_installation_id, repo.full_name)
+            cloned_at = utcnow()  # the tree is at least this new
             head = clone(
                 clone_url,
                 repo.default_branch,
@@ -534,7 +785,7 @@ def index_repo(
             if found is not None:
                 name, text = found
                 try:
-                    repo.config = _merge_config(repo.config, parse_kintsua_yml(text))
+                    file_config = parse_kintsua_yml(text)
                 except ValueError as e:
                     result.config_error = f"{name}: {e}"
                     log.info("%s: bad %s kept previous config: %s", repo.full_name, name, e)
@@ -546,17 +797,30 @@ def index_repo(
                 ),
                 deadline=budget.deadline,
             )
+            _drop_oversized(extracted)
             result.phases["extract"] = time.monotonic() - t
         budget.check("resolve")
 
         t = time.monotonic()
+        # one writer per repo from here to the commit; a run with an older tree than the
+        # last write steps aside (two workers can hold an install and a push run at once)
+        if not _lock_repo_for_write(session, repo, cloned_at):
+            session.rollback()
+            result.superseded = True
+            log.info("index %s (%s): a newer index already wrote; skipping", repo.full_name, reason)
+            return result
+        session.refresh(repo)  # config / stats as committed by whoever wrote last
+        if file_config is not None:
+            repo.config = _merge_config(repo.config, file_config)
         resolved = resolve_dependencies(session, extracted.dependencies, repo_config=repo.config)
         result.phases["resolve"] = time.monotonic() - t
         budget.check("write")
 
         t = time.monotonic()
         written = write_index(session, repo, head, resolved.dependencies, extracted.call_sites)
-        dismissed = dismiss_vanished_impacts(session, repo, head, written.new_sites)
+        dismissed = dismiss_vanished_impacts(
+            session, repo, head, written.new_sites, partial_files=extracted.stats.partial_files
+        )
         repo.last_indexed_sha = head
         repo.indexed_at = utcnow()
         repo.last_index_error = None
@@ -566,6 +830,7 @@ def index_repo(
             "head_sha": head,
             "reason": reason,
             "indexed_at": repo.indexed_at.isoformat(),
+            "cloned_at": cloned_at.isoformat(),
         }
         for sid in resolved.new_source_ids:
             enqueue(
@@ -575,6 +840,10 @@ def index_repo(
         result.phases["write"] = time.monotonic() - t
 
         t = time.monotonic()
+        # the install issue too has one writer per repo (a concurrent run may have just
+        # created it: refresh to see its number)
+        session.execute(select(Repo.id).where(Repo.id == repo.id).with_for_update())
+        session.refresh(repo)
         depmap = dependency_map(
             session, repo, stats=extracted.stats, config_error=result.config_error
         )

@@ -42,6 +42,39 @@ def test_tool_name_normalisation():
     )
     assert http_tool_name("GET", "https://h/o/5f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c") == "GET h/o/{id}"
     assert http_tool_name("GET", "https://h/v2/items") == "GET h/v2/items"  # 'v2' is not an id
+    assert http_tool_name("POST", "https://u:p@h/v1/charges/123") == "POST h/v1/charges/{id}"
+
+
+@pytest.mark.parametrize(
+    "url,expected,secret",
+    [
+        (
+            "https://hooks.slack.com/services/T0A1B2C3D/B0A1B2C3D/abcDEFghiJKLmnoPQRstuVWX",
+            "POST hooks.slack.com/services/{token}/{token}/{token}",
+            "abcDEFghiJKLmnoPQRstuVWX",
+        ),
+        (
+            "https://discord.com/api/webhooks/123456789012345678/" + "Zr7f-Kq_9" * 7 + "x",
+            "POST discord.com/api/webhooks/{id}/{token}",
+            "Zr7f-Kq_9",
+        ),
+        (
+            "https://api.telegram.org/bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage",
+            "POST api.telegram.org/{token}/sendMessage",
+            "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
+        ),
+        (
+            "https://api.vendor.com/v1/verify/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "POST api.vendor.com/v1/verify/{token}",
+            "eyJhbGci",
+        ),
+    ],
+)
+def test_tool_names_never_carry_path_credentials(url, expected, secret):
+    name = http_tool_name("POST", url)
+    assert name == expected and secret not in name
+    for word in ("charges", "sendMessage", "getChatMemberCount", "personal_access_tokens"):
+        assert http_tool_name("GET", f"https://h/v1/{word}") == f"GET h/v1/{word}"
 
 
 def test_sync_httpx_client_ok_and_error(reporter):
@@ -155,3 +188,92 @@ def test_redaction_patterns_cover_the_core_list():
     ):
         assert s not in out, (s, out)
     assert SECRET_RE.sub("[REDACTED]", '{"id": 42, "status": "ok"}') == '{"id": 42, "status": "ok"}'
+
+
+@pytest.mark.parametrize(
+    "text,secret",
+    [
+        ("Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNz"),
+        ('{"Authorization": "Basic dXNlcjpwYXNzd29yZDEyMw=="}', "dXNlcjpwYXNz"),
+        ('{"authorization": "Token abcdef1234567890"}', "abcdef1234567890"),
+        ("echo: basic dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNz"),
+        ('{"private_key": "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"}', "MIIEvQIBADAN"),
+        ("private-key=MIIEvQIBADANBgkqhkiG9w0BAQEFAAS", "MIIEvQIBADAN"),
+        ("proxy https://alice:hunter2pass@proxy.internal:8080/", "hunter2pass"),
+        ("github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz", "11ABCDEFG0123"),
+        ("key kts_abcdefghijklmnopqrstuvwxyz0123", "abcdefghijklmnop"),
+    ],
+)
+def test_redaction_covers_basic_auth_private_keys_and_url_credentials(text, secret):
+    assert secret not in SECRET_RE.sub("[REDACTED]", text)
+
+
+def test_sdk_redaction_is_a_superset_of_the_core():
+    from kintsua.core.util import SECRET_PATTERNS, redact_secrets
+
+    samples = [
+        "sk_live_abcdefghijklmnop",
+        "Authorization: Bearer abcdefghijklmnop123",
+        "Authorization: Token abcdef1234567890",
+        "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+        "xoxb-1234567890-abcdef xapp-1-A0123456789-abcdef",
+        "AKIAABCDEFGHIJKLMNOP AIzaSyA-abcdefghijklmnopqrstuvwxyz01234",
+        "sk-ant-abcdefghijklmnopqrstuvwxyz sk-proj-abcdefghijklmnopqrstuvwxyz",
+        "sk-abcdefghijklmnopqrstuvwx kts_abcdefghijklmnopqrstuvwxyz0123",
+        "npm_" + "a1" * 18 + " pypi-" + "A" * 60,
+        'client_secret="abcdefghijkl" private_key=MIIEvQIBADANBgkqh',
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlc2lnbmF0dXJl",
+        "https://alice:hunter2pass@proxy.internal/",
+    ]
+    assert len(samples) >= len(SECRET_PATTERNS) // 2
+    for text in samples:
+        core, sdk = redact_secrets(text), SECRET_RE.sub("[REDACTED]", text)
+        assert core != text, text  # each sample is one the core redacts...
+        leaked = [w for w in text.split() if w not in core and w in sdk and len(w) > 8]
+        assert not leaked, (text, sdk)  # ...and nothing the core removes survives the SDK
+
+
+def test_redaction_leaves_prose_alone():
+    for text in ("basic authentication failed", "token expired", "see the private keys docs"):
+        assert SECRET_RE.sub("[REDACTED]", text) == text
+
+
+class AiohttpLikeRequest:
+    """aiohttp's ``_RequestContextManager``: awaitable *and* an async context manager."""
+
+    def __await__(self):
+        return self._resp().__await__()
+
+    async def _resp(self):
+        return httpx.Response(200)
+
+    async def __aenter__(self):
+        return await self._resp()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class AiohttpLikeSession:
+    def request(self, method, url, **kw):
+        return AiohttpLikeRequest()
+
+
+async def test_unsupported_clients_are_returned_untouched(reporter):
+    session = AiohttpLikeSession()
+    assert wrap_http(session) is session and not hasattr(session, "_kintsua_wrapped")
+    async with session.request("GET", "https://api.vendor.com/x") as resp:
+        assert resp.status_code == 200
+    assert events(reporter) == []
+
+
+async def test_observe_keeps_non_coroutine_awaitables_intact(reporter):
+    from kintsua.sdk.wrap import observe
+
+    seen = []
+    request = observe(AiohttpLikeSession().request, lambda *a: seen.append(a))
+    async with request("GET", "https://api.vendor.com/x") as resp:  # still a context manager
+        assert resp.status_code == 200
+    assert (await request("GET", "https://api.vendor.com/x")).status_code == 200

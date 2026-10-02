@@ -74,6 +74,10 @@ class WeeklyReport(BaseModel):
     failing_sources: list[FailingSource] = Field(default_factory=list)
     stats: ReportStats = Field(default_factory=ReportStats)
     notes: list[str] = Field(default_factory=list)
+    # True only for a build restricted to public (operator-seeded) sources with no customer
+    # repo links (``build_weekly_report(..., public_only=True)``): the only kind the public
+    # page may serve
+    public: bool = False
 
     def by_severity(self) -> dict[str, list[ReportItem]]:
         out: dict[str, list[ReportItem]] = {s: [] for s in SEVERITY_ORDER}

@@ -129,10 +129,13 @@ def test_discovery_creates_runtime_dependencies_and_call_sites_once(
         and rooms_src.locator == "https://mcp.rooms.example/mcp"
         and rooms_src.active
     )
+    assert rooms_src.origin == "runtime" and rooms_src.meta["transport"] == "http"
+    assert rooms.meta["transport"] == "http" and rooms.meta["server_name"] == rooms_src.locator
     stripe = deps[("http", "api.stripe.com")]
     assert stripe.meta["vendor"] == "stripe" and stripe.meta["host"] == "api.stripe.com"
     stripe_src = session.get(Source, stripe.source_id)
     assert stripe_src.kind == "openapi" and stripe_src.vendor == "stripe"
+    assert stripe_src.origin == "seed"  # the curated sdk_map spec URL
     assert deps[("http", "api.unknown-vendor.example")].source_id is None
 
     runtime_sites = [cs for cs in _sites(session, repo) if cs.discovered_at_runtime]
@@ -301,10 +304,19 @@ def test_promotion_opens_issue_when_auto_issue_is_on(session, fake_github, f: Fa
     try:
         imp = s2.scalar(select(Impact))
         assert imp.status == "issued" and imp.github_issue_number == 1
-        src = s2.scalar(select(Source).where(Source.kind == "mcp"))
-        assert (
-            src.locator == "https://mcp.weather.example/mcp" and src.active
-        )  # a real server is watched
+        server = s2.scalar(
+            select(Source).where(Source.locator == "https://mcp.weather.example/mcp")
+        )
+        assert server.kind == "mcp" and server.active  # a real server is watched
+        assert server.origin == "runtime" and not server.public
+        # the promoted event is private to the repo: it hangs off its own observed source
+        row = s2.get(ChangeEventRow, imp.change_event_id)
+        observed = s2.get(Source, row.source_id)
+        assert observed.locator == observed_locator(repo, "get_weather")
+        assert observed.origin == "observed" and not observed.active and not observed.public
+        assert observed.meta["server"] == "https://mcp.weather.example/mcp"
+        assert row.diff["private"] is True and row.diff["repo_id"] == str(repo.id)
+        assert row.diff["server"] == "https://mcp.weather.example/mcp"
     finally:
         s2.close()
     issue = fake_github.repo("acme/support-agent").issues[1]

@@ -164,3 +164,70 @@ def test_auth_required_mcp_server_exits_three_with_a_hint(tmp_path):
     assert "401" in res.stderr and "--auth-env" in res.stderr and "could not fetch" in res.stderr
     rows = [json.loads(line) for line in (tmp_path / "history.jsonl").read_text().splitlines()]
     assert rows[0]["error"] and "401" in rows[0]["error"]
+
+
+@respx.mock
+def test_auth_env_is_sent_for_a_spec(tmp_path, monkeypatch):
+    authed = respx.get(SPEC_URL, headers={"Authorization": "Bearer s3cret"}).mock(
+        return_value=spec("openapi3_before.json")
+    )
+    respx.get(SPEC_URL).mock(return_value=httpx.Response(401, text="who are you"))
+    monkeypatch.setenv("SPEC_TOKEN", "s3cret")
+    d = tmp_path / ".kintsua"
+    args = ["--spec", SPEC_URL, "--auth-env", "SPEC_TOKEN", "--dir", str(d)]
+    res = runner.invoke(app, ["watch", "snapshot", *args], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    assert authed.call_count == 1
+    assert "s3cret" not in (d / "api.vendor.test.lock.json").read_text()
+    res = runner.invoke(app, ["watch", "diff", *args], catch_exceptions=False)
+    assert res.exit_code == 0 and authed.call_count == 2
+    monkeypatch.delenv("SPEC_TOKEN")
+    res = runner.invoke(app, ["watch", "diff", *args], catch_exceptions=False)
+    assert res.exit_code == 3 and "SPEC_TOKEN is not set" in res.stderr
+
+
+SPEC_V2_URL = "https://api.vendor.test/v2/openapi.json"
+
+
+@respx.mock
+def test_two_sources_on_one_host_never_share_a_lockfile(tmp_path):
+    v1 = respx.get(SPEC_URL).mock(return_value=spec("openapi3_before.json"))
+    v2 = respx.get(SPEC_V2_URL).mock(return_value=spec("openapi3_after.json"))
+    d = tmp_path / ".kintsua"
+
+    def run(cmd: str, url: str, *extra: str):
+        argv = ["watch", cmd, "--spec", url, "--dir", str(d), *extra]
+        return runner.invoke(app, argv, catch_exceptions=False)
+
+    assert run("snapshot", SPEC_URL).exit_code == 0
+    first = (d / "api.vendor.test.lock.json").read_text()
+    res = run("diff", SPEC_V2_URL)  # same host, another spec: not compared with the first one
+    assert res.exit_code == 4 and "no lockfile" in res.stderr, res.output
+    assert run("snapshot", SPEC_V2_URL).exit_code == 0
+    assert (d / "api.vendor.test.lock.json").read_text() == first  # not overwritten
+    assert len(list(d.glob("*.lock.json"))) == 2
+    assert run("diff", SPEC_URL).exit_code == 0 and run("diff", SPEC_V2_URL).exit_code == 0
+    v2.mock(return_value=spec("openapi3_before.json"))  # only the second spec changes
+    assert run("diff", SPEC_V2_URL).exit_code == 1
+    assert run("diff", SPEC_URL).exit_code == 0 and v1.call_count >= 3
+    # an explicit --name shared by two sources is a usage error for diff, a warning for snapshot
+    assert run("snapshot", SPEC_URL, "--name", "shared").exit_code == 0
+    res = run("diff", SPEC_V2_URL, "--name", "shared")
+    assert res.exit_code == 2 and f"was written for openapi {SPEC_URL}" in res.stderr
+    assert "--name" in res.stderr
+    res = run("snapshot", SPEC_V2_URL, "--name", "shared")
+    assert res.exit_code == 0 and "overwriting" in res.stderr
+
+
+@respx.mock
+def test_push_redirect_is_a_warning_not_a_success(tmp_path):
+    respx.get(SPEC_URL).mock(return_value=spec("openapi3_before.json"))
+    push = respx.post("http://api.test/v1/watch/push").mock(
+        return_value=httpx.Response(301, headers={"Location": PUSH_URL})
+    )
+    argv = ["watch", "snapshot", "--spec", SPEC_URL, "--dir", str(tmp_path), "--push"]
+    argv += ["--repo", "acme/agent", "--key", "kts_k", "--url", "http://api.test"]
+    res = runner.invoke(app, argv, catch_exceptions=False)
+    assert res.exit_code == 0 and push.call_count == 1
+    assert "pushed" not in res.stdout
+    assert "HTTP 301 redirect to https://api.test/v1/watch/push" in res.stderr

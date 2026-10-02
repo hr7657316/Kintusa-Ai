@@ -1,9 +1,12 @@
 """The ``weekly_report`` job and the report CLI.
 
-The job builds the last-7-days report, renders Markdown and writes
+The job builds the last-7-days *public* report (only operator-seeded sources, no customer
+repo links, redacted errors: docs/CONTRACTS.md rule 5), renders Markdown and writes
 ``<data_dir>/reports/<YYYY-MM-DD>.md`` plus ``latest.md`` / ``latest.json`` (what the API's
-``GET /report/weekly`` serves). CLI: ``python -m kintsua.report.run [--since 7d] [--json]
-[--write]`` prints the Markdown (or JSON) to stdout.
+``GET /report/weekly`` serves; ``read_latest`` only hands out a report marked public).
+CLI: ``python -m kintsua.report.run [--since 7d] [--json] [--write] [--include-private]``
+prints the Markdown (or JSON) to stdout; an operator's ``--include-private`` build is never
+written to ``latest.*``.
 """
 
 from __future__ import annotations
@@ -36,10 +39,16 @@ def reports_dir(data_dir: str | Path | None = None) -> Path:
 
 
 def write_report(report: WeeklyReport, data_dir: str | Path | None = None) -> dict[str, Path]:
-    """Write ``<date>.md``, ``latest.md`` and ``latest.json``; returns the paths."""
+    """Write ``<date>.md``, ``latest.md`` and ``latest.json``; returns the paths. A report
+    that is not public (an operator's unfiltered build) is written only as
+    ``<date>.private.md`` and never replaces what the public page serves."""
     d = reports_dir(data_dir)
     d.mkdir(parents=True, exist_ok=True)
     markdown = render_markdown(report)
+    if not report.public:
+        private = d / f"{report.until.strftime('%Y-%m-%d')}.private.md"
+        private.write_text(markdown, "utf-8")
+        return {"dated": private}
     payload = json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True)
     dated = d / f"{report.until.strftime('%Y-%m-%d')}.md"
     latest_md = d / "latest.md"
@@ -51,20 +60,33 @@ def write_report(report: WeeklyReport, data_dir: str | Path | None = None) -> di
 
 
 def read_latest(data_dir: str | Path | None = None) -> tuple[str | None, dict[str, Any] | None]:
-    """The stored ``latest.md`` and ``latest.json`` (None when no report was written yet)."""
+    """The stored ``latest.md`` and ``latest.json``: ``(None, None)`` when no report was
+    written yet, or when the stored one is not marked public (written before the public
+    build existed, or by hand), so the public page never serves customer data."""
     d = reports_dir(data_dir)
     md = d / "latest.md"
     js = d / "latest.json"
+    try:
+        data = json.loads(js.read_text("utf-8")) if js.exists() else None
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or data.get("public") is not True:
+        if js.exists():
+            log.warning("%s is not a public report; not serving it", js)
+        return None, None
     text = md.read_text("utf-8") if md.exists() else None
-    data = json.loads(js.read_text("utf-8")) if js.exists() else None
     return text, data
 
 
 def build_report_for_window(
-    session: Session, *, until: datetime | None = None, window: timedelta = DEFAULT_WINDOW
+    session: Session,
+    *,
+    until: datetime | None = None,
+    window: timedelta = DEFAULT_WINDOW,
+    public_only: bool = True,
 ) -> WeeklyReport:
     until = until or utcnow()
-    return build_weekly_report(session, until - window, until)
+    return build_weekly_report(session, until - window, until, public_only=public_only)
 
 
 def _register(kind: str) -> Any:
@@ -79,7 +101,7 @@ def weekly_report(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
     window = DEFAULT_WINDOW
     if payload.get("since"):
         window = parse_duration(str(payload["since"]))
-    report = build_report_for_window(session, window=window)
+    report = build_report_for_window(session, window=window, public_only=True)
     paths = write_report(report)
     log.info(
         "weekly report written: %s (%d items, %d breaking)",
@@ -102,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--write", action="store_true", help="also write <data_dir>/reports/")
     parser.add_argument("--no-safe", action="store_true", help="omit the safe section")
+    parser.add_argument(
+        "--include-private",
+        action="store_true",
+        help="operator view: include customer sources and repo links (never published)",
+    )
     args = parser.parse_args(argv)
 
     from kintsua.core.db import new_session
@@ -110,7 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging("WARNING")
     session = new_session()
     try:
-        report = build_report_for_window(session, window=parse_duration(args.since))
+        report = build_report_for_window(
+            session, window=parse_duration(args.since), public_only=not args.include_private
+        )
     finally:
         session.close()
     if args.write:

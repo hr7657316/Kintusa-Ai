@@ -18,12 +18,25 @@ from tests.matcher.conftest import CHARGES_BODY, Factory
 def test_plain_neutralises_markdown_and_html():
     s = plain("<script>alert(1)</script> **bold** [x](http://evil) # heading\n- item `code`")
     assert "<" not in s and ">" not in s
-    assert "**" not in s and "[x](" not in s and "\\[x\\](http://evil)" in s
+    assert "**" not in s and "[x](" not in s and "\\[x\\](http:\u200b//evil)" in s
     assert "`code`" not in s and "\\`code\\`" in s
     assert "\n" not in s
     assert s.startswith("&lt;script&gt;")
     assert plain("- leading dash") == "\\- leading dash"
     assert plain("x" * 50, max_len=10).endswith("…") and len(plain("x" * 50, max_len=10)) == 10
+
+
+def test_plain_defuses_mentions_and_autolinks():
+    # GitHub release notes quoted in an issue must not ping upstream contributors or plant
+    # clickable links in the customer's repo
+    s = plain("Fix retries by @octocat in https://x.example/y see www.z.example or WWW.Q.example")
+    for live in ("@octocat", "https://", "www.z", "WWW.Q"):
+        assert live not in s, live
+    # the text still reads the same (zero-width spaces are invisible)
+    assert s.replace("\u200b", "") == (
+        "Fix retries by @octocat in https://x.example/y see www.z.example or WWW.Q.example"
+    )
+    assert plain("dev@example.com") == "dev@\u200bexample.com"
 
 
 def _issued_world(session, f: Factory, **cls_kw):
@@ -88,7 +101,7 @@ def test_build_issue_body_sections_and_escaping(session, fake_github, f: Factory
     # untrusted text is inert
     assert "<img" not in body and "<b>" not in body and "<br>" not in body
     assert "\\*\\*bold\\*\\*" in body and "&lt;img src=x onerror=alert(1)&gt;" in body
-    assert "[call](http://x)" not in body and "\\[call\\](http://x)" in body
+    assert "[call](http://x)" not in body and "\\[call\\](http:\u200b//x)" in body
     # upstream facts
     assert "**Stripe API** (openapi) · `2024-06-20` → `2024-09-30` · detected" in body
     assert "required\\_added at" in body and '`["amount"]` → `["amount","currency"]`' in body

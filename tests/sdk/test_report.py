@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
+import pytest
 import respx
 
 from kintsua.sdk.report import SDK_VERSION, Reporter, configure, flush, get_reporter
@@ -245,6 +247,64 @@ def test_real_local_http_server_roundtrip():
         assert path == "/v1/ingest" and auth == "Bearer kts_live"
         assert body["repo"] == "acme/agent" and body["events"][0]["tool_name"] == "get_weather"
         rep.close()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@respx.mock
+def test_a_redirect_is_not_a_delivery():
+    route = respx.post(INGEST).mock(
+        return_value=httpx.Response(301, headers={"Location": "https://api.test2/v1/ingest"})
+    )
+    rep = Reporter("k", "r", URL, flush_interval_s=3600)
+    rep.retry_delay_s = 0.01
+    rep.record("t", "mcp", "ok")
+    assert rep.flush() == 0
+    assert rep.sent == 0 and rep.dropped == 1 and route.called
+
+
+def _collecting_server() -> tuple[HTTPServer, list[dict]]:
+    received: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, received
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_forked_child_starts_its_own_flusher_and_sends_only_its_events():
+    srv, received = _collecting_server()
+    try:
+        rep = configure(key="k", repo="acme/agent", url=f"http://127.0.0.1:{srv.server_port}")
+        rep.flush_interval_s = 3600
+        rep.record("parent_sent", "mcp", "ok")  # starts the parent's flusher thread
+        assert rep._thread is not None and rep._thread.is_alive()
+        assert rep.flush() == 1
+        rep.record("parent_pending", "mcp", "ok")  # still queued at fork time
+        pid = os.fork()
+        if pid == 0:  # the child (a multiprocessing worker): report back via the exit code
+            code = 1
+            try:
+                rep.record("child_event", "mcp", "ok")
+                alive = rep._thread is not None and rep._thread.is_alive()
+                code = 0 if alive and rep.flush() == 1 else 2
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        names = [e["tool_name"] for body in received for e in body["events"]]
+        assert names == ["parent_sent", "child_event"]  # the child never re-sent the parent's
+        assert [e["tool_name"] for e in rep._q] == ["parent_pending"]  # still the parent's
     finally:
         srv.shutdown()
         srv.server_close()

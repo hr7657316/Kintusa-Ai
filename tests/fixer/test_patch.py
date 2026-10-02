@@ -121,3 +121,50 @@ def test_normalize_repo_path():
 def test_looks_binary():
     assert looks_binary(b"\x00\x01\x02")
     assert not looks_binary(b"print('hi')\n")
+
+
+# a removed SQL comment ``-- legacy column`` is emitted as ``--- legacy column`` and an
+# added ``++ x`` as ``+++ x``: hunk body, not file headers
+SQL_COMMENT_DIFF = """diff --git a/agent/q.py b/agent/q.py
+index 1111111..2222222 100644
+--- a/agent/q.py
++++ b/agent/q.py
+@@ -1,5 +1,5 @@
+ QUERY = \"\"\"
+ SELECT id,
+--- legacy column
++++ x
+ FROM charges
+ \"\"\"
+diff --git a/agent/other.py b/agent/other.py
+index 3333333..4444444 100644
+--- a/agent/other.py
++++ b/agent/other.py
+@@ -1 +1 @@
+-a = 1
++a = 2
+"""
+
+
+def test_hunk_body_lines_that_look_like_file_headers():
+    patches = parse_unified_diff(SQL_COMMENT_DIFF)
+    assert [p.path for p in patches] == ["agent/q.py", "agent/other.py"]
+    q = patches[0]
+    assert q.removed_lines == 1 and q.added_lines == 1
+    assert q.hunks[0].removed == ["-- legacy column"] and q.hunks[0].added == ["++ x"]
+    assert touched_paths(SQL_COMMENT_DIFF) == ["agent/q.py", "agent/other.py"]
+    assert changed_line_count(SQL_COMMENT_DIFF) == 4
+    assert diff_stat(SQL_COMMENT_DIFF) == {"agent/q.py": (1, 1), "agent/other.py": (1, 1)}
+
+
+def test_hunk_counts_from_a_real_git_diff(sandbox):
+    """End to end through ``git diff``: removing a ``-- `` line from a call-site file."""
+    sandbox.write_file("agent/q.py", 'QUERY = """\nSELECT id,\n-- legacy column\nFROM t\n"""\n')
+    sandbox.git_ok("add", "agent/q.py")
+    sandbox.git_ok("commit", "-q", "-m", "q")
+    sandbox.base_sha = sandbox.head_sha()
+    sandbox.write_file("agent/q.py", 'QUERY = """\nSELECT id,\n++ x\nFROM t\n"""\n')
+    diff = sandbox.diff()
+    assert "\n--- legacy column\n" in diff and "\n+++ x\n" in diff
+    assert touched_paths(diff) == ["agent/q.py"]
+    assert changed_line_count(diff) == 2

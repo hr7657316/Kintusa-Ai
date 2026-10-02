@@ -217,3 +217,29 @@ def test_read_context_and_number_lines(sandbox: LocalSandbox):
     assert len(ctx_text.splitlines()) == 5
     assert read_context(sandbox, "missing.py", 3) == ""
     assert number_lines("a\nb", 9) == "   9 | a\n  10 | b"
+
+
+def test_wall_clock_expiry_between_turns_returns_partial_outcome(
+    sandbox: LocalSandbox, fake_llm: FakeLLM, monkeypatch
+):
+    """The budget running out between two model turns is an ``error`` outcome carrying the
+    tokens already spent, not a ``SandboxTimeout`` escaping ``run_agent``."""
+    ctx = _ctx(sandbox)
+    fake_llm.queue_turn(
+        tool_calls=[
+            ("read_file", {"path": "agent/billing.py", "start_line": None, "end_line": None})
+        ]
+    )
+    fake_llm.queue_turn(tool_calls=[("done", {"reason": "never reached", "needs_human": False})])
+    real = fake_llm.complete_tools
+
+    def turn_then_expire(*args, **kwargs):
+        turn = real(*args, **kwargs)
+        sandbox.deadline.total_s = 0.0  # the job's wall clock runs out during this turn
+        return turn
+
+    monkeypatch.setattr(fake_llm, "complete_tools", turn_then_expire)
+    outcome = run_agent(sandbox, ctx, get_llm(), max_steps=12)
+    assert outcome.status == "error" and "wall clock" in outcome.reason
+    assert outcome.steps == 1 and outcome.tool_calls == ["read_file"]
+    assert outcome.tokens_in == 10 and outcome.tokens_out == 5 and outcome.tokens_total == 15

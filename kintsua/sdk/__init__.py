@@ -1,7 +1,5 @@
-"""The Kintsua runtime SDK (``pip install kintsua``; stdlib + httpx only): ``wrap_mcp`` for any
-MCP client session, ``wrap_http`` for httpx / requests clients, ``hook_*`` for frameworks. No key
-(``KINTSUA_KEY``) means every call is a no-op; nothing raises into the agent; no payloads leave
-the process unless ``sample=True`` (argument keys only, never values)."""
+"""Kintsua runtime SDK (stdlib + httpx): ``wrap_mcp``, ``wrap_http``, ``hook_*``. No key: no-ops;
+nothing raises into the agent; no payloads leave unless ``sample=True`` (argument keys only)."""
 
 from __future__ import annotations
 

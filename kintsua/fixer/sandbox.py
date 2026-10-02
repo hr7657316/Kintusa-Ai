@@ -33,8 +33,19 @@ Two backends share one interface (``Sandbox``):
       prompt-injected changelog that gets code executed through the test suite cannot
       exfiltrate the customer's code because there is no route out at all.
 
-    Both containers share one named volume holding the clone, so the install step's
-    output (``.venv``, ``node_modules``) is visible to the no-network steps.
+    Both containers share one named volume holding the clone (``/work``), so the install
+    step's in-project output (``.venv``, ``node_modules``, poetry's env with
+    ``POETRY_VIRTUALENVS_IN_PROJECT=1``) is visible to the no-network steps, and a second
+    per-job named volume mounted over the image venv (``/opt/venv``, first on ``PATH``)
+    so ``pip install -r requirements.txt`` / ``pip install -e .`` from the networked
+    helper land where the test container's ``python`` looks. Docker seeds an empty named
+    volume from the image's directory on first mount, so the venv starts as the image
+    built it (pytest, ruff, poetry).
+
+Only files the sandbox itself writes (``write_file``, replacement and unified patches)
+count as new files in ``diff`` / ``changed_files``; untracked artefacts of the install or
+the test run (``package-lock.json``, ``*.egg-info``, report files) never become part of
+the patch.
 
 Every backend scrubs the installation token (and any other ``://user:secret@`` URL
 credentials) from everything it logs or returns, and clamps every ``run`` to the job's
@@ -72,6 +83,7 @@ from kintsua.fixer.patch import (
     apply_replacement,
     looks_binary,
     normalize_repo_path,
+    parse_unified_diff,
 )
 
 log = logging.getLogger(__name__)
@@ -224,6 +236,8 @@ class Sandbox:
         self.branch: str | None = None
         self.secrets: tuple[str, ...] = ()
         self.log_lines: list[str] = []
+        #: repo paths written through this sandbox (the only untracked files a diff shows)
+        self.written_paths: set[str] = set()
         self._cleaned = False
 
     # ---- abstract -------------------------------------------------------------------
@@ -347,12 +361,24 @@ class Sandbox:
         self.branch = branch
         self.record(f"prepared {scrub(clone_url, self.secrets)}@{branch} at {head[:12]}")
 
+    def _note_written(self, path: str) -> None:
+        self.written_paths.add(self.repo_path(path))
+
+    def _stage_new_files(self) -> None:
+        """``git add --intent-to-add`` the files this sandbox created, so they show up in
+        ``git diff``. Never ``--all``: untracked files the install or the test run left
+        behind (lockfiles, ``*.egg-info``, coverage/report files) are not the patch."""
+        present = [p for p in sorted(self.written_paths) if self.file_exists(p)]
+        if present:
+            # an ignored path makes git exit 1 but the others are still added
+            self.git("add", "--intent-to-add", "--", *present)
+
     def diff(self) -> str:
-        """Unified diff of the working tree (including new files) against the base sha."""
+        """Unified diff against the base sha: tracked files plus the files this sandbox
+        wrote (untracked install/test artefacts are left out)."""
         if not self.workdir or not self.base_sha:
             raise SandboxError("sandbox is not prepared")
-        # intent-to-add so new files show up in ``git diff``; harmless for tracked files
-        self.git("add", "--all", "--intent-to-add", ".")
+        self._stage_new_files()
         res = self.git("diff", "--no-color", "--no-ext-diff", "--binary", self.base_sha, "--", ".")
         if not res.ok:
             raise SandboxError(f"git diff failed: {scrub(res.tail(10), self.secrets)}")
@@ -361,7 +387,7 @@ class Sandbox:
     def changed_files(self) -> list[str]:
         if not self.workdir or not self.base_sha:
             raise SandboxError("sandbox is not prepared")
-        self.git("add", "--all", "--intent-to-add", ".")
+        self._stage_new_files()
         res = self.git("diff", "--name-only", self.base_sha, "--", ".")
         files = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
         return sorted(dict.fromkeys(files))
@@ -419,6 +445,10 @@ class Sandbox:
         res = self.git("apply", "--whitespace=nowarn", "-", input=diff_text)
         if not res.ok:
             return False, f"git apply failed: {scrub(res.tail(10), self.secrets)}"
+        for fp in parse_unified_diff(diff_text):
+            norm = normalize_repo_path(fp.new_path or "") if fp.new_path else None
+            if norm:
+                self.written_paths.add(norm)
         self.record("applied unified diff")
         return True, "patch applied"
 
@@ -655,6 +685,7 @@ class LocalSandbox(Sandbox):
         p = self._abs(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
+        self._note_written(path)
 
     def list_files(self, glob: str = "**/*") -> list[str]:
         if not self.workdir:
@@ -722,6 +753,8 @@ class DockerSandbox(Sandbox):
     WORK_MOUNT = "/work"
     REPO_DIR = "/work/repo"
     SCRATCH_DIR = "/work/scratch"
+    #: the image's venv (first on PATH); a per-job volume so installs reach the test container
+    VENV_DIR = "/opt/venv"
 
     def __init__(
         self,
@@ -741,6 +774,7 @@ class DockerSandbox(Sandbox):
         self.user = user
         self.image = self.settings.sandbox_image
         self.volume: Any = None
+        self.venv_volume: Any = None
         self.container: Any = None
         self._env_base = {
             "HOME": "/home/sandbox",
@@ -755,6 +789,10 @@ class DockerSandbox(Sandbox):
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
             "npm_config_update_notifier": "false",
+            # installs must land on a volume both containers see: pip (and poetry, which
+            # honours the image's activated VIRTUAL_ENV) write to the shared /opt/venv; an
+            # env poetry creates itself goes in the project (.venv under /work/repo)
+            "POETRY_VIRTUALENVS_IN_PROJECT": "true",
         }
 
     # ---- lifecycle ------------------------------------------------------------------
@@ -769,8 +807,13 @@ class DockerSandbox(Sandbox):
             "user": self.user,
             "labels": {"kintsua.job": self.job_id, "kintsua.component": "fixer"},
         }
+        volumes: dict[str, dict[str, str]] = {}
         if self.volume is not None:
-            cfg["volumes"] = {self.volume.name: {"bind": self.WORK_MOUNT, "mode": "rw"}}
+            volumes[self.volume.name] = {"bind": self.WORK_MOUNT, "mode": "rw"}
+        if self.venv_volume is not None:
+            volumes[self.venv_volume.name] = {"bind": self.VENV_DIR, "mode": "rw"}
+        if volumes:
+            cfg["volumes"] = volumes
         return cfg
 
     def egress_hosts(self) -> dict[str, str]:
@@ -814,6 +857,10 @@ class DockerSandbox(Sandbox):
         self.volume = self.client.volumes.create(
             name=f"kintsua-fix-{self.job_id}", labels={"kintsua.job": self.job_id}
         )
+        # created before the first container mounts it, so Docker seeds it from the image
+        self.venv_volume = self.client.volumes.create(
+            name=f"kintsua-venv-{self.job_id}", labels={"kintsua.job": self.job_id}
+        )
         # the image's /work is owned by the sandbox user, so a fresh volume mounted there
         # inherits that ownership; only the scratch dir has to exist
         self._networked_run(["mkdir", "-p", self.SCRATCH_DIR], timeout_s=60)
@@ -845,7 +892,7 @@ class DockerSandbox(Sandbox):
         if self._cleaned:
             return
         self._cleaned = True
-        for obj in (self.container, self.volume):
+        for obj in (self.container, self.volume, self.venv_volume):
             if obj is None:
                 continue
             try:
@@ -854,6 +901,7 @@ class DockerSandbox(Sandbox):
                 log.warning("sandbox cleanup: %s", scrub(str(e), self.secrets))
         self.container = None
         self.volume = None
+        self.venv_volume = None
 
     # ---- processes ------------------------------------------------------------------
 
@@ -1033,6 +1081,7 @@ class DockerSandbox(Sandbox):
 
     def write_file(self, path: str, text: str) -> None:
         self._put_file(self._abs(path), text)
+        self._note_written(path)
 
     def list_files(self, glob: str = "**/*") -> list[str]:
         if not self.workdir:

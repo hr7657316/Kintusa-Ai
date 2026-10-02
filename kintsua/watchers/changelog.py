@@ -8,7 +8,8 @@ Every change is ``text_changed`` at ``/paragraphs/<index>`` (``before=None`` for
 paragraph, ``after=None`` for a vanished one) and the joined new paragraphs travel with the
 event as ``text`` for the LLM classifier. ``robots.txt`` is honoured (``urllib.robotparser``;
 unreachable robots files count as allow) and a disallowed page fails the poll with a clear
-``RobotsDisallowed`` error.
+``RobotsDisallowed`` error. The page body is capped at ``meta["max_bytes"]`` (32 MB) and
+guarded sources (``meta["_net_guard"]``) go through ``kintsua.core.netguard``.
 """
 
 from __future__ import annotations
@@ -25,6 +26,13 @@ from urllib.parse import urlsplit
 import httpx
 
 from kintsua.core.events import CanonicalDoc, ChangeOp, json_pointer
+from kintsua.watchers._http import (
+    ResponseTooLarge,
+    client_kwargs,
+    get_bounded,
+    guard_url,
+    max_bytes_for,
+)
 from kintsua.watchers.base import BaseWatcher, SourceRef, register
 
 log = logging.getLogger(__name__)
@@ -32,6 +40,7 @@ log = logging.getLogger(__name__)
 DEFAULT_USER_AGENT = "kintsua-watcher/0.1 (+https://github.com/hr7657316/Kintusa-Ai)"
 DEFAULT_TIMEOUT_S = 60.0
 ROBOTS_TTL_S = 3600.0
+ROBOTS_MAX_BYTES = 512 * 1024
 MAX_PARAGRAPHS = 5000
 TEXT_LIMIT = 20_000
 
@@ -56,11 +65,11 @@ async def robots_allows(client: httpx.AsyncClient, url: str, user_agent: str) ->
     else:
         rp = None
         try:
-            r = await client.get(host + "/robots.txt")
+            r = await get_bounded(client, host + "/robots.txt", max_bytes=ROBOTS_MAX_BYTES)
             if r.status_code == 200 and r.text:
                 rp = urllib.robotparser.RobotFileParser()
                 rp.parse(r.text.splitlines())
-        except httpx.HTTPError as e:  # unreachable robots.txt counts as allow
+        except (httpx.HTTPError, ResponseTooLarge) as e:  # unreachable robots.txt: allow
             log.debug("robots.txt fetch failed for %s: %s", host, e)
         _robots_cache[host] = (now + ROBOTS_TTL_S, rp)
     if rp is None:
@@ -179,12 +188,16 @@ class ChangelogWatcher(BaseWatcher):
         for k, v in (meta.get("headers") or {}).items():
             headers[str(k)] = os.path.expandvars(str(v))
         timeout = float(meta.get("timeout_s") or DEFAULT_TIMEOUT_S)
+        guard_url(url, meta)
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=httpx.Timeout(timeout), headers=headers
+            follow_redirects=True,
+            timeout=httpx.Timeout(timeout),
+            headers=headers,
+            **client_kwargs(meta),  # guarded: robots.txt, the page and every redirect hop
         ) as client:
             if not meta.get("ignore_robots") and not await robots_allows(client, url, ua):
                 raise RobotsDisallowed(f"robots.txt disallows fetching {url} for {_ua_token(ua)}")
-            r = await client.get(url)
+            r = await get_bounded(client, url, max_bytes=max_bytes_for(meta))
             r.raise_for_status()
             html_text = r.text
         body = html_to_body(html_text, url)

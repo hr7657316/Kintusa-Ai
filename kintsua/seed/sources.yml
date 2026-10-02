@@ -3,8 +3,11 @@
 # Every openapi / discovery / changelog URL below returned HTTP 200 on 2026-10-01 and every
 # public MCP server answered `initialize` + `tools/list` without credentials. MCP servers
 # that require OAuth are listed with `meta.auth_env`: set that environment variable to a
-# bearer token on the worker and they are polled too; until then they fail with a clear
-# "environment variable X is not set" error and back off.
+# bearer token on the worker and they are polled too; until then they are "unconfigured":
+# not scheduled, recorded as "unconfigured: environment variable X is not set" when polled
+# by hand, and never listed as failing on the public weekly report.
+# Every entry is loaded with origin "seed": the only sources whose stdio command the hosted
+# worker runs and the only ones on the public weekly report.
 #
 # Fields: kind (openapi|mcp|pypi|npm|changelog), locator, display_name, vendor,
 #         poll_interval_s (optional; defaults: mcp 6h, openapi 24h, pypi/npm 6h, changelog 24h),

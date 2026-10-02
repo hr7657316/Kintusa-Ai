@@ -32,6 +32,7 @@ def test_setup_page_posts_the_manifest_to_github(client, settings):
         "issues",
         "check_suite",
         "check_run",
+        "repository",
     }
 
     r = client.get("/setup/github")

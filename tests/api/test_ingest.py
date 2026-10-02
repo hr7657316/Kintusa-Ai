@@ -7,8 +7,23 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
-from kintsua.core.models import ChangeEventRow, Dependency, RuntimeEvent, Snapshot, Source
+from kintsua.api.ingest import MAX_SAMPLE_BYTES
+from kintsua.core.db import new_session
+from kintsua.core.events import CanonicalDoc, canonical_json
+from kintsua.core.models import (
+    CallSite,
+    ChangeEventRow,
+    Dependency,
+    Impact,
+    Repo,
+    RuntimeEvent,
+    Snapshot,
+    Source,
+)
+from kintsua.core.queue import drain
 from kintsua.core.util import utcnow
+from kintsua.watchers.run import ingest_canonical_doc
+from kintsua.worker import register_all_handlers
 from tests.api.conftest import REPO_FULL_NAME, bearer
 
 EVENTS = [
@@ -169,6 +184,48 @@ def test_ingest_writes_runtime_events_and_queues_match_runtime(client, factory, 
     assert r.status_code == 200 and r.json()["accepted"] == 0
 
 
+def test_oversized_schema_mismatch_keeps_a_compacted_diff(client, factory, session):
+    """api-correctness-10: a large-tool mismatch keeps its ops (clipped) instead of losing
+    the diff, so runtime promotion still says which property changed."""
+    org = factory.org()
+    repo = factory.repo(org)
+    key = factory.sdk_key(org)
+    big_schema = {
+        "type": "object",
+        "description": "x" * 400,
+        "properties": {f"field_{i}": {"type": "string", "description": "y" * 60} for i in range(8)},
+    }
+    diff = [
+        {
+            "op": "required_added" if i == 0 else "added",
+            "path": f"/properties/prop_{i}",
+            "before": None,
+            "after": big_schema,
+        }
+        for i in range(60)
+    ]
+    event = {
+        "tool_name": "create_pull_request",
+        "kind": "mcp",
+        "outcome": "schema_mismatch",
+        "schema_fingerprint": "c" * 64,
+        "sample": {"diff": diff, "previous_fingerprint": "d" * 64, "server": "https://x.example"},
+    }
+    r = client.post(
+        "/v1/ingest", json={"repo": REPO_FULL_NAME, "events": [event]}, headers=bearer(key)
+    )
+    assert r.status_code == 200, r.text
+    row = session.scalar(select(RuntimeEvent).where(RuntimeEvent.repo_id == repo.id))
+    sample = row.sample
+    assert sample["truncated"] is True and sample["previous_fingerprint"] == "d" * 64
+    assert len(canonical_json(sample).encode("utf-8")) <= MAX_SAMPLE_BYTES
+    kept = sample["diff"]
+    assert kept and kept[0]["op"] == "required_added" and kept[0]["path"] == "/properties/prop_0"
+    assert all(set(op) == {"op", "path", "before", "after"} for op in kept)
+    assert sample["ops_dropped"] == 60 - len(kept) > 0
+    assert isinstance(kept[0]["after"], str) and len(kept[0]["after"]) <= 515
+
+
 def test_ingest_404_for_unknown_repo_and_413_over_batch(client, factory, settings, monkeypatch):
     org = factory.org()
     repo = factory.repo(org)
@@ -234,19 +291,28 @@ def test_watch_push_snapshots_diffs_and_attaches_a_dependency(client, factory, s
         first["change_event_id"] is None and first["ops"] == 0 and first["first_snapshot"] is True
     )
     src = session.get(Source, first["source_id"])
-    assert src.kind == "mcp" and src.locator == locator and src.display_name == "Weather MCP"
-    assert (
-        src.vendor == "weather"
-        and src.meta["transport"] == "http"
-        and src.meta["pushed_by"] == "cli"
-    )
+    # org-scoped: its own locator, origin push, never polled, never trusted
+    assert src.kind == "mcp" and src.locator == f"push:{org.id}:mcp:{locator}"
+    assert src.origin == "push" and src.owner_org_id == org.id
+    assert src.pollable is False and src.trusted is False and src.public is False
+    assert src.display_name == "Weather MCP" and src.vendor == "weather"
+    assert src.meta["transport"] == "http" and src.meta["pushed_by"] == "cli"
+    assert src.meta["pushed_locator"] == locator
     assert src.last_polled_at is not None
+    # nothing was written under the bare locator
+    assert session.scalar(select(Source).where(Source.locator == locator)) is None
     dep = session.get(Dependency, first["dependency_id"])
-    assert dep.repo_id == repo.id and dep.kind == "mcp" and dep.name == locator
+    assert dep.repo_id == repo.id and dep.kind == "mcp" and dep.name == src.locator
     assert dep.source_id == src.id and dep.discovered_at_runtime is True
     assert dep.meta["vendor"] == "weather" and dep.meta["pushed_by"] == "cli"
+    assert dep.meta["pushed_locator"] == locator and dep.meta["server_name"] == "Weather MCP"
+    sites = list(session.scalars(select(CallSite).where(CallSite.dependency_id == dep.id)))
+    assert [(s.operation, s.symbol, s.discovered_at_runtime) for s in sites] == [
+        ("get_weather", "kintsua watch --push", True)
+    ]
     assert session.scalar(select(Snapshot).where(Snapshot.source_id == src.id)) is not None
     assert factory.jobs("classify_event") == []
+    assert factory.jobs("poll_source") == []
 
     # the same body again: no new snapshot, no event
     r = client.post("/v1/watch/push", json=body, headers=bearer(key))
@@ -276,8 +342,12 @@ def test_watch_push_snapshots_diffs_and_attaches_a_dependency(client, factory, s
     assert [j.payload for j in jobs] == [{"change_event_id": str(event.id)}]
     assert len(session.scalars(select(Dependency).where(Dependency.repo_id == repo.id)).all()) == 1
 
-    # an OpenAPI document works the same way (stdio MCP locators are marked as such)
-    spec = {"openapi": "3.0.0", "info": {"title": "t", "version": "1"}, "paths": {}}
+    # an OpenAPI document works the same way; its operations become call sites
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "t", "version": "1"},
+        "paths": {"/v1/things": {"get": {"responses": {}}, "post": {"responses": {}}}},
+    }
     r = client.post(
         "/v1/watch/push",
         json={
@@ -288,6 +358,11 @@ def test_watch_push_snapshots_diffs_and_attaches_a_dependency(client, factory, s
         headers=bearer(key),
     )
     assert r.status_code == 200 and r.json()["change_event_id"] is None
+    spec_dep = session.get(Dependency, r.json()["dependency_id"])
+    assert sorted(
+        session.scalars(select(CallSite.operation).where(CallSite.dependency_id == spec_dep.id))
+    ) == ["GET /v1/things", "POST /v1/things"]
+    # a stdio command line is accepted: pushed sources are never polled, so never run
     r = client.post(
         "/v1/watch/push",
         json={
@@ -298,10 +373,151 @@ def test_watch_push_snapshots_diffs_and_attaches_a_dependency(client, factory, s
         headers=bearer(key),
     )
     assert r.status_code == 200
-    assert session.get(Source, r.json()["source_id"]).meta["transport"] == "stdio"
+    stdio = session.get(Source, r.json()["source_id"])
+    assert stdio.meta["transport"] == "stdio" and stdio.origin == "push"
+    assert stdio.locator == f"push:{org.id}:mcp:npx -y weather-mcp" and not stdio.pollable
+    assert factory.jobs("poll_source") == []
 
     # unknown repo / bad kind
     r = client.post("/v1/watch/push", json={**body, "repo": "acme/nope"}, headers=bearer(key))
     assert r.status_code == 404
     bad = {**body, "source": {"kind": "pypi", "locator": "stripe"}}
     assert client.post("/v1/watch/push", json=bad, headers=bearer(key)).status_code == 422
+
+
+def _weather_without_tool() -> dict:
+    v2 = copy.deepcopy(MCP_V1)
+    v2["server"]["version"] = "2.0.0"
+    v2["tools"] = {}
+    return v2
+
+
+def test_watch_push_never_touches_a_source_another_org_depends_on(client, factory, session):
+    """sdk-cli-security-2: org B pushing a fabricated document for a locator org A watches
+    must not change A's source, emit a change event on it, or reach A's repo."""
+    locator = "https://mcp.weather.example/mcp"
+    org_a = factory.org("acme")
+    repo_a = factory.repo(org_a)
+    shared = factory.source(
+        kind="mcp", locator=locator, vendor="weather", meta={"transport": "http"}
+    )
+    shared.origin = "seed"
+    session.commit()
+    dep_a = factory.dependency(repo_a, shared, kind="mcp", name=locator)
+    factory.call_site(dep_a, file_path="agent/weather.py", line=3, operation="get_weather")
+    ingest_canonical_doc(session, shared, CanonicalDoc(version="1.0.0", body=MCP_V1))
+    session.commit()
+    polled_at = session.get(Source, shared.id).last_polled_at
+    snapshots_before = len(
+        list(session.scalars(select(Snapshot).where(Snapshot.source_id == shared.id)))
+    )
+
+    org_b = factory.org("mallory", installation_id=777)
+    repo_b = factory.repo(org_b, "mallory/agent")
+    key_b = factory.sdk_key(org_b)
+    for doc in (MCP_V1, _weather_without_tool()):
+        r = client.post(
+            "/v1/watch/push",
+            json={
+                "repo": "mallory/agent",
+                "source": {"kind": "mcp", "locator": locator},
+                "doc": {"version": doc["server"]["version"], "body": doc},
+            },
+            headers=bearer(key_b),
+        )
+        assert r.status_code == 200, r.text
+    pushed = session.get(Source, r.json()["source_id"])
+    assert pushed.id != shared.id and pushed.owner_org_id == org_b.id
+    session.expire_all()
+    # the shared (seeded) source is untouched: no snapshot, no event, no poll-clock move
+    assert (
+        len(list(session.scalars(select(Snapshot).where(Snapshot.source_id == shared.id))))
+        == snapshots_before
+    )
+    assert (
+        session.scalars(select(ChangeEventRow).where(ChangeEventRow.source_id == shared.id)).all()
+        == []
+    )
+    assert session.get(Source, shared.id).last_polled_at == polled_at
+    # the change event lives on B's pushed source, and only B's repo depends on it
+    events = session.scalars(select(ChangeEventRow).where(ChangeEventRow.source_id == pushed.id))
+    assert len(events.all()) == 1
+    deps = session.scalars(select(Dependency).where(Dependency.source_id == pushed.id)).all()
+    assert [d.repo_id for d in deps] == [repo_b.id]
+    assert (
+        session.scalars(
+            select(Dependency).where(
+                Dependency.repo_id == repo_a.id, Dependency.source_id == pushed.id
+            )
+        ).all()
+        == []
+    )
+
+
+def test_watch_push_refuses_rows_it_does_not_own(client, factory, session):
+    org = factory.org()
+    repo = factory.repo(org)
+    key = factory.sdk_key(org)
+    locator = "https://mcp.weather.example/mcp"
+    body = {
+        "repo": REPO_FULL_NAME,
+        "source": {"kind": "mcp", "locator": locator},
+        "doc": {"version": "1", "body": MCP_V1},
+    }
+    # a customer row squatting on this org's push locator (e.g. from a repo's MCP config)
+    squatter = factory.source(kind="mcp", locator=f"push:{org.id}:mcp:{locator}", vendor=None)
+    r = client.post("/v1/watch/push", json=body, headers=bearer(key))
+    assert r.status_code == 409, r.text
+    session.expire_all()
+    assert session.scalars(select(Snapshot).where(Snapshot.source_id == squatter.id)).all() == []
+    assert "pushed_by" not in (session.get(Source, squatter.id).meta or {})
+    session.delete(session.get(Source, squatter.id))
+    session.commit()
+
+    # this org's push source that another org's repo has been attached to
+    r = client.post("/v1/watch/push", json=body, headers=bearer(key))
+    assert r.status_code == 200, r.text
+    pushed_id = r.json()["source_id"]
+    other = factory.org("other", installation_id=31337)
+    other_repo = factory.repo(other, "other/app")
+    session.add(
+        Dependency(repo_id=other_repo.id, source_id=pushed_id, kind="mcp", name="x", meta={})
+    )
+    session.commit()
+    v2 = {**body, "doc": {"version": "2", "body": _mcp_v2()}}
+    r = client.post("/v1/watch/push", json=v2, headers=bearer(key))
+    assert r.status_code == 409
+    session.expire_all()
+    assert (
+        session.scalars(select(ChangeEventRow).where(ChangeEventRow.source_id == pushed_id)).all()
+        == []
+    )
+    assert session.get(Repo, repo.id).active is True
+
+
+def test_watch_push_change_opens_an_impact_on_the_pushing_repo(client, factory, session):
+    """api-correctness-6: a breaking change pushed from CI reaches the repo as an impact."""
+    register_all_handlers()
+    org = factory.org()
+    repo = factory.repo(org)
+    key = factory.sdk_key(org)
+    base = {"repo": REPO_FULL_NAME, "source": {"kind": "mcp", "locator": "npx -y weather-mcp"}}
+    r = client.post(
+        "/v1/watch/push",
+        json={**base, "doc": {"version": "1", "body": MCP_V1}},
+        headers=bearer(key),
+    )
+    assert r.status_code == 200, r.text
+    r = client.post(
+        "/v1/watch/push",
+        json={**base, "doc": {"version": "2", "body": _weather_without_tool()}},
+        headers=bearer(key),
+    )
+    assert r.status_code == 200 and r.json()["change_event_id"], r.text
+    assert drain(new_session, ["classify_event", "match_event"]) >= 2
+    session.expire_all()
+    impacts = session.scalars(select(Impact).where(Impact.repo_id == repo.id)).all()
+    assert len(impacts) == 1
+    impact = impacts[0]
+    assert str(impact.change_event_id) == r.json()["change_event_id"]
+    assert [s["operation"] for s in impact.matched_call_sites] == ["get_weather"]

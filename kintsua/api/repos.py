@@ -2,7 +2,9 @@
 
 * ``GET  /v1/repos/{id}/dependencies`` - the dependency map (``kintsua.indexer.depmap``).
 * ``GET  /v1/repos/{id}/changes``      - impacts with their change event / classification.
-* ``POST /v1/repos/{id}/sources``      - add a spec / changelog URL or an MCP server.
+* ``POST /v1/repos/{id}/sources``      - add a spec / changelog URL or an MCP server
+  (``origin="customer"``; a stdio command is recorded but never run by the hosted watcher)
+  and queue a re-index so the new source's ``hosts`` pick up existing call sites.
 * ``POST /v1/repos/{id}/mute``, ``DELETE ...?pattern=`` - mute patterns (open impacts that
   are now fully muted are dismissed with a comment on their issue).
 * ``POST /v1/repos/{id}/fix-mode``     - ``pr`` | ``issue_only``.
@@ -12,6 +14,12 @@
   and impact of the repo (the repo row stays).
 
 Every endpoint answers JSON, or an HTML fragment when called by HTMX (``HX-Request``).
+The ``async`` routes only await the request body; the database and GitHub work runs in the
+threadpool (``run_in_threadpool``) so it never blocks the event loop.
+
+Values set here are written to the ``Repo.config`` keys the other components read
+(``sources`` / ``mute`` / ``fix``) and remembered under ``Repo.config["settings"]``, which the
+indexer keeps across re-indexes so it can merge them back after parsing ``.kintsua.yml``.
 """
 
 from __future__ import annotations
@@ -22,12 +30,14 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from kintsua.api.deps import get_db, read_body, render, repo_access, wants_html
 from kintsua.api.schemas import AddSourceBody, FixModeBody, MuteBody, OpenIssueBody
+from kintsua.core.config import get_settings
 from kintsua.core.models import (
     CallSite,
     ChangeEventRow,
@@ -39,10 +49,12 @@ from kintsua.core.models import (
     RuntimeEvent,
     Source,
 )
+from kintsua.core.netguard import is_http_locator
 from kintsua.core.queue import JOB_POLL_SOURCE, enqueue
 from kintsua.core.util import utcnow
 from kintsua.indexer.config import effective_fix_mode
 from kintsua.indexer.depmap import dependency_map
+from kintsua.indexer.run import enqueue_index_repo
 from kintsua.matcher.issues import close_impact_issue, create_issue_for_impact
 from kintsua.matcher.match import maybe_enqueue_fix, open_issues_for_pending
 from kintsua.matcher.mute import is_muted
@@ -54,6 +66,11 @@ router = APIRouter(prefix="/v1/repos", tags=["repos"])
 
 ACTIVE_IMPACT_STATUSES: tuple[str, ...] = ("detected", "issued", "fixing", "pr_open")
 DEFAULT_CHANGES_LIMIT = 50
+SETTINGS_KEY = "settings"  # Repo.config[SETTINGS_KEY]: what the settings API set, by key
+# a repo may only be attached to sources of these origins (pushed and synthetic sources are
+# private to the org / repo that produced them)
+ATTACHABLE_ORIGINS: tuple[str, ...] = ("seed", "customer", "runtime")
+SOURCE_REINDEX_DELAY_S = 60
 
 
 # --------------------------------------------------------------------------------------
@@ -80,6 +97,22 @@ def config_sources(repo: Repo) -> list[dict[str, Any]]:
 def _entry_locator(entry: dict[str, Any]) -> str | None:
     v = entry.get("url") or entry.get("command") or entry.get("locator")
     return str(v).strip() if v else None
+
+
+def remember_setting(cfg: dict[str, Any], key: str, value: Any) -> None:
+    """Record an API-set value under ``cfg["settings"]`` (``None`` forgets it)."""
+    current = cfg.get(SETTINGS_KEY)
+    saved = dict(current) if isinstance(current, dict) else {}
+    if value is None:
+        saved.pop(key, None)
+    else:
+        saved[key] = value
+    cfg[SETTINGS_KEY] = saved
+
+
+def saved_settings(repo: Repo) -> dict[str, Any]:
+    saved = (repo.config or {}).get(SETTINGS_KEY)
+    return dict(saved) if isinstance(saved, dict) else {}
 
 
 def repo_fix_mode(repo: Repo) -> str | None:
@@ -204,17 +237,40 @@ def get_changes(
 # --------------------------------------------------------------------------------------
 
 
+def hosted_watcher_polls(source: Source) -> bool:
+    """Whether the hosted watcher will poll ``source``: never pushed or synthetic sources,
+    and an MCP stdio command only when it is operator-seeded (CONTRACTS, Source trust)."""
+    if not source.pollable:
+        return False
+    return source.kind != "mcp" or is_http_locator(source.locator) or source.trusted
+
+
 def add_source(session: Session, repo: Repo, body: AddSourceBody) -> dict[str, Any]:
+    assert body.locator is not None
+    existing = session.scalar(
+        select(Source).where(Source.kind == body.kind, Source.locator == body.locator)
+    )
+    if existing is not None and existing.origin not in ATTACHABLE_ORIGINS:
+        raise HTTPException(
+            status_code=422,
+            detail="this locator belongs to a pushed or synthetic source and cannot be added",
+        )
+    # built here only: nothing the caller sends becomes source meta, origin or a trust flag
     meta: dict[str, Any] = {"configured_by": "settings"}
     if body.transport:
         meta["transport"] = body.transport
         if body.transport == "stdio":
             meta["quiet"] = True
-    assert body.locator is not None
     source = find_or_create_source(
-        session, body.kind, body.locator, display_name=body.display_name, meta=meta
+        session,
+        body.kind,
+        body.locator,
+        display_name=body.display_name,
+        meta=meta,
+        origin="customer",
     )
-    if not source.active:
+    polled = hosted_watcher_polls(source)
+    if polled and not source.active and source.origin in ("customer", "runtime"):
         source.active = True
     dep = session.scalar(
         select(Dependency).where(
@@ -243,19 +299,32 @@ def add_source(session: Session, repo: Repo, body: AddSourceBody) -> dict[str, A
         dep.source_id = source.id
         dep.meta = {**(dep.meta or {}), **dep_meta}
     session.flush()
-    job = enqueue(
-        session,
-        JOB_POLL_SOURCE,
-        {"source_id": str(source.id)},
-        dedupe_key=f"poll_source:{source.id}",
+    job = (
+        enqueue(
+            session,
+            JOB_POLL_SOURCE,
+            {"source_id": str(source.id)},
+            dedupe_key=f"poll_source:{source.id}",
+        )
+        if polled
+        else None
     )
     cfg = repo_config(repo)
     sources = config_sources(repo)
+    entry = body.config_entry()
     if not any(_entry_locator(s) == source.locator for s in sources):
-        sources.append(body.config_entry())
+        sources.append(entry)
     cfg["sources"] = sources
+    saved = [s for s in saved_settings(repo).get("sources") or [] if isinstance(s, dict)]
+    if not any(_entry_locator(s) == source.locator for s in saved):
+        saved.append(entry)
+    remember_setting(cfg, "sources", saved)
     repo.config = cfg
     session.flush()
+    if repo.active:
+        # the resolver attaches existing call sites to the new source (sources[].hosts)
+        delay = min(SOURCE_REINDEX_DELAY_S, get_settings().push_debounce_s)
+        enqueue_index_repo(session, repo, "config", debounce_s=delay or None)
     log.info("source %s %s added to %s", body.kind, source.locator, repo.full_name)
     return {
         "source_id": str(source.id),
@@ -263,9 +332,19 @@ def add_source(session: Session, repo: Repo, body: AddSourceBody) -> dict[str, A
         "kind": body.kind,
         "locator": source.locator,
         "display_name": source.display_name,
+        "polled": polled,
         "poll_job_id": str(job.id) if job is not None else None,
         "sources": sources,
     }
+
+
+def _source_notice(result: dict[str, Any]) -> str:
+    if result["polled"]:
+        return f"Watching {result['locator']}. The dependency map refreshes after a re-index."
+    return (
+        f"Added {result['locator']}. Kintsua does not run stdio MCP servers on its side; "
+        "push snapshots from CI with `kintsua watch --push`."
+    )
 
 
 @router.post("/{repo_id}/sources")
@@ -273,12 +352,14 @@ async def post_source(
     request: Request, repo: Repo = Depends(repo_access), session: Session = Depends(get_db)
 ) -> Response:
     body = await read_body(request, AddSourceBody)
+    return await run_in_threadpool(_post_source, request, repo, session, body)
+
+
+def _post_source(request: Request, repo: Repo, session: Session, body: AddSourceBody) -> Response:
     result = add_source(session, repo, body)
     session.commit()
     if wants_html(request):
-        resp = render(
-            request, "partials/notice.html", kind="ok", message=f"Watching {result['locator']}."
-        )
+        resp = render(request, "partials/notice.html", kind="ok", message=_source_notice(result))
         resp.headers["HX-Refresh"] = "true"
         return resp
     return JSONResponse(result, status_code=201)
@@ -372,11 +453,17 @@ async def post_mute(
     request: Request, repo: Repo = Depends(repo_access), session: Session = Depends(get_db)
 ) -> Response:
     body = await read_body(request, MuteBody)
+    return await run_in_threadpool(_post_mute, request, repo, session, body)
+
+
+def _post_mute(request: Request, repo: Repo, session: Session, body: MuteBody) -> Response:
     mutes = mute_list(repo)
     if body.pattern not in mutes:
         mutes.append(body.pattern)
     cfg = repo_config(repo)
     cfg["mute"] = mutes
+    saved = [m for m in saved_settings(repo).get("mute") or [] if isinstance(m, str)]
+    remember_setting(cfg, "mute", saved + ([body.pattern] if body.pattern not in saved else []))
     repo.config = cfg
     session.commit()
     dismissed = dismiss_muted_impacts(session, repo, mutes)
@@ -398,6 +485,8 @@ def delete_mute(
     mutes = [m for m in mute_list(repo) if m != pattern]
     cfg = repo_config(repo)
     cfg["mute"] = mutes
+    saved = [m for m in saved_settings(repo).get("mute") or [] if m != pattern]
+    remember_setting(cfg, "mute", saved)
     repo.config = cfg
     session.commit()
     return _mute_response(request, repo, mutes, [])
@@ -413,10 +502,15 @@ async def post_fix_mode(
     request: Request, repo: Repo = Depends(repo_access), session: Session = Depends(get_db)
 ) -> Response:
     body = await read_body(request, FixModeBody)
+    return await run_in_threadpool(_post_fix_mode, request, repo, session, body)
+
+
+def _post_fix_mode(request: Request, repo: Repo, session: Session, body: FixModeBody) -> Response:
     cfg = repo_config(repo)
     fix = dict(cfg.get("fix") or {}) if isinstance(cfg.get("fix"), dict) else {}
     fix["mode"] = body.mode
     cfg["fix"] = fix
+    remember_setting(cfg, "fix", {"mode": body.mode})
     repo.config = cfg
     session.commit()
     org = session.get(Org, repo.org_id)
@@ -469,6 +563,12 @@ async def post_open_issue(
     request: Request, repo: Repo = Depends(repo_access), session: Session = Depends(get_db)
 ) -> Response:
     body = await read_body(request, OpenIssueBody)
+    return await run_in_threadpool(_post_open_issue, request, repo, session, body)
+
+
+def _post_open_issue(
+    request: Request, repo: Repo, session: Session, body: OpenIssueBody
+) -> Response:
     if body.impact_id:
         opened = [open_draft(session, repo, body.impact_id)]
     else:
@@ -551,16 +651,21 @@ def delete_data(
 
 __all__ = [
     "ACTIVE_IMPACT_STATUSES",
+    "ATTACHABLE_ORIGINS",
+    "SETTINGS_KEY",
     "add_source",
     "change_entries",
     "config_sources",
     "delete_repo_data",
     "dismiss_muted_impacts",
+    "hosted_watcher_polls",
     "impact_entry",
     "mute_list",
     "muting_pattern",
     "open_draft",
+    "remember_setting",
     "repo_config",
     "repo_fix_mode",
     "router",
+    "saved_settings",
 ]

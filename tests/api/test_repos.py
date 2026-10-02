@@ -142,13 +142,17 @@ def test_add_source_creates_source_dependency_job_and_config(client, factory, se
     assert dep.repo_id == repo.id and dep.source_id == src.id and dep.kind == "openapi"
     assert dep.name == url and dep.meta["configured"] is True
     assert dep.meta["hosts"] == ["api.vendor.example"]
+    assert src.origin == "customer" and data["polled"] is True
     jobs = factory.jobs("poll_source")
     assert len(jobs) == 1 and jobs[0].payload == {"source_id": str(src.id)}
     assert jobs[0].dedupe_key == f"poll_source:{src.id}"
+    # a re-index lets the resolver attach the hosts' existing call sites to the new source
+    index_jobs = factory.jobs("index_repo")
+    assert [j.payload for j in index_jobs] == [{"repo_id": str(repo.id), "reason": "config"}]
     session.expire_all()
-    assert session.get(Repo, repo.id).config["sources"] == [
-        {"kind": "openapi", "url": url, "name": "Vendor API", "hosts": ["api.vendor.example"]}
-    ]
+    entry = {"kind": "openapi", "url": url, "name": "Vendor API", "hosts": ["api.vendor.example"]}
+    assert session.get(Repo, repo.id).config["sources"] == [entry]
+    assert session.get(Repo, repo.id).config["settings"]["sources"] == [entry]
 
     # adding the same URL again is idempotent
     r = client.post(f"/v1/repos/{repo.id}/sources", json={"kind": "openapi", "url": url})
@@ -157,17 +161,20 @@ def test_add_source_creates_source_dependency_job_and_config(client, factory, se
     session.expire_all()
     assert len(session.get(Repo, repo.id).config["sources"]) == 1
 
-    # an MCP stdio command is a locator too
+    # an MCP stdio command is recorded, but the hosted watcher never runs a customer's
+    # command line, so no poll is queued for it
     r = client.post(
         f"/v1/repos/{repo.id}/sources",
         json={"kind": "mcp", "command": "npx -y @modelcontextprotocol/server-filesystem /tmp"},
     )
     assert r.status_code == 201, r.text
+    assert r.json()["polled"] is False and r.json()["poll_job_id"] is None
     mcp = session.get(Source, UUID(r.json()["source_id"]))
     assert (
         mcp.kind == "mcp" and mcp.locator == "npx -y @modelcontextprotocol/server-filesystem /tmp"
     )
-    assert mcp.meta["transport"] == "stdio"
+    assert mcp.meta["transport"] == "stdio" and mcp.origin == "customer" and not mcp.trusted
+    assert len(factory.jobs("poll_source")) == 1
     session.expire_all()
     assert session.get(Repo, repo.id).config["sources"][1] == {
         "kind": "mcp",
@@ -209,6 +216,69 @@ def test_add_source_creates_source_dependency_job_and_config(client, factory, se
     session.expire_all()
     entry = session.get(Repo, repo.id).config["sources"][2]
     assert entry["kind"] == "changelog" and entry["hosts"] == ["a.example", "b.example"]
+
+
+def test_add_source_ignores_caller_trust_flags_and_meta(client, factory, session):
+    """Rule 1: the caller cannot choose the origin, trust flags or ``_``-prefixed meta."""
+    org = factory.org()
+    repo = factory.repo(org)
+    mint_session(client)
+    r = client.post(
+        f"/v1/repos/{repo.id}/sources",
+        json={
+            "kind": "mcp",
+            "command": "python -c 'import os; os.system(\"id\")'",
+            "origin": "seed",
+            "trusted": True,
+            "allow_stdio": True,
+            "meta": {"_net_guard": False, "trusted": True, "allow_stdio": True},
+            "_net_guard": False,
+        },
+    )
+    assert r.status_code == 201, r.text
+    src = session.get(Source, UUID(r.json()["source_id"]))
+    assert src.origin == "customer" and src.trusted is False and src.owner_org_id is None
+    assert set(src.meta) == {"configured_by", "transport", "quiet"}
+    assert factory.jobs("poll_source") == []
+    # the same holds for a URL source
+    r = client.post(
+        f"/v1/repos/{repo.id}/sources",
+        json={
+            "kind": "openapi",
+            "url": "https://api.vendor.example/openapi.json",
+            "origin": "seed",
+            "meta": {"_net_guard": False},
+        },
+    )
+    assert r.status_code == 201, r.text
+    src = session.get(Source, UUID(r.json()["source_id"]))
+    assert src.origin == "customer" and set(src.meta) == {"configured_by"}
+
+
+def test_add_source_never_attaches_pushed_or_synthetic_sources(client, factory, session):
+    org = factory.org()
+    repo = factory.repo(org)
+    other = factory.org("other", installation_id=4242)
+    locator = f"push:{other.id}:mcp:https://mcp.weather.example/mcp"
+    pushed = factory.source(kind="mcp", locator=locator, vendor="weather")
+    pushed.origin = "push"
+    pushed.owner_org_id = other.id
+    session.commit()
+    mint_session(client)
+    r = client.post(f"/v1/repos/{repo.id}/sources", json={"kind": "mcp", "command": locator})
+    assert r.status_code == 422, r.text
+    session.expire_all()
+    assert session.scalars(select(Dependency).where(Dependency.repo_id == repo.id)).all() == []
+
+    # a seeded stdio server is the operator's: adding it attaches the seeded row and polls it
+    seeded = factory.source(kind="mcp", locator="npx -y @acme/weather-mcp", vendor="weather")
+    seeded.origin = "seed"
+    session.commit()
+    r = client.post(f"/v1/repos/{repo.id}/sources", json={"kind": "mcp", "command": seeded.locator})
+    assert r.status_code == 201, r.text
+    assert r.json()["source_id"] == str(seeded.id) and r.json()["polled"] is True
+    session.expire_all()
+    assert session.get(Source, seeded.id).origin == "seed"
 
 
 def test_mute_add_remove_and_dismiss_covered_impacts(client, factory, session, fake_github):
@@ -253,6 +323,7 @@ def test_mute_add_remove_and_dismiss_covered_impacts(client, factory, session, f
     assert session.get(Impact, other.id).status == "detected"
     assert issue.state == "closed" and "muted" in issue.comments[-1].body
     assert session.get(Repo, repo.id).config["mute"] == ["stripe:/v1/charges*"]
+    assert session.get(Repo, repo.id).config["settings"]["mute"] == ["stripe:/v1/charges*"]
 
     # duplicates collapse, new patterns append
     r = client.post(f"/v1/repos/{repo.id}/mute", json={"pattern": "stripe:/v1/charges*"})
@@ -266,6 +337,7 @@ def test_mute_add_remove_and_dismiss_covered_impacts(client, factory, session, f
     assert r.status_code == 200 and r.json()["mute"] == ["tool:get_*"]
     session.expire_all()
     assert session.get(Repo, repo.id).config["mute"] == ["tool:get_*"]
+    assert session.get(Repo, repo.id).config["settings"]["mute"] == ["tool:get_*"]
 
     # the HTMX form answers the mutes fragment; a bare vendor mutes the slack draft (no issue to close)
     r = client.post(
@@ -293,6 +365,7 @@ def test_fix_mode_switch(client, factory, session):
     }
     session.expire_all()
     assert session.get(Repo, repo.id).config["fix"]["mode"] == "pr"
+    assert session.get(Repo, repo.id).config["settings"]["fix"] == {"mode": "pr"}
     assert client.post(f"/v1/repos/{repo.id}/fix-mode", json={"mode": "yolo"}).status_code == 422
     r = client.post(
         f"/v1/repos/{repo.id}/fix-mode", data={"mode": "issue_only"}, headers={"HX-Request": "true"}

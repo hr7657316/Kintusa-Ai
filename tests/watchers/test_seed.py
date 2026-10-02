@@ -114,3 +114,17 @@ def test_cli_list_and_dry_run(session, db, capsys):
     assert seed_main([]) == 0
     assert "created" in capsys.readouterr().out
     assert session.scalar(select(func.count()).select_from(Source)) == len(load_seed_sources())
+
+
+def test_seeded_rows_are_trusted_public_and_promote_customer_rows(session):
+    from kintsua.watchers.run import find_or_create_source
+
+    entries = load_seed_sources()
+    first = entries[0]
+    customer = find_or_create_source(session, first.kind, first.locator)
+    assert customer.origin == "customer" and not customer.trusted and not customer.public
+    upsert_sources(session, entries)
+    session.refresh(customer)
+    assert customer.origin == "seed" and customer.trusted and customer.public
+    rows = session.scalars(select(Source)).all()
+    assert rows and all(r.origin == "seed" and r.pollable for r in rows)

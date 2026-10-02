@@ -73,6 +73,10 @@ class ExtractStats(BaseModel):
     dynamic_mcp_registrations: int = 0
     unattributed_tool_calls: int = 0
     errors: list[str] = Field(default_factory=list)  # "<path>: <reason>", capped
+    # repo-relative paths that exist but were skipped or only partially extracted (too
+    # large, binary, syntax errors, extractor exception): their call sites may be missing,
+    # so re-indexing must not treat impacts on them as vanished. Not capped.
+    partial_files: list[str] = Field(default_factory=list)
 
     def add(self, other: ExtractStats) -> ExtractStats:
         return ExtractStats(
@@ -84,12 +88,23 @@ class ExtractStats(BaseModel):
             + other.dynamic_mcp_registrations,
             unattributed_tool_calls=self.unattributed_tool_calls + other.unattributed_tool_calls,
             errors=(self.errors + other.errors)[:50],
+            partial_files=list(dict.fromkeys(self.partial_files + other.partial_files)),
         )
+
+    def _mark_partial(self, path: str) -> None:
+        if path and path not in self.partial_files:
+            self.partial_files.append(path)
 
     def record_error(self, path: str, reason: str) -> None:
         self.parse_errors += 1
+        self._mark_partial(path)
         if len(self.errors) < 50:
             self.errors.append(f"{path}: {reason}")
+
+    def record_skipped(self, path: str) -> None:
+        """A file over the size limit: counted and remembered, not parsed."""
+        self.skipped_large += 1
+        self._mark_partial(path)
 
 
 class ExtractResult(BaseModel):

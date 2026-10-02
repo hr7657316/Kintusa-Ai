@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -116,15 +117,22 @@ class GitHubApp:
         return out
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
 def verify_webhook_signature(body: bytes, signature_header: str | None, secret: str | None) -> bool:
-    """``X-Hub-Signature-256: sha256=<hex>``."""
+    """``X-Hub-Signature-256: sha256=<hex>``. Any malformed header (wrong length, non-hex,
+    non-ASCII) is simply a mismatch, never an exception."""
     if not secret:
         log.warning("GITHUB_WEBHOOK_SECRET not set; refusing webhook")
         return False
     if not signature_header or not signature_header.startswith("sha256="):
         return False
+    provided = signature_header.split("=", 1)[1].strip().lower()
+    if not _SHA256_HEX.fullmatch(provided):
+        return False
     expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header.split("=", 1)[1])
+    return hmac.compare_digest(expected.encode("ascii"), provided.encode("ascii"))
 
 
 _app: GitHubApp | None = None

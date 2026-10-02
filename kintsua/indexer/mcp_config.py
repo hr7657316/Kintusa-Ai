@@ -1003,6 +1003,8 @@ def extract_mcp(
     known: dict[str, list[str]] = {}
     if tools_for_locator is not None:
         for dep in mcp_deps:
+            if dep.meta.get("disabled"):
+                continue  # not in use: never looked up (let alone started)
             try:
                 names = tools_for_locator(dep.name)
             except Exception as e:  # noqa: BLE001 - a dead server must not fail the index

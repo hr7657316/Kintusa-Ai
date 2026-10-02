@@ -1,7 +1,11 @@
 """Detect how to install, test and statically check a customer repository.
 
-``detect_test_command(workdir, repo_config)`` returns a ``TestPlan``. The test command is
-chosen in this order (first hit wins):
+``detect_test_command(workdir, repo_config)`` returns a ``TestPlan``. ``workdir`` is either
+a host path or a prepared ``Sandbox``: with a sandbox every manifest is read and every
+file listed **through the sandbox** (``read_file`` / ``list_files``) and tool availability
+is probed inside it, so the Docker backend (whose clone lives in a container at
+``/work/repo``, not on the worker's filesystem) gets the same plan as a local clone. The
+test command is chosen in this order (first hit wins):
 
 1. ``.kintsua.yml`` ``test_command`` (``repo_config["test_command"]``);
 2. ``pyproject.toml`` ``[tool.kintsua] test``;
@@ -27,12 +31,15 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import tomllib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from kintsua.fixer.sandbox import Sandbox, SandboxError
 
 log = logging.getLogger(__name__)
 
@@ -63,17 +70,112 @@ class TestPlan:
         return asdict(self)
 
 
-def _read_text(path: Path, max_bytes: int = 512_000) -> str | None:
-    try:
-        if not path.is_file() or path.is_symlink() or path.stat().st_size > max_bytes:
+MAX_MANIFEST_BYTES = 512_000
+MAX_SCANNED_FILES = 20_000
+
+
+class _PathTree:
+    """The repository as a directory on this machine (``LocalSandbox.workdir``, tests)."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+        self.label = str(self.root)
+
+    def read_text(self, rel: str) -> str | None:
+        path = self.root / rel
+        try:
+            if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_MANIFEST_BYTES:
+                return None
+            return path.read_text("utf-8", errors="replace")
+        except OSError:
             return None
-        return path.read_text("utf-8", errors="replace")
-    except OSError:
-        return None
+
+    def exists(self, rel: str) -> bool:
+        return (self.root / rel).exists()
+
+    def is_dir(self, rel: str) -> bool:
+        return (self.root / rel).is_dir()
+
+    def top_level(self) -> list[tuple[str, bool]]:
+        """``(name, is_dir)`` for the entries of the repository root."""
+        try:
+            return [(e.name, e.is_dir()) for e in self.root.iterdir()]
+        except OSError:
+            return []
+
+    def files(self) -> list[str]:
+        out: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
+            rel_dir = os.path.relpath(dirpath, self.root)
+            for fn in filenames:
+                out.append(fn if rel_dir == "." else f"{rel_dir}/{fn}".replace(os.sep, "/"))
+                if len(out) >= MAX_SCANNED_FILES:
+                    return out
+        return out
 
 
-def _read_pyproject(root: Path) -> dict[str, Any]:
-    text = _read_text(root / "pyproject.toml")
+class _SandboxTree:
+    """The repository inside a prepared sandbox: one ``list_files`` (cached) plus
+    ``read_file`` per manifest, so nothing touches the worker's filesystem."""
+
+    def __init__(self, sandbox: Sandbox):
+        self.sandbox = sandbox
+        self.label = f"{sandbox.backend}:{sandbox.workdir}"
+        self._files: list[str] | None = None
+        self._set: set[str] = set()
+        self._dirs: set[str] = set()
+
+    def files(self) -> list[str]:
+        if self._files is None:
+            listed = self.sandbox.list_files("**/*")
+            self._files = [
+                f for f in listed if not any(part in _IGNORED_DIRS for part in f.split("/")[:-1])
+            ]
+            self._set = set(self._files)
+            for f in self._files:
+                parts = f.split("/")[:-1]
+                for i in range(1, len(parts) + 1):
+                    self._dirs.add("/".join(parts[:i]))
+        return self._files
+
+    def read_text(self, rel: str) -> str | None:
+        self.files()
+        if rel not in self._set:
+            return None
+        try:
+            text = self.sandbox.read_file(rel)
+        except SandboxError:
+            return None
+        return None if len(text) > MAX_MANIFEST_BYTES else text
+
+    def exists(self, rel: str) -> bool:
+        self.files()
+        return rel in self._set or rel in self._dirs
+
+    def is_dir(self, rel: str) -> bool:
+        self.files()
+        return rel in self._dirs
+
+    def top_level(self) -> list[tuple[str, bool]]:
+        self.files()
+        names = {f.split("/", 1)[0]: "/" in f for f in self._files or []}
+        return list(names.items())
+
+    def tool_available(self, name: str) -> bool:
+        """Whether ``name`` is on the sandbox's PATH (the image, not the worker)."""
+        try:
+            res = self.sandbox.run(["sh", "-c", f"command -v {shlex.quote(name)}"], timeout_s=30)
+        except SandboxError:
+            return False
+        return res.ok
+
+
+_Tree = _PathTree | _SandboxTree
+
+
+def _read_pyproject(tree: _Tree) -> dict[str, Any]:
+    text = tree.read_text("pyproject.toml")
     if not text:
         return {}
     try:
@@ -83,8 +185,8 @@ def _read_pyproject(root: Path) -> dict[str, Any]:
         return {}
 
 
-def _read_package_json(root: Path) -> dict[str, Any]:
-    text = _read_text(root / "package.json")
+def _read_package_json(tree: _Tree) -> dict[str, Any]:
+    text = tree.read_text("package.json")
     if not text:
         return {}
     try:
@@ -95,46 +197,34 @@ def _read_package_json(root: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _has_test_files(root: Path, max_entries: int = 20_000) -> bool:
-    if (root / "tests").is_dir() or (root / "test").is_dir():
+def _has_test_files(tree: _Tree) -> bool:
+    if tree.is_dir("tests") or tree.is_dir("test"):
         return True
-    seen = 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _IGNORED_DIRS]
-        for fn in filenames:
-            seen += 1
-            if seen > max_entries:
-                return False
-            if fn.endswith(".py") and (fn.startswith("test_") or fn.endswith("_test.py")):
-                return True
+    for rel in tree.files():
+        fn = rel.rsplit("/", 1)[-1]
+        if fn.endswith(".py") and (fn.startswith("test_") or fn.endswith("_test.py")):
+            return True
     return False
 
 
-def _make_has_test_target(root: Path) -> bool:
+def _make_has_test_target(tree: _Tree) -> bool:
     for name in ("Makefile", "makefile", "GNUmakefile"):
-        text = _read_text(root / name)
+        text = tree.read_text(name)
         if text and any(_MAKE_TARGET_RE.match(line) for line in text.splitlines()):
             return True
     return False
 
 
-def _looks_python(root: Path, pyproject: dict[str, Any]) -> bool:
-    if pyproject or (root / "setup.py").exists() or (root / "setup.cfg").exists():
+def _looks_python(tree: _Tree, pyproject: dict[str, Any]) -> bool:
+    if pyproject or tree.exists("setup.py") or tree.exists("setup.cfg"):
         return True
-    if any((root / n).exists() for n in ("requirements.txt", "uv.lock", "poetry.lock", "Pipfile")):
+    if any(tree.exists(n) for n in ("requirements.txt", "uv.lock", "poetry.lock", "Pipfile")):
         return True
-    try:
-        for entry in root.iterdir():
-            if entry.suffix == ".py":
-                return True
-            if (
-                entry.is_dir()
-                and entry.name not in _IGNORED_DIRS
-                and (entry / "__init__.py").exists()
-            ):
-                return True
-    except OSError:
-        pass
+    for name, is_dir in tree.top_level():
+        if not is_dir and name.endswith(".py"):
+            return True
+        if is_dir and name not in _IGNORED_DIRS and tree.exists(f"{name}/__init__.py"):
+            return True
     return False
 
 
@@ -157,35 +247,43 @@ def _as_str_list(value: Any) -> list[str]:
     return []
 
 
-def _python_runner_prefix(root: Path) -> str:
+def _python_runner_prefix(tree: _Tree) -> str:
     """``uv run`` / ``poetry run`` so the auto-detected pytest sees the lockfile env."""
-    if (root / "uv.lock").exists():
+    if tree.exists("uv.lock"):
         return "uv run --frozen "
-    if (root / "poetry.lock").exists():
+    if tree.exists("poetry.lock"):
         return "poetry run "
     return ""
 
 
-def _ruff_configured(root: Path, pyproject: dict[str, Any]) -> bool:
-    if (root / "ruff.toml").exists() or (root / ".ruff.toml").exists():
+def _ruff_configured(tree: _Tree, pyproject: dict[str, Any]) -> bool:
+    if tree.exists("ruff.toml") or tree.exists(".ruff.toml"):
         return True
     tool = pyproject.get("tool")
     return isinstance(tool, dict) and "ruff" in tool
 
 
 def detect_test_command(
-    workdir: str | Path,
+    workdir: str | Path | Sandbox,
     repo_config: dict[str, Any] | None = None,
     *,
     tool_available: Callable[[str], bool] | None = None,
 ) -> TestPlan:
-    """See the module docstring. ``tool_available(name)`` says whether a binary exists
-    in the sandbox (defaults to ``shutil.which`` on this machine)."""
-    root = Path(workdir)
+    """See the module docstring. ``workdir`` is a host path or a prepared ``Sandbox``
+    (the fixer passes the sandbox, so detection never reads the worker's filesystem at a
+    container path). ``tool_available(name)`` says whether a binary exists in the
+    sandbox (defaults to ``command -v`` inside the sandbox, or ``shutil.which`` on this
+    machine for a host path)."""
+    tree: _Tree = _SandboxTree(workdir) if isinstance(workdir, Sandbox) else _PathTree(workdir)
     repo_config = repo_config or {}
-    available = tool_available or (lambda name: shutil.which(name) is not None)
-    pyproject = _read_pyproject(root)
-    pkg = _read_package_json(root)
+    if tool_available is not None:
+        available = tool_available
+    elif isinstance(tree, _SandboxTree):
+        available = tree.tool_available
+    else:
+        available = lambda name: shutil.which(name) is not None  # noqa: E731
+    pyproject = _read_pyproject(tree)
+    pkg = _read_package_json(tree)
     kintsua_tool = (
         (pyproject.get("tool") or {}).get("kintsua")
         if isinstance(pyproject.get("tool"), dict)
@@ -193,7 +291,7 @@ def detect_test_command(
     )
     kintsua_tool = kintsua_tool if isinstance(kintsua_tool, dict) else {}
 
-    is_python = _looks_python(root, pyproject)
+    is_python = _looks_python(tree, pyproject)
     is_node = bool(pkg)
     language = (
         "mixed"
@@ -220,10 +318,10 @@ def detect_test_command(
         if isinstance(script, str) and script.strip() and not NPM_PLACEHOLDER_RE.search(script):
             command, source = "npm test", "package.json scripts.test"
             runner = "vitest" if "vitest" in script else "jest" if "jest" in script else "npm"
-        elif _make_has_test_target(root):
+        elif _make_has_test_target(tree):
             command, source, runner = "make test", "Makefile", "make"
-        elif is_python and _has_test_files(root):
-            command = _python_runner_prefix(root) + PYTEST_COMMAND
+        elif is_python and _has_test_files(tree):
+            command = _python_runner_prefix(tree) + PYTEST_COMMAND
             source, runner = "pytest", "pytest"
         elif is_node:
             deps = _deps(pkg)
@@ -247,18 +345,18 @@ def detect_test_command(
     install: list[str] = _as_str_list(kintsua_tool.get("install"))
     if not install:
         if is_python:
-            if (root / "uv.lock").exists():
+            if tree.exists("uv.lock"):
                 install.append("uv sync --frozen")
-            elif (root / "poetry.lock").exists():
+            elif tree.exists("poetry.lock"):
                 install.append("poetry install --no-interaction")
-            elif (root / "requirements.txt").exists():
+            elif tree.exists("requirements.txt"):
                 install.append("python -m pip install -r requirements.txt")
                 for extra in (
                     "requirements-dev.txt",
                     "requirements-test.txt",
                     "requirements_dev.txt",
                 ):
-                    if (root / extra).exists():
+                    if tree.exists(extra):
                         install.append(f"python -m pip install -r {extra}")
             elif pyproject:
                 project = (
@@ -275,11 +373,11 @@ def detect_test_command(
                     target = f".[{','.join(extras)}]" if extras else "."
                     install.append(f"python -m pip install -e {target}")
         if is_node:
-            if (root / "pnpm-lock.yaml").exists():
+            if tree.exists("pnpm-lock.yaml"):
                 install.append("pnpm install --frozen-lockfile")
-            elif (root / "yarn.lock").exists():
+            elif tree.exists("yarn.lock"):
                 install.append("yarn install --frozen-lockfile")
-            elif (root / "package-lock.json").exists():
+            elif tree.exists("package-lock.json"):
                 install.append("npm ci")
             else:
                 install.append("npm install")
@@ -287,9 +385,9 @@ def detect_test_command(
     # ---- static checks -----------------------------------------------------------
     static: list[str] = _as_str_list(kintsua_tool.get("static_checks"))
     if not static:
-        if is_python and (_ruff_configured(root, pyproject) or available("ruff")):
+        if is_python and (_ruff_configured(tree, pyproject) or available("ruff")):
             static.append(RUFF_COMMAND)
-        if (root / "tsconfig.json").exists():
+        if tree.exists("tsconfig.json"):
             static.append(TSC_COMMAND)
 
     plan = TestPlan(
@@ -302,7 +400,7 @@ def detect_test_command(
     )
     log.info(
         "test plan for %s: command=%r (%s) install=%s static=%s",
-        root,
+        tree.label,
         plan.command,
         plan.source,
         plan.install,

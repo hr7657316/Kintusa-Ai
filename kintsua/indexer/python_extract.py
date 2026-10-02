@@ -586,8 +586,12 @@ def _is_id_segment(seg: str) -> bool:
 
 def _http_method_and_url(
     symbol: str, call: Node, src: bytes
-) -> tuple[str, Node | None, str | None] | None:
-    """For an HTTP-looking symbol return (METHOD, url_node, literal_method_or_None)."""
+) -> tuple[str | None, Node | None, str | None] | None:
+    """For an HTTP-looking symbol return (METHOD, url_node, literal_method_or_None).
+
+    METHOD is None when the call takes a non-literal method (``client.request(method,
+    url)``): the call site is then recorded as the bare path, the matcher's any-method form.
+    """
     prefix, _, method = symbol.rpartition(".")
     if prefix not in HTTP_MODULE_PREFIXES and prefix not in HTTP_CLIENT_CLASSES:
         return None
@@ -600,7 +604,7 @@ def _http_method_and_url(
         m_node = kws.get("method") or (pos[0] if pos else None)
         m = _string_literal(m_node, src) if m_node is not None else None
         url = kws.get("url") or (pos[1] if len(pos) > 1 else None)
-        return (m.upper() if m else "ANY"), url, (m.upper() if m else None)
+        return (m.upper() if m else None), url, (m.upper() if m else None)
     return None
 
 
@@ -904,7 +908,7 @@ def _record_http(
             file_path=ctx.rel,
             line=line_of(call),
             symbol=symbol,
-            operation=f"{method} {path}",
+            operation=f"{method} {path}" if method else path,
             args_shape=shape,
             in_tests=ctx.in_tests,
         )
@@ -1033,7 +1037,7 @@ def extract_python(root: str | Path, *, deadline: float | None = None) -> Extrac
             raise IndexBudgetExceeded(f"python extraction ran out of budget at {rel}")
         result.stats.files_seen += 1
         if too_large:
-            result.stats.skipped_large += 1
+            result.stats.record_skipped(rel)
             continue
         text = read_text(path)
         if text is None:

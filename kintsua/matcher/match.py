@@ -12,7 +12,8 @@
    (``kintsua.matcher.operations``), minus the repo's ``.kintsua.yml`` mutes
    (``kintsua.matcher.mute``). Package events (``package:<name>``, ``*`` or no affected
    paths from a registry source) affect every call site of the package dependency; a
-   major bump creates an impact even when no call site is recorded.
+   major bump creates an impact even when no call site is recorded (unless the package
+   or its vendor is muted).
 4. Create one ``impact`` per ``(repo, change_event)`` (unique; an existing one is
    returned as is) in status ``detected`` with ``matched_call_sites``.
 5. If issues may open (``Settings.auto_issue`` or ``Org.settings.auto_issue``) enqueue
@@ -20,13 +21,16 @@
 
 Job handlers: ``match_event`` (``{"change_event_id"}``) and ``open_issue``
 (``{"impact_id"}``: create the issue, then enqueue ``fix_impact`` when the effective fix
-mode is ``pr`` and the category is fixable).
+mode is ``pr``, the category is fixable and a matched call site has a file to patch).
+``open_issue`` jobs retry for about 15 hours (GitHub incidents); ``requeue_stalled_issues``
+(called from the watcher tick) re-queues the ones that ran out of attempts.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -41,6 +45,7 @@ from kintsua.core.models import (
     Classification,
     Dependency,
     Impact,
+    Job,
     Org,
     Repo,
     Source,
@@ -54,10 +59,12 @@ from kintsua.core.queue import (
     enqueue,
     job_handler,
 )
+from kintsua.core.util import utcnow
 from kintsua.matcher.issues import (
     ACTIONABLE_SEVERITIES,
     create_issue_for_impact,
     effective_fix_mode,
+    has_file_located_site,
     is_fixable,
 )
 from kintsua.matcher.mute import clean_patterns, is_muted
@@ -68,6 +75,10 @@ log = logging.getLogger(__name__)
 PACKAGE_KINDS: tuple[str, ...] = ("pypi", "npm")
 RULE_MAJOR_BUMP = "major_bump"
 OPEN_STATUSES: tuple[str, ...] = ("detected", "issued", "fixing", "pr_open")
+# 30/60/120/240 s ... then hourly: about 15 h of retries before an open_issue job gives up
+OPEN_ISSUE_MAX_ATTEMPTS = 20
+STALLED_ISSUE_MAX_AGE = timedelta(days=7)  # requeue_stalled_issues looks this far back
+STALLED_ISSUE_COOLDOWN = timedelta(hours=1)  # after the last attempt gave up
 
 
 # --------------------------------------------------------------------------------------
@@ -97,6 +108,7 @@ def enqueue_open_issue(session: Session, impact: Impact) -> bool:
         JOB_OPEN_ISSUE,
         {"impact_id": str(impact.id)},
         dedupe_key=open_issue_dedupe_key(impact.id),
+        max_attempts=OPEN_ISSUE_MAX_ATTEMPTS,
     )
     return True
 
@@ -105,8 +117,12 @@ def maybe_enqueue_fix(
     session: Session, impact: Impact, *, classification: Classification | None = None
 ) -> bool:
     """After an issue exists: queue ``fix_impact`` when the effective fix mode is ``pr``,
-    the category is one the fixer handles and the impact is freshly issued."""
+    the category is one the fixer handles, the impact is freshly issued and at least one
+    matched call site is a file the fixer can patch (not ``<runtime>``, not a package
+    major bump with no call site)."""
     if impact.status != "issued":
+        return False
+    if not has_file_located_site(impact.matched_call_sites):
         return False
     cls = classification
     if cls is None and impact.classification_id is not None:
@@ -190,6 +206,7 @@ def site_record(site: CallSite, dep: Dependency, vendor: str | None) -> dict[str
         "operation": site.operation,
         "dependency_id": str(dep.id),
         "dependency": dep.name,
+        "dependency_kind": dep.kind,
     }
     if vendor:
         rec["vendor"] = vendor
@@ -237,7 +254,9 @@ def match_call_sites(
         if not hit:
             continue
         vendor = dependency_vendor(dep, source)
-        if is_muted(mute_patterns, vendor, site.operation):
+        if is_muted(mute_patterns, vendor, site.operation, tool=dep.kind == "mcp") or (
+            direct_package and is_muted(mute_patterns, vendor, f"package:{dep.name}")
+        ):
             log.info("call site %s %s muted for %s", site.file_path, site.operation, dep.repo_id)
             continue
         seen.add(str(site.id))
@@ -344,7 +363,10 @@ def match_change_event(session: Session, change_event_row: ChangeEventRow) -> li
             mute_patterns=mutes,
         )
         package_dep_hit = major_bump and any(
-            d.source_id == row.source_id and d.kind in PACKAGE_KINDS for d in repo_deps
+            d.source_id == row.source_id
+            and d.kind in PACKAGE_KINDS
+            and not is_muted(mutes, dependency_vendor(d, source), f"package:{d.name}")
+            for d in repo_deps
         )
         if not matched and not package_dep_hit:
             continue
@@ -409,6 +431,50 @@ def open_issues_for_pending(
             log.exception("could not open issue for impact %s", impact.id)
     if enqueue_only:
         session.commit()
+    return out
+
+
+def requeue_stalled_issues(session: Session, *, now: datetime | None = None) -> list[Impact]:
+    """Re-queue ``open_issue`` for draft impacts whose last ``open_issue`` job ran out of
+    attempts (a GitHub incident longer than the retry window), so the "issue within an
+    hour" promise survives outages. Only impacts of the last ``STALLED_ISSUE_MAX_AGE`` on
+    active repos whose org lets issues open, at most once per ``STALLED_ISSUE_COOLDOWN``
+    after the job gave up. A job that failed permanently (``NonRetryable``, attempts left)
+    and a draft that was never queued are left alone. Meant for the watcher tick; commits.
+    Returns the impacts re-queued."""
+    now = now or utcnow()
+    candidates = session.scalars(
+        select(Impact)
+        .join(Repo, Repo.id == Impact.repo_id)
+        .join(Org, Org.id == Repo.org_id)
+        .where(
+            Impact.status == "detected",
+            Impact.github_issue_number.is_(None),
+            Impact.created_at >= now - STALLED_ISSUE_MAX_AGE,
+            Repo.active.is_(True),
+            Org.active.is_(True),
+        )
+        .order_by(Impact.created_at)
+    ).all()
+    out: list[Impact] = []
+    for impact in candidates:
+        last = session.scalar(
+            select(Job)
+            .where(Job.kind == JOB_OPEN_ISSUE, Job.dedupe_key == open_issue_dedupe_key(impact.id))
+            .order_by(Job.created_at.desc())
+            .limit(1)
+        )
+        if last is None or last.status != "failed" or last.attempts < last.max_attempts:
+            continue
+        if last.finished_at is not None and last.finished_at > now - STALLED_ISSUE_COOLDOWN:
+            continue
+        repo = session.get(Repo, impact.repo_id)
+        if repo is None or not issues_may_open(session.get(Org, repo.org_id)):
+            continue
+        enqueue_open_issue(session, impact)
+        log.info("impact %s: open_issue had given up; queued again", impact.id)
+        out.append(impact)
+    session.commit()
     return out
 
 
@@ -482,5 +548,6 @@ __all__ = [
     "open_issue_dedupe_key",
     "open_issues_for_pending",
     "pending_impacts",
+    "requeue_stalled_issues",
     "site_record",
 ]

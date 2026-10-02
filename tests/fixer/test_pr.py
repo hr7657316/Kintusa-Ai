@@ -210,3 +210,29 @@ def test_open_pull_request_labels_and_lock():
     assert {lb.name for lb in pr.labels} == {LABEL, LABEL_BREAKING}
     assert set(repo.labels) == {LABEL, LABEL_BREAKING}
     assert lock._value == 2  # released
+
+
+def test_commit_contains_only_the_patch_not_install_or_test_artefacts(
+    sandbox: LocalSandbox, no_push
+):
+    from pathlib import Path
+
+    root = Path(sandbox.workdir)
+    (root / "package-lock.json").write_text('{"lockfileVersion": 3}\n')
+    (root / "tests" / ".last_run.json").write_text('{"ok": true}\n')
+    (root / "coverage.xml").write_text("<coverage/>\n")
+    sandbox.apply_patch(
+        {
+            "path": "agent/billing.py",
+            "old": "        source=source,\n",
+            "new": "        payment_method=source,\n",
+        }
+    )
+    sandbox.write_file("agent/new_helper.py", "X = 1\n")  # a file the sandbox created
+    result = commit_and_push(
+        sandbox, branch_name("stripe", "abc"), "fix", clone_url="file:///x", base_branch="main"
+    )
+    committed = sandbox.git_ok("show", "--name-only", "--format=", result.sha).split()
+    assert sorted(committed) == ["agent/billing.py", "agent/new_helper.py"]
+    untracked = sandbox.git_ok("status", "--porcelain", "--untracked-files=all")
+    assert "package-lock.json" in untracked and "coverage.xml" in untracked

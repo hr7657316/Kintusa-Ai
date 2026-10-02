@@ -46,7 +46,9 @@ inputs:
     required: false
     default: ""
   snapshot-if-missing:
-    description: "When no lockfile exists yet, write one instead of failing ('true' / 'false')."
+    description: >-
+      When no lockfile exists yet (diff exit code 4), write one instead of failing ('true' /
+      'false'). Usage errors and unreadable lockfiles (exit code 2) still fail the step.
     required: false
     default: "true"
   update:
@@ -68,7 +70,9 @@ inputs:
 
 outputs:
   exit-code:
-    description: "0 nothing at the gate, 1 gate fired, 2 usage / no lockfile, 3 could not fetch."
+    description: >-
+      0 nothing at the gate, 1 gate fired, 2 usage error or unreadable lockfile, 3 could not
+      fetch, 4 no lockfile yet (only when snapshot-if-missing is 'false').
     value: ${{ steps.watch.outputs.exit-code }}
 
 runs:
@@ -109,6 +113,14 @@ runs:
         UPDATE: ${{ inputs.update }}
       run: |
         set -uo pipefail
+        case "$FAIL_ON" in
+          breaking|degraded) ;;
+          *)
+            echo "::error::kintsua watch: fail-on must be 'breaking' or 'degraded', got '$FAIL_ON'"
+            echo "exit-code=2" >> "$GITHUB_OUTPUT"
+            exit 2
+            ;;
+        esac
         args=(--dir "$DIR")
         if [ -n "$SERVER" ]; then args+=(--server "$SERVER"); fi
         if [ -n "$SPEC" ]; then args+=(--spec "$SPEC"); fi
@@ -119,7 +131,8 @@ runs:
 
         kintsua watch diff "${args[@]}" "${diff_args[@]}"
         rc=$?
-        if [ "$rc" -eq 2 ] && [ "$SNAPSHOT_IF_MISSING" = "true" ]; then
+        # 4 = no lockfile yet; 2 (usage error, unreadable lockfile) must not become a snapshot
+        if [ "$rc" -eq 4 ] && [ "$SNAPSHOT_IF_MISSING" = "true" ]; then
           echo "::notice::kintsua watch: no lockfile yet; writing the first snapshot"
           kintsua watch snapshot "${args[@]}"
           rc=$?

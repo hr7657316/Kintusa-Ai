@@ -193,3 +193,28 @@ def test_package_json_dependencies_and_dev_flag(tmp_path: Path):
     assert names["zod"].vendor is None
     assert names["stripe"].version_constraint == "^17"
     assert [c.operation for c in r.call_sites] == ["stripe.charges.list"]
+
+
+def test_dynamic_fetch_method_is_recorded_as_the_bare_path_and_matches_any_method():
+    from kintsua.matcher.operations import matches_any
+
+    r, ops = run(
+        """
+export async function a(id: string, method: string) {
+  return fetch(`https://api.stripe.com/v1/charges/${id}`, { method });
+}
+export async function b(m: string) {
+  return fetch("https://api.stripe.com/v1/charges", { method: m, headers: {} });
+}
+export async function c() {
+  return fetch("https://api.stripe.com/v1/refunds", { headers: {} });
+}
+export async function d() {
+  return fetch("https://api.stripe.com/v1/customers", { method: "post" });
+}
+"""
+    )
+    assert set(ops) == {"/v1/charges/{id}", "/v1/charges", "GET /v1/refunds", "POST /v1/customers"}
+    assert matches_any("/v1/charges/{id}", ["POST /v1/charges/{id}"])
+    assert matches_any("/v1/charges", ["POST /v1/charges"])
+    assert not matches_any("GET /v1/refunds", ["POST /v1/refunds"])

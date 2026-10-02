@@ -8,9 +8,21 @@
     "to_version": "2.0.0",
     "ops": [
       {
-        "op": "deprecated",
+        "op": "text_changed",
         "path": "/latest",
         "before": "1.17.5",
+        "after": "2.0.0"
+      },
+      {
+        "op": "deprecated",
+        "path": "/latest",
+        "before": "1",
+        "after": "2"
+      },
+      {
+        "op": "added",
+        "path": "/versions/2.0.0",
+        "before": null,
         "after": "2.0.0"
       }
     ],
@@ -22,13 +34,12 @@
     "category": "deprecation"
   },
   "rule_hits_expected": [
-    "deprecated",
     "major_bump"
   ],
   "affected_paths_expected": [
     "package:@modelcontextprotocol/sdk"
   ],
   "migration_hint_contains": "2.0.0",
-  "summary_contains": "major version bump",
-  "note": "rules give degraded/deprecation; the server also runs the model on the release notes and may escalate"
+  "summary_contains": "@modelcontextprotocol/sdk 1.x -> 2.0.0: major version bump",
+  "note": "ops in NpmWatcher.diff's shape (the deprecated op carries bare majors); the event-level major_bump rule decides from the full versions. Rules give degraded/deprecation; the server also runs the model on the release notes and may escalate"
 }

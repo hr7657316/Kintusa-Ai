@@ -3,13 +3,20 @@
 ``fix_impact`` (``{"impact_id"}``): load the impact, refuse early when the category is
 not fixable (only ``rename``, ``required_param`` and ``deprecation`` in v0), when the
 effective fix mode is not ``pr`` or when the change touches auth; defer (re-enqueue in
-60 s) while ``settings.fix_concurrency`` fixes are running; otherwise move the impact to
-``fixing``, prepare the sandbox, detect the test plan (refusing repos with neither a test
-command nor static checks), install dependencies, build the ``FixContext`` from the
-sandbox, run the baseline, the agent and the validator, then commit, push and open the
-PR (``pr_open``) or record an honest failure (``failed`` + ``fix_reason`` + an issue
-comment with the scrubbed log excerpt). The sandbox is always cleaned up and token spend
-is logged per job.
+60 s, at most ``MAX_DEFERRALS`` times) while ``settings.fix_concurrency`` fixes are
+running; otherwise move the impact to ``fixing`` (stamped ``ci_result.fix_started_at``),
+prepare the sandbox, detect the test plan through the sandbox (refusing repos with
+neither a test command nor static checks), install dependencies, build the
+``FixContext`` from the sandbox, run the baseline, the agent and the validator, then
+commit, push (with an installation token minted right before the push) and open the PR
+(``pr_open``) or record an honest failure (``failed`` + ``fix_reason`` + an issue comment
+with the scrubbed log excerpt). The sandbox is always cleaned up and token spend is
+logged per job.
+
+A ``fixing`` impact whose job died with its worker (deploy, OOM) would hold a concurrency
+slot forever: impacts stamped more than ``2 * sandbox_wall_clock_s`` ago (or never
+stamped) do not count, and the next ``fix_impact`` re-queues each of them once and fails
+it honestly the second time.
 
 ``pr_outcome`` (``{"repo_id", "pr_number", "action", "merged"}``): ``record_pr_outcome``.
 ``record_ci_result`` is called by the webhook handler for check results on our PR.
@@ -19,10 +26,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from kintsua.core.config import Settings, get_settings
@@ -58,6 +67,7 @@ from kintsua.fixer.sandbox import (
     SandboxTimeout,
     make_sandbox,
     register_active,
+    secrets_in_url,
     tail_text,
     unregister_active,
 )
@@ -67,10 +77,18 @@ from kintsua.fixer.validate import run_baseline, validate
 log = logging.getLogger(__name__)
 
 FIXABLE_CATEGORIES: frozenset[str] = frozenset({"rename", "required_param", "deprecation"})
-CI_FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
-    {"failure", "timed_out", "cancelled", "action_required"}
-)
+#: conclusions that mean the customer's CI ran and went red; ``cancelled`` (superseded
+#: runs), ``action_required`` (approval pending), ``neutral``, ``skipped`` and ``stale``
+#: are recorded but never fail the impact
+CI_FAILURE_CONCLUSIONS: frozenset[str] = frozenset({"failure", "timed_out"})
+CI_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset({"success"})
 DEFER_DELAY_S = 60.0
+#: re-enqueues while the concurrency cap is hit before the job fails honestly (~6 h at 60 s)
+MAX_DEFERRALS = 360
+#: a ``fixing`` impact older than this many wall clocks lost its job (worker died)
+STALE_FIXING_WALL_CLOCKS = 2
+#: how often a lost fix job is re-queued before the impact is failed
+MAX_LOST_RETRIES = 1
 INSTALL_TIMEOUT_S = 600.0
 LOG_EXCERPT_LINES = 40
 
@@ -330,15 +348,69 @@ def run_install(sandbox: Sandbox, plan: TestPlan) -> None:
             )
 
 
-def _fixing_count(session: Session, exclude: Impact) -> int:
-    return int(
-        session.scalar(
-            select(func.count())
-            .select_from(Impact)
-            .where(Impact.status == "fixing", Impact.id != exclude.id)
-        )
-        or 0
+def _fix_started_at(impact: Impact) -> datetime | None:
+    raw = (impact.ci_result or {}).get("fix_started_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        started = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return started if started.tzinfo is not None else started.replace(tzinfo=UTC)
+
+
+def _sweep_lost_fixes(session: Session, settings: Settings, exclude: Impact) -> int:
+    """Free the slots of ``fixing`` impacts whose job is gone: older than
+    ``STALE_FIXING_WALL_CLOCKS`` wall clocks, or never stamped. Each is re-queued once,
+    then failed honestly. Returns how many were swept."""
+    cutoff = utcnow() - timedelta(
+        seconds=STALE_FIXING_WALL_CLOCKS * float(settings.sandbox_wall_clock_s)
     )
+    swept = 0
+    rows = session.scalars(
+        select(Impact).where(Impact.status == "fixing", Impact.id != exclude.id)
+    ).all()
+    for imp in rows:
+        started = _fix_started_at(imp)
+        if started is not None and started > cutoff:
+            continue
+        swept += 1
+        ci = dict(imp.ci_result or {})
+        lost = int(ci.get("fix_lost") or 0) + 1
+        ci["fix_lost"] = lost
+        ci.pop("fix_started_at", None)
+        imp.ci_result = ci
+        if lost <= MAX_LOST_RETRIES:
+            imp.status = "issued"
+            enqueue(
+                session,
+                JOB_FIX_IMPACT,
+                {"impact_id": str(imp.id)},
+                dedupe_key=fix_impact_dedupe_key(imp.id),
+            )
+            session.commit()
+            log.warning("impact %s: fix job lost (worker stopped mid-job); re-queued", imp.id)
+        else:
+            _fail(
+                session,
+                imp,
+                "the fix job was lost twice (the worker stopped mid-job); open a PR by hand or "
+                "re-run the fix",
+            )
+    return swept
+
+
+def _fixing_count(session: Session, exclude: Impact, settings: Settings | None = None) -> int:
+    """Live fixes (``fixing`` and stamped within ``STALE_FIXING_WALL_CLOCKS`` wall
+    clocks); the caller sweeps lost ones first."""
+    settings = settings or get_settings()
+    cutoff = utcnow() - timedelta(
+        seconds=STALE_FIXING_WALL_CLOCKS * float(settings.sandbox_wall_clock_s)
+    )
+    rows = session.scalars(
+        select(Impact).where(Impact.status == "fixing", Impact.id != exclude.id)
+    ).all()
+    return sum(1 for imp in rows if (_fix_started_at(imp) or cutoff) > cutoff)
 
 
 # --------------------------------------------------------------------------------------
@@ -366,19 +438,29 @@ def handle_fix_impact(session: Session, payload: dict[str, Any]) -> dict[str, An
         _fail(session, impact, reason)
         return {"impact_id": str(impact.id), "status": "failed", "refused": reason}
 
-    running = _fixing_count(session, impact)
+    _sweep_lost_fixes(session, settings, impact)
+    running = _fixing_count(session, impact, settings)
     if running >= settings.fix_concurrency:
+        deferrals = _int_or_zero(payload.get("deferrals")) + 1
+        if deferrals > MAX_DEFERRALS:
+            reason = (
+                f"the fixer stayed at its concurrency limit ({settings.fix_concurrency}) for "
+                f"{MAX_DEFERRALS} retries; re-run the fix later"
+            )
+            _fail(session, impact, reason)
+            return {"impact_id": str(impact.id), "status": "failed", "refused": reason}
         enqueue(
             session,
             JOB_FIX_IMPACT,
-            {"impact_id": str(impact.id)},
+            {"impact_id": str(impact.id), "deferrals": deferrals},
             delay_s=settings.fix_defer_delay_s,
             dedupe_key=fix_impact_dedupe_key(impact.id),
         )
         session.commit()
         log.info(
-            "impact %s deferred: %s fixes running (limit %s)",
+            "impact %s deferred (%s): %s fixes running (limit %s)",
             impact.id,
+            deferrals,
             running,
             settings.fix_concurrency,
         )
@@ -386,12 +468,20 @@ def handle_fix_impact(session: Session, payload: dict[str, Any]) -> dict[str, An
 
     assert cls is not None  # refusal_reason guarantees it
     impact.status = "fixing"
+    impact.ci_result = {**(impact.ci_result or {}), "fix_started_at": utcnow().isoformat()}
     job_id = payload.get("_job_id")
     if job_id:
         with contextlib.suppress(ValueError):
             impact.fix_job_id = UUID(str(job_id))
     session.commit()
     return _run_fix(session, settings, impact, repo, org, row, cls, source)
+
+
+def _int_or_zero(v: Any) -> int:
+    try:
+        return max(0, int(v))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _run_fix(
@@ -406,7 +496,8 @@ def _run_fix(
 ) -> dict[str, Any]:
     app = get_github_app()
     installation_id = int(org.github_installation_id) if org is not None else 0
-    sandbox = make_sandbox(settings, job_id=f"{str(impact.id)[:8]}")
+    # unique per attempt: a re-run never reuses a stale volume or container name
+    sandbox = make_sandbox(settings, job_id=f"{str(impact.id)[:8]}-{uuid.uuid4().hex[:6]}")
     register_active(sandbox)
     tokens_in = tokens_out = 0
     model: str | None = None
@@ -418,9 +509,10 @@ def _run_fix(
             or "main"
         )
         clone_url = app.clone_url(installation_id, repo.full_name)
-        workdir = sandbox.prepare(clone_url, base_branch)
+        sandbox.prepare(clone_url, base_branch)
 
-        plan = detect_test_command(workdir, repo.config or {})
+        # read through the sandbox: with Docker ``workdir`` is a path inside the container
+        plan = detect_test_command(sandbox, repo.config or {})
         refused = plan_refusal(plan)
         if refused:
             _fail(session, impact, refused, comment=True)
@@ -471,12 +563,16 @@ def _run_fix(
 
         gh_repo = app.installation_client(installation_id).get_repo(repo.full_name)
         branch = branch_name(ctx.vendor, row.id)
+        # the clone's token may expire during a 15-minute job: mint the push URL now, and
+        # scrub its token like the clone's
+        push_url = app.clone_url(installation_id, repo.full_name)
+        sandbox.secrets = tuple(dict.fromkeys((*sandbox.secrets, *secrets_in_url(push_url))))
         try:
             pushed = commit_and_push(
                 sandbox,
                 branch,
                 commit_message(ctx),
-                clone_url=clone_url,
+                clone_url=push_url,
                 gh_repo=gh_repo,
                 base_branch=base_branch,
             )
@@ -683,24 +779,37 @@ def _ci_excerpt(details: dict[str, Any]) -> str:
 def record_ci_result(
     session: Session, repo: Repo, pr_number: int, conclusion: str, details: dict[str, Any] | None
 ) -> Impact | None:
-    """Store the customer's CI result on the impact. A failing conclusion moves it to
-    ``failed`` with an issue comment carrying the log excerpt; success leaves ``pr_open``."""
+    """Store the customer's CI result on the impact, per check (``ci_result.checks``).
+    A ``failure`` / ``timed_out`` moves ``pr_open`` to ``failed`` with an issue comment
+    carrying the log excerpt; other non-success conclusions (``cancelled``,
+    ``action_required``, ``neutral`` ...) are only recorded. When every check that failed
+    later reports ``success`` (a re-run), a CI-failed impact returns to ``pr_open``."""
     impact = _impact_for_pr(session, repo, pr_number)
     if impact is None:
         return None
     details = dict(details or {})
+    now = utcnow().isoformat()
+    name = str(details.get("name") or details.get("check_name") or "CI")
+    url = details.get("details_url") or details.get("html_url")
     ci = dict(impact.ci_result or {})
     ci["conclusion"] = conclusion
     ci["details"] = {k: v for k, v in details.items() if k not in ("log", "output", "text")}
-    ci["recorded_at"] = utcnow().isoformat()
+    ci["recorded_at"] = now
+    checks = dict(ci.get("checks") or {})
+    if conclusion in CI_FAILURE_CONCLUSIONS or conclusion in CI_SUCCESS_CONCLUSIONS:
+        # the latest red/green verdict per check; a cancelled re-run does not clear a failure
+        checks[name] = {"conclusion": conclusion, "recorded_at": now, "details_url": url}
+    ci["checks"] = checks
+    failing = sorted(
+        n for n, c in checks.items() if (c or {}).get("conclusion") in CI_FAILURE_CONCLUSIONS
+    )
     impact.ci_result = ci
     if conclusion in CI_FAILURE_CONCLUSIONS and impact.status == "pr_open":
-        name = details.get("name") or details.get("check_name") or "CI"
-        url = details.get("details_url") or details.get("html_url")
         reason = f"CI {name} reported {conclusion} on PR #{pr_number}"
         impact.status = "failed"
         impact.fix_reason = reason
         impact.resolved_at = utcnow()
+        impact.ci_result = {**ci, "failed_by_ci": True}
         session.commit()
         excerpt = _ci_excerpt(details)
         body = (
@@ -712,6 +821,24 @@ def record_ci_result(
         if excerpt:
             body += f"\n\n```\n{_fence_safe(excerpt)}\n```"
         _comment(session, impact, body)
+    elif (
+        conclusion in CI_SUCCESS_CONCLUSIONS
+        and impact.status == "failed"
+        and ci.get("failed_by_ci")
+        and impact.pr_outcome is None
+        and not failing
+    ):
+        impact.status = "pr_open"
+        impact.fix_reason = None
+        impact.resolved_at = None
+        impact.ci_result = {**ci, "failed_by_ci": False, "recovered_at": now}
+        session.commit()
+        _comment(
+            session,
+            impact,
+            f"CI {name} now passes on PR #{pr_number}; every check that failed has passed "
+            "since, so the PR is back to awaiting review.",
+        )
     else:
         session.commit()
     log.info("impact %s: CI %s on PR #%s -> %s", impact.id, conclusion, pr_number, impact.status)
@@ -749,6 +876,7 @@ def handle_pr_outcome(session: Session, payload: dict[str, Any]) -> dict[str, An
 
 __all__ = [
     "CI_FAILURE_CONCLUSIONS",
+    "CI_SUCCESS_CONCLUSIONS",
     "FIXABLE_CATEGORIES",
     "build_fix_context",
     "effective_fix_mode",

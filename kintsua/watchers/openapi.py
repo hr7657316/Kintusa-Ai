@@ -21,9 +21,14 @@ its refs so deep changes are reported once, at ``/components/schemas/<name>/...`
 
 Diff (native walker, always available): ``removed`` / ``added`` operations, parameter and
 schema ops from ``diff_json_schema`` (``required_added``, ``type_changed``, ``enum_changed``,
-``removed`` ...), ``auth_changed`` for security changes, ``deprecated``, ``text_changed`` for
-summary/description-only changes and ``renamed`` when a removed and an added sibling share
-an identical schema or a Levenshtein distance under 3. Optionally, when the ``oasdiff``
+``removed`` ...; a schema edit it does not model, such as a new ``default``, is
+``text_changed``), ``auth_changed`` when a security scheme's type, location or scope set or
+a ``security`` requirement set changes (wording and order are ``text_changed`` / nothing),
+``deprecated``, ``text_changed`` for summary/description-only changes and ``renamed`` when
+a removed and an added sibling share an identical distinctive schema or a Levenshtein
+distance under 3 (never across HTTP methods, status codes or media types). The response
+body is capped at ``meta["max_bytes"]`` and YAML alias bombs are refused; guarded sources
+(``meta["_net_guard"]``) go through ``kintsua.core.netguard``. Optionally, when the ``oasdiff``
 binary is on PATH and ``KINTSUA_USE_OASDIFF=1``, its changelog ids are mapped into ops and
 merged (deduplicated by op+path) with the native result.
 """
@@ -49,8 +54,14 @@ from kintsua.core.events import (
     json_pointer_escape,
     split_pointer,
 )
+from kintsua.watchers._http import client_kwargs, get_bounded, guard_url, max_bytes_for
 from kintsua.watchers.base import BaseWatcher, SourceRef, register, sort_keys
-from kintsua.watchers.schemadiff import diff_json_schema, levenshtein, schema_summary
+from kintsua.watchers.schemadiff import (
+    diff_json_schema,
+    levenshtein,
+    residual_schema_ops,
+    schema_summary,
+)
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +102,10 @@ STRUCTURAL_REF_PREFIXES = (
     "#/responses/",
 )
 RENAME_MAX_DISTANCE = 3
+# YAML alias-bomb guard (see _check_expansion)
+YAML_MAX_EXPANDED_NODES = 20_000_000
+YAML_MAX_SHARED_NODES = 1_000_000
+YAML_MAX_EXPANSION_RATIO = 10
 
 
 class SpecFormatError(ValueError):
@@ -118,7 +133,42 @@ def parse_spec_text(text: str) -> dict[str, Any]:
 
 def _yaml_load(text: str) -> Any:
     loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
-    return yaml.load(text, Loader=loader)  # noqa: S506 - SafeLoader variant
+    doc = yaml.load(text, Loader=loader)  # noqa: S506 - SafeLoader variant
+    _check_expansion(doc)
+    return doc
+
+
+def _check_expansion(doc: Any) -> None:
+    """Refuse YAML whose aliases expand far beyond the document itself (a "billion laughs"
+    alias bomb loads small, because aliased nodes are shared, and explodes when the spec is
+    canonicalised or serialised). Legit anchors re-use a little; a bomb re-uses enormously."""
+    sizes: dict[int, int] = {}
+    unique = 0  # nodes as written (each container once, plus its scalar children)
+
+    def size(node: Any) -> int:
+        nonlocal unique
+        if not isinstance(node, dict | list):
+            return 1
+        key = id(node)
+        if key in sizes:  # an aliased container: its full expanded size again
+            return sizes[key]
+        children = list(node.values()) if isinstance(node, dict) else node
+        unique += 1 + sum(1 for c in children if not isinstance(c, dict | list))
+        sizes[key] = 1  # a recursive alias counts once
+        total = 1 + sum(size(c) for c in children)
+        sizes[key] = total
+        return total
+
+    try:
+        expanded = size(doc)
+    except RecursionError as e:
+        raise SpecFormatError("YAML document is nested too deeply") from e
+    if expanded > YAML_MAX_EXPANDED_NODES or (
+        expanded > YAML_MAX_SHARED_NODES and expanded > YAML_MAX_EXPANSION_RATIO * max(unique, 1)
+    ):
+        raise SpecFormatError(
+            f"YAML aliases expand {unique} nodes to {expanded}; refusing the document"
+        )
 
 
 def detect_format(doc: dict[str, Any], meta: dict[str, Any] | None = None) -> str:
@@ -174,15 +224,22 @@ def canonicalise(doc: dict[str, Any], meta: dict[str, Any] | None = None) -> dic
 async def fetch_spec(
     url: str, meta: dict[str, Any] | None = None, *, timeout_s: float | None = None
 ) -> dict[str, Any]:
+    """GET + parse. Guarded sources (``meta["_net_guard"]``) have the URL and every
+    redirect hop checked by ``kintsua.core.netguard``; the body is capped at
+    ``meta["max_bytes"]`` (default 32 MB)."""
     meta = meta or {}
+    guard_url(url, meta)
     headers = {"User-Agent": str(meta.get("user_agent") or DEFAULT_USER_AGENT)}
     for k, v in (meta.get("headers") or {}).items():
         headers[str(k)] = os.path.expandvars(str(v))
     timeout = float(timeout_s or meta.get("timeout_s") or DEFAULT_TIMEOUT_S)
     async with httpx.AsyncClient(
-        follow_redirects=True, timeout=httpx.Timeout(timeout), headers=headers
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout),
+        headers=headers,
+        **client_kwargs(meta),
     ) as client:
-        r = await client.get(url)
+        r = await get_bounded(client, url, max_bytes=max_bytes_for(meta))
         r.raise_for_status()
         return parse_spec_text(r.text)
 
@@ -701,16 +758,22 @@ def diff_openapi(
     b_sec = (before.get("components") or {}).get("securitySchemes") or {}
     a_sec = (after.get("components") or {}).get("securitySchemes") or {}
     for name in sorted(set(b_sec) | set(a_sec)):
-        if b_sec.get(name) != a_sec.get(name):
-            ops.append(
-                ChangeOp(
-                    op="auth_changed",
-                    path=json_pointer("components", "securitySchemes", name),
-                    before=b_sec.get(name),
-                    after=a_sec.get(name),
+        b_s, a_s = b_sec.get(name), a_sec.get(name)
+        if b_s == a_s:
+            continue
+        sptr = json_pointer("components", "securitySchemes", name)
+        if _auth_shape(b_s) != _auth_shape(a_s):
+            ops.append(ChangeOp(op="auth_changed", path=sptr, before=b_s, after=a_s))
+            continue
+        # same scheme, type, location and scope set: only wording (or scope order) moved
+        for k in ("description", "title"):
+            b_txt = b_s.get(k) if isinstance(b_s, dict) else None
+            a_txt = a_s.get(k) if isinstance(a_s, dict) else None
+            if b_txt != a_txt:
+                ops.append(
+                    ChangeOp(op="text_changed", path=sptr + "/" + k, before=b_txt, after=a_txt)
                 )
-            )
-    if (before.get("security") or []) != (after.get("security") or []):
+    if _security_key(before.get("security")) != _security_key(after.get("security")):
         ops.append(
             ChangeOp(
                 op="auth_changed",
@@ -740,7 +803,7 @@ def _diff_operation(
                     op="text_changed", path=ptr + "/" + k, before=b_op.get(k), after=a_op.get(k)
                 )
             )
-    if (b_op.get("security") or None) != (a_op.get("security") or None):
+    if _security_key(b_op.get("security")) != _security_key(a_op.get("security")):
         ops.append(
             ChangeOp(
                 op="auth_changed",
@@ -791,15 +854,7 @@ def _diff_operation(
         if (bp.get("schema") or {}) != (ap.get("schema") or {}):
             sub = sdiff(bp.get("schema"), ap.get("schema"), pp + "/schema")
             ops.extend(
-                sub
-                or [
-                    ChangeOp(
-                        op="type_changed",
-                        path=pp + "/schema",
-                        before=schema_summary(bp.get("schema")),
-                        after=schema_summary(ap.get("schema")),
-                    )
-                ]
+                sub or residual_schema_ops(bp.get("schema"), ap.get("schema"), pp + "/schema")
             )
 
     # requestBody
@@ -853,22 +908,64 @@ def _diff_content(
         elif mt not in b_content:
             ops.append(ChangeOp(op="added", path=mptr, before=None, after=schema_summary(a_schema)))
         elif (b_schema or {}) != (a_schema or {}):
-            sub = sdiff(b_schema, a_schema, mptr)
             ops.extend(
-                sub
-                or [
-                    ChangeOp(
-                        op="type_changed",
-                        path=mptr,
-                        before=schema_summary(b_schema),
-                        after=schema_summary(a_schema),
-                    )
-                ]
+                sdiff(b_schema, a_schema, mptr) or residual_schema_ops(b_schema, a_schema, mptr)
             )
 
 
 def _is_deprecated(x: dict[str, Any]) -> bool:
     return x.get("deprecated") is True or x.get("x-deprecated") is True
+
+
+_AUTH_TEXT_KEYS = frozenset({"description", "title"})
+
+
+def _auth_shape(scheme: Any) -> Any:
+    """What a security scheme means to a caller: everything but its wording, with each
+    OAuth flow's ``scopes`` map reduced to the sorted scope names."""
+    if not isinstance(scheme, dict):
+        return scheme
+    out: dict[str, Any] = {}
+    for k, v in scheme.items():
+        if k in _AUTH_TEXT_KEYS or str(k).startswith("x-"):
+            continue
+        if k == "flows" and isinstance(v, dict):
+            out[k] = {
+                name: (
+                    {
+                        fk: (
+                            sorted(map(str, fv)) if fk == "scopes" and isinstance(fv, dict) else fv
+                        )
+                        for fk, fv in flow.items()
+                        if fk not in _AUTH_TEXT_KEYS
+                    }
+                    if isinstance(flow, dict)
+                    else flow
+                )
+                for name, flow in v.items()
+            }
+        else:
+            out[k] = v
+    return out
+
+
+def _security_key(requirements: Any) -> frozenset[Any] | None:
+    """A ``security`` list compared without order: the set of alternatives, each the set of
+    ``(scheme, sorted scopes)`` pairs. Empty and missing compare equal (as before)."""
+    if not requirements or not isinstance(requirements, list):
+        return None
+    alternatives = set()
+    for req in requirements:
+        if not isinstance(req, dict):
+            alternatives.add(frozenset({("?", repr(req))}))
+            continue
+        alternatives.add(
+            frozenset(
+                (str(k), tuple(sorted(str(s) for s in (v or []) if s is not None)))
+                for k, v in req.items()
+            )
+        )
+    return frozenset(alternatives)
 
 
 def _param_summary(p: dict[str, Any]) -> dict[str, Any]:
@@ -912,13 +1009,40 @@ def _shape(payload: Any) -> Any:
     return payload
 
 
+def _distinctive_shape(shape: Any) -> bool:
+    """An identical shape only proves a rename when it is specific: an object, array, enum or
+    ``$ref`` schema (or a summary listing properties), not a bare scalar such as
+    ``{"in": "query", "required": false, "schema": {"type": "string"}}`` that any two
+    optional string parameters share."""
+    if not isinstance(shape, dict) or not shape:
+        return False
+    for node in (shape, shape.get("schema"), shape.get("inputSchema")):
+        if isinstance(node, dict) and any(
+            k in node for k in ("properties", "enum", "items", "$ref", "oneOf", "anyOf", "allOf")
+        ):
+            return True
+    return False
+
+
+def _rename_candidate(op: ChangeOp) -> bool:
+    """Siblings that can never be renames of each other: HTTP operations on one path (GET
+    removed + PUT added is two changes), response status codes and media types."""
+    toks = split_pointer(op.path)
+    if len(toks) == 3 and toks[0] == "paths" and toks[2] in HTTP_METHODS:
+        return False
+    if len(toks) >= 2 and toks[-2] in ("responses", "content"):
+        return False
+    return not (len(toks) >= 3 and toks[-1] == "schema" and toks[-3] == "content")
+
+
 def detect_renames(ops: list[ChangeOp]) -> list[ChangeOp]:
-    """Pair ``removed``/``added`` siblings (same parent pointer) that share an identical shape
-    or whose names are within Levenshtein distance < 3 into one ``renamed`` op
-    (path = the removed item's pointer, before = old name, after = new name)."""
+    """Pair ``removed``/``added`` siblings (same parent pointer) into one ``renamed`` op
+    (path = the removed item's pointer, before = old name, after = new name) when they share
+    an identical, distinctive shape or their names are within Levenshtein distance < 3 and
+    under half the longer name. HTTP methods, status codes and media types never pair."""
     by_parent: dict[str, tuple[list[int], list[int]]] = {}
     for i, op in enumerate(ops):
-        if op.op not in ("removed", "added"):
+        if op.op not in ("removed", "added") or not _rename_candidate(op):
             continue
         parent = op.path.rsplit("/", 1)[0]
         bucket = by_parent.setdefault(parent, ([], []))
@@ -939,9 +1063,10 @@ def detect_renames(ops: list[ChangeOp]) -> list[ChangeOp]:
                 a_name = _name_of(a)
                 if not r_name or not a_name or r_name == a_name:
                     continue
-                identical = bool(r_shape) and r_shape == _shape(a.after)
+                identical = _distinctive_shape(r_shape) and r_shape == _shape(a.after)
                 dist = levenshtein(r_name, a_name)
-                if identical or dist < RENAME_MAX_DISTANCE:
+                close = dist < RENAME_MAX_DISTANCE and dist * 2 < max(len(r_name), len(a_name))
+                if identical or close:
                     score = 0 if identical else dist
                     if best is None or score < best[0]:
                         best = (score, ai)

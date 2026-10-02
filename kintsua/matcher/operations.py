@@ -120,8 +120,11 @@ def _split_path(target: str) -> tuple[str, ...]:
     """Strip scheme/host/query, collapse slashes, drop the trailing slash, template ids."""
     t = target.strip()
     if "://" in t:
-        parts = urlsplit(t)
-        t = parts.path or "/"
+        try:
+            t = urlsplit(t).path or "/"
+        except ValueError:  # e.g. "http://[::1/x" (bad IPv6 literal) from a runtime sample
+            rest = t.split("://", 1)[1].split("?", 1)[0].split("#", 1)[0]
+            t = "/" + rest.partition("/")[2]
     else:
         t = t.split("?", 1)[0].split("#", 1)[0]
         if not t.startswith("/"):
@@ -708,6 +711,10 @@ def operations_match(site_operation: str | None, affected: str | None) -> bool:
     * tool / resource / prompt / schema: exact name.
     * SDK vs SDK: equal or dotted-suffix related.
     * SDK vs HTTP (either way round): through :data:`SDK_RULES`.
+    * SDK vs tool: the full name only. A bare dotted call-site string parses as an SDK
+      symbol but may be an MCP tool name (``browser.navigate`` ~ ``tool:browser.navigate``);
+      an SDK chain that merely ends in a tool's name (``notion_client.Client.search`` vs
+      ``tool:search``) is a different operation.
     """
     a = parse_operation(site_operation)
     b = parse_operation(affected)
@@ -729,10 +736,8 @@ def operations_match(site_operation: str | None, affected: str | None) -> bool:
         return any(_http_match(h, b) for h in sdk_http_operations(a.name))
     if a.kind == "http" and b.kind == "sdk":
         return any(_http_match(a, h) for h in sdk_http_operations(b.name))
-    if a.kind == "tool" and b.kind == "sdk":
-        return b.name.rsplit(".", 1)[-1] == a.name
-    if a.kind == "sdk" and b.kind == "tool":
-        return a.name.rsplit(".", 1)[-1] == b.name
+    if {a.kind, b.kind} == {"sdk", "tool"}:
+        return a.name == b.name
     return False
 
 

@@ -1,5 +1,4 @@
-"""Wrappers that observe MCP sessions and HTTP clients without changing their behaviour.
-Best-effort: a failure inside the SDK is logged at DEBUG and the wrapped call proceeds."""
+"""Observe MCP sessions and HTTP clients unchanged; an SDK failure is a DEBUG log, never raised."""
 
 from __future__ import annotations
 
@@ -9,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from collections.abc import Callable
@@ -16,22 +16,27 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from kintsua.sdk.report import Reporter, get_reporter
+from kintsua.sdk.report import Opt, Reporter, get_reporter
 
 log = logging.getLogger("kintsua.sdk")
 _STATE_LOCK = threading.Lock()
 _ID_SEG = re.compile(r"\d+|[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{24,}", re.I)
-# kintsua.core.util.SECRET_PATTERNS, copied (the SDK must not import the hosted core) and
-# extended to match JSON-quoted keys ("api_key": "...").
+# path segments that carry a credential (webhook / bot tokens): high-entropy, never a word
+_TOKEN_SEG = re.compile(r"bot\d+:[\w-]+|(?=[\w.-]*[A-Z\d])[\w.-]{20,}|(?=[A-Z]*\d)[A-Z\d]{8,}")
+# A superset of kintsua.core.util.SECRET_PATTERNS, copied (the SDK must not import the core)
 SECRET_RE = re.compile(
-    r"(sk|rk|pk)_(live|test)_[0-9a-z]{8,}|bearer\s+[a-z0-9\-_.=]{12,}|gh[pousr]_[0-9a-z]{20,}"
-    r"|xox[baprs]-[0-9a-z\-]{10,}|AKIA[0-9A-Z]{16}|sk-ant-[0-9a-z\-_]{20,}|sk-[0-9a-z]{20,}"
-    r"|(api[_-]?key|token|secret|password|authorization)[\"']?\s*[:=]\s*[\"']?(bearer\s+)?[^\s\"',}]{6,}"
-    r"|eyJ[0-9a-z_\-]{10,}\.[0-9a-z_\-]{10,}\.[0-9a-z_\-]{10,}",
+    r"(sk|rk|pk)_(live|test)_[0-9a-z]{8,}|bearer\s+[\w\-.=]{12,}|gh[pousr]_[0-9a-z]{20,}"
+    r"|basic\s+(?=[a-z]*[\d+/=])[\w+/=]{8,}|github_pat_\w{22,}|xox[abeprs]-[0-9a-z\-]{10,}"
+    r"|xapp-[0-9a-z\-]{10,}|AKIA[0-9A-Z]{16}|AIza[\w\-]{35}|sk-ant-[\w\-]{20,}|kts_[\w\-]{20,}"
+    r"|sk-(proj|svcacct|admin)-[\w\-]{20,}|sk-[0-9a-z]{20,}|npm_[0-9a-z]{36}|pypi-[\w\-]{50,}"
+    r"|(api[_-]?key|token|secret|password|private[_-]?key|(proxy-)?authorization)[\"']?\s*[:=]\s*"
+    r"[\"']?([a-z]+\s+)?[^\s\"',}]{6,}|eyJ[\w\-]{10,}\.[\w\-]{10,}\.[\w\-]{10,}"
+    r"|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)",  # URL userinfo (user:password@)
     re.I,
 )
-Opt = str | None
+_CACHES: dict[str, dict[str, str]] = {}  # server -> {tool: fingerprint}, shared by its sessions
 Done = Callable[[tuple, dict, float, Any, BaseException | None], None]
+pick_name = lambda a, kw: (a[0] if a else kw.get("name"), (a[1:] or [kw.get("arguments")])[0])  # noqa: E731
 
 
 def fingerprint(input_schema: Any) -> str:
@@ -48,9 +53,8 @@ def schema_diff(before: Any, after: Any, ptr: str = "") -> list[dict[str, Any]]:
     for k in sorted(set(bp) | set(ap)):
         p, b, a = f"{ptr}/properties/{k}", bp.get(k), ap.get(k)
         if k not in ap or k not in bp:
-            ops.append(
-                {"op": "added" if k in ap else "removed", "path": p, "before": b, "after": a}
-            )
+            op = "added" if k in ap else "removed"
+            ops.append({"op": op, "path": p, "before": b, "after": a})
         elif isinstance(b, dict) and isinstance(a, dict):
             for key, op in (("type", "type_changed"), ("enum", "enum_changed")):
                 if b.get(key) != a.get(key):
@@ -66,9 +70,7 @@ def schema_diff(before: Any, after: Any, ptr: str = "") -> list[dict[str, Any]]:
 
 def tools_of(result: Any) -> list[tuple[str, dict[str, Any]]]:
     """``[(name, inputSchema)]`` from a ListToolsResult (mcp 1.x/2.x), Tool models or dicts."""
-    tools = getattr(result, "tools", None)
-    if tools is None:
-        tools = result.get("tools") if isinstance(result, dict) else result
+    tools = result.get("tools") if isinstance(result, dict) else getattr(result, "tools", result)
     out: list[tuple[str, dict[str, Any]]] = []
     for t in tools or []:
         t = getattr(t, "_mcp_tool", t)  # google-adk MCPTool keeps the wire tool here
@@ -110,43 +112,38 @@ def check_tools(reporter: Reporter, cache: dict[str, str], result: Any, server: 
 def observe(orig: Callable[..., Any], on_done: Done) -> Callable[..., Any]:
     """Run ``on_done(args, kwargs, t0, result, exc)`` after a sync/async call; it never raises."""
 
-    async def awaited(aw: Any, done: Callable[[Any, BaseException | None], None]) -> Any:
+    def done(a: tuple, kw: dict, t0: float, res: Any, exc: BaseException | None) -> None:
+        try:
+            on_done(a, kw, t0, res, exc)
+        except Exception as e:  # noqa: BLE001
+            log.debug("kintsua: observer failed: %s", e)
+
+    async def awaited(aw: Any, *ctx: Any) -> Any:  # ctx: (args, kwargs, t0)
         try:
             res = await aw
         except BaseException as e:
-            done(None, e)
+            done(*ctx, None, e)
             raise
-        done(res, None)
+        done(*ctx, res, None)
         return res
 
     def wrapper(*a: Any, **kw: Any) -> Any:
         t0 = time.perf_counter()
-
-        def done(res: Any, exc: BaseException | None) -> None:
-            try:
-                on_done(a, kw, t0, res, exc)
-            except Exception as e:  # noqa: BLE001
-                log.debug("kintsua: observer failed: %s", e)
-
         try:
             res = orig(*a, **kw)
         except BaseException as e:
-            done(None, e)
+            done(a, kw, t0, None, e)
             raise
-        if inspect.isawaitable(res):
-            return awaited(res, done)
-        done(res, None)
+        if inspect.isawaitable(res):  # a coroutine is observed, other awaitables keep their type
+            return awaited(res, a, kw, t0) if inspect.iscoroutine(res) else res
+        done(a, kw, t0, res, None)
         return res
 
     return wrapper
 
 
-def _pick_name(a: tuple, kw: dict) -> tuple[Any, Any]:
-    return (a[0] if a else kw.get("name")), (a[1] if len(a) > 1 else kw.get("arguments"))
-
-
-def call_observer(reporter: Reporter, cache: dict, sample: bool, name_of: Any = _pick_name) -> Done:
-    """``on_done`` for ``call_tool``: name, latency, ok/error, error class; arg keys if ``sample``."""
+def call_observer(reporter: Reporter, cache: Any, sample: bool, name_of: Any = pick_name) -> Done:
+    """``on_done`` for ``call_tool``: name, latency, outcome, error class, ``sample`` arg keys."""
 
     def done(a: tuple, kw: dict, t0: float, res: Any, exc: BaseException | None) -> None:
         name, args = name_of(a, kw)
@@ -154,7 +151,8 @@ def call_observer(reporter: Reporter, cache: dict, sample: bool, name_of: Any = 
         flag = getattr(res, "isError", None) if flag is None else flag
         error = type(exc).__name__ if exc else ("ToolError" if flag else None)
         keys = {"arg_keys": sorted(map(str, args))} if sample and isinstance(args, dict) else None
-        fields = {"error_class": error, "schema_fingerprint": cache.get(str(name)), "sample": keys}
+        fps = cache(a) if callable(cache) else cache  # cache(args): the called server's dict
+        fields = {"error_class": error, "schema_fingerprint": fps.get(str(name)), "sample": keys}
         fields["latency_ms"] = (time.perf_counter() - t0) * 1000
         reporter.record(str(name or "?"), "mcp", "error" if error else "ok", **fields)
 
@@ -168,15 +166,27 @@ def _server_name(res: Any, srv: list[str]) -> None:  # initialize observer: serv
     srv[0] = srv[0] or (f"mcp:{name}" if name else "")
 
 
-def wrap_mcp(session: Any, repo: Opt = None, key: Opt = None, sample=False, server: Opt = None):
-    """Patch ``initialize`` / ``list_tools`` / ``call_tool`` on an MCP client session (mcp 1.x/2.x
-    or any sync/async duck type), return the same object; ``server`` names the locator."""
+def server_id(params: Any, label: str = "") -> str:
+    """``sample.server``: URL (no userinfo/query) or command line in ``params``, else ``label``."""
+    get = params.get if isinstance(params, dict) else lambda k: getattr(params, k, None)
+    url, cmd = str(get("url") or ""), get("command")
+    if "://" in url:  # parsed by hand: never raises, whatever the framework holds
+        scheme, _, rest = url.partition("://")
+        host, slash, path = re.split(r"[?#]", rest)[0].partition("/")
+        return f"{scheme}://{host.rpartition('@')[2]}{slash}{path}"
+    line = shlex.join([str(cmd), *map(str, get("args") or [])]) if cmd else label
+    return SECRET_RE.sub("[REDACTED]", line)
+
+
+def wrap_mcp(session: Any, repo: Opt = None, key: Opt = None, sample=False, server: Any = None):
+    """Observe initialize / list_tools / call_tool of an MCP session; ``server``: str or params."""
     try:
         rep = get_reporter(repo, key)
         if not rep.enabled or getattr(session, "_kintsua_wrapped", False):
             return session
-        cache: dict[str, str] = {}
-        srv = [str(server or getattr(session, "url", None) or "")]
+        p = server if isinstance(server, dict) else {"url": server or getattr(session, "url", None)}
+        srv = [server_id(p, server if isinstance(server, str) else "")]
+        cache = _CACHES.setdefault(srv[0], {}) if srv[0] else {}
         observers: dict[str, Done] = {
             "initialize": lambda a, kw, t0, res, exc: _server_name(res, srv),
             "list_tools": lambda a, kw, t0, res, exc: exc or check_tools(rep, cache, res, srv[0]),
@@ -192,9 +202,10 @@ def wrap_mcp(session: Any, repo: Opt = None, key: Opt = None, sample=False, serv
 
 
 def http_tool_name(method: str, url: str) -> str:
-    """``GET api.vendor.com/v1/users/{id}``: numeric/uuid/long-hex segments -> ``{id}``, no query."""
+    """``GET api.vendor.com/v1/users/{id}``: ids -> ``{id}``, credentials -> ``{token}``, no query."""
     u = urlsplit(str(url))
-    path = "/".join("{id}" if _ID_SEG.fullmatch(s) else s for s in u.path.split("/"))
+    seg = lambda s: "{id}" if _ID_SEG.fullmatch(s) else "{token}" if _TOKEN_SEG.fullmatch(s) else s  # noqa: E731
+    path = "/".join(map(seg, u.path.split("/")))
     return f"{str(method).upper()} {(u.hostname or '').lower()}{path or '/'}"
 
 
@@ -220,20 +231,16 @@ def http_observer(reporter: Reporter, name_of: Any) -> Done:
     return done
 
 
-def _httpx_name(a: tuple, kw: dict) -> tuple[str, str]:
-    r = a[0] if a else kw["request"]  # Client.stream() passes request= by keyword
-    return r.method, str(r.url)
-
-
 def wrap_http(client: Any, repo: Opt = None, key: Opt = None) -> Any:
-    """Observe an httpx Client/AsyncClient (``send``) or a requests Session (``request``)."""
+    """Observe an httpx Client/AsyncClient (``send``) or a requests Session (``request``) only."""
     try:
         reporter = get_reporter(repo, key)
         if not reporter.enabled or getattr(client, "_kintsua_wrapped", False):
             return client
         if hasattr(client, "event_hooks") and callable(getattr(client, "send", None)):
-            client.send = observe(client.send, http_observer(reporter, _httpx_name))
-        elif callable(getattr(client, "request", None)):
+            by_req = lambda a, kw: ((r := a[0] if a else kw["request"]).method, str(r.url))  # noqa: E731
+            client.send = observe(client.send, http_observer(reporter, by_req))
+        elif hasattr(client, "mount") and hasattr(client, "adapters"):  # requests.Session
             by_args = lambda a, kw: (a[0], a[1])  # noqa: E731 - request(method, url, ...)
             client.request = observe(client.request, http_observer(reporter, by_args))
         else:

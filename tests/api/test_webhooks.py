@@ -16,6 +16,7 @@ from tests.api.conftest import (
     REPO_FULL_NAME,
     REPO_GITHUB_ID,
     STRIPE_SPEC,
+    bearer,
     load_payload,
     post_webhook,
 )
@@ -85,7 +86,11 @@ def test_installation_created_creates_org_repos_and_index_jobs(client, session, 
     assert org is not None
     assert org.name == "acme" and org.account_type == "Organization" and org.plan == "free"
     assert org.active is True
-    assert org.settings == {"fix_mode": "issue_only", "auto_issue": False}
+    assert org.settings == {
+        "fix_mode": "issue_only",
+        "auto_issue": False,
+        "github_account_id": 583231,
+    }
     repos = {r.full_name: r for r in session.scalars(select(Repo).where(Repo.org_id == org.id))}
     assert set(repos) == {"acme/support-agent", "acme/billing-bot"}
     assert repos["acme/support-agent"].private is True
@@ -199,6 +204,100 @@ def test_installation_repositories_added_and_removed(client, session, factory):
     assert session.get(Repo, new.id).active is False
 
 
+def test_removing_one_repo_keeps_sources_its_siblings_still_use(client, session, factory):
+    """api-correctness-1: removing repo B keeps polling a source repo A still depends on."""
+    org = factory.org()
+    repo_a = factory.repo(org)
+    repo_b = factory.repo(org, "acme/other", github_repo_id=186853010)
+    shared = factory.source(
+        kind="openapi", locator="https://api.vendor.example/openapi.json", vendor="v"
+    )
+    only_b = factory.source(kind="changelog", locator="https://vendor.example/changelog")
+    factory.dependency(repo_a, shared, kind="openapi", name=shared.locator)
+    factory.dependency(repo_b, shared, kind="openapi", name=shared.locator)
+    factory.dependency(repo_b, only_b, kind="changelog", name=only_b.locator)
+    removed = {
+        "action": "removed",
+        "installation": {"id": INSTALLATION_ID, "account": ACCOUNT},
+        "repositories_added": [],
+        "repositories_removed": [{"id": 186853010, "full_name": "acme/other"}],
+        "sender": SENDER,
+    }
+    r = post_webhook(client, "installation_repositories", removed)
+    assert r.status_code == 200 and r.json()["sources_deactivated"] == 1, r.text
+    session.expire_all()
+    assert session.get(Repo, repo_b.id).active is False
+    assert session.get(Source, shared.id).active is True  # repo A still depends on it
+    assert session.get(Source, only_b.id).active is False
+
+    # adding the repo back polls its source again
+    added = {
+        **removed,
+        "action": "added",
+        "repositories_added": [{"id": 186853010, "full_name": "acme/other"}],
+        "repositories_removed": [],
+    }
+    r = post_webhook(client, "installation_repositories", added)
+    assert r.status_code == 200 and r.json()["sources_reactivated"] == 1, r.text
+    session.expire_all()
+    assert session.get(Source, only_b.id).active is True
+    assert session.get(Repo, repo_a.id).active is True
+
+
+def test_reinstall_reuses_the_org_of_the_same_account(client, session, factory):
+    """api-correctness-3: a reinstall (new installation id) keeps the org, its plan, SDK key
+    and sources instead of creating a second, empty org."""
+    created = load_payload("installation_created")
+    assert post_webhook(client, "installation", created).status_code == 200
+    org = session.scalar(select(Org).where(Org.github_installation_id == INSTALLATION_ID))
+    org.plan = "pro"
+    org.settings = {**org.settings, "stripe_subscription_id": "sub_123"}
+    session.commit()
+    key = factory.sdk_key(org)
+    repo = session.scalar(select(Repo).where(Repo.github_repo_id == REPO_GITHUB_ID))
+    custom = factory.source(kind="openapi", locator="https://api.vendor.example/openapi.json")
+    stdio = factory.source(kind="mcp", locator="python tools/server.py", vendor=None)
+    factory.dependency(repo, custom, kind="openapi", name=custom.locator)
+    factory.dependency(repo, stdio, kind="mcp", name=stdio.locator)
+    stdio.active = False  # the worker refuses customer stdio commands
+    session.commit()
+
+    deleted = {**created, "action": "deleted"}
+    r = post_webhook(client, "installation", deleted)
+    assert r.status_code == 200 and r.json()["sources_deactivated"] == 1
+    session.expire_all()
+    assert session.get(Source, custom.id).active is False
+
+    reinstalled = copy.deepcopy(created)
+    reinstalled["installation"]["id"] = INSTALLATION_ID + 1
+    r = post_webhook(client, "installation", reinstalled)
+    assert r.status_code == 200, r.text
+    assert r.json()["org_id"] == str(org.id) and r.json()["sources_reactivated"] == 1
+    session.expire_all()
+    assert session.scalar(select(func.count(Org.id))) == 1
+    org = session.get(Org, org.id)
+    assert org.github_installation_id == INSTALLATION_ID + 1 and org.active is True
+    assert org.plan == "pro" and org.settings["stripe_subscription_id"] == "sub_123"
+    assert session.get(Repo, repo.id).org_id == org.id and session.get(Repo, repo.id).active
+    assert session.get(Source, custom.id).active is True
+    assert session.get(Source, stdio.id).active is False  # never revived: not runnable
+    # the customer's existing SDK key keeps working
+    r = client.post(
+        "/v1/ingest",
+        json={"repo": REPO_FULL_NAME, "events": []},
+        headers=bearer(key),
+    )
+    assert r.status_code == 200, r.text
+
+    # a different account installing gets its own org
+    stranger = copy.deepcopy(created)
+    stranger["installation"]["id"] = 99
+    stranger["installation"]["account"] = {"login": "acme", "id": 1, "type": "Organization"}
+    stranger["repositories"] = []
+    r = post_webhook(client, "installation", stranger)
+    assert r.status_code == 200 and r.json()["org_id"] != str(org.id)
+
+
 def test_push_to_default_branch_debounces_and_reschedules(client, session, factory, settings):
     org = factory.org()
     repo = factory.repo(org)
@@ -259,6 +358,41 @@ def test_push_to_default_branch_debounces_and_reschedules(client, session, facto
     assert r.status_code == 200 and r.json()["reason"] == "push"
     session.expire_all()
     assert session.get(Repo, repo.id).default_branch == "trunk"
+
+
+def test_renamed_repo_follows_its_new_name(client, session, factory):
+    """api-correctness-8: GitHub renames reach the repo row (push payloads and the
+    repository event), so ingest and the settings page work under the new name."""
+    org = factory.org()
+    repo = factory.repo(org)
+    key = factory.sdk_key(org)
+    payload = load_payload("push")
+    payload["repository"]["full_name"] = "acme/support-bot"
+    payload["repository"]["name"] = "support-bot"
+    r = post_webhook(client, "push", payload)
+    assert r.status_code == 200, r.text
+    session.expire_all()
+    assert session.get(Repo, repo.id).full_name == "acme/support-bot"
+    r = client.post(
+        "/v1/ingest", json={"repo": "acme/support-bot", "events": []}, headers=bearer(key)
+    )
+    assert r.status_code == 200, r.text
+
+    event = {
+        "action": "renamed",
+        "changes": {"repository": {"name": {"from": "support-bot"}}},
+        "repository": {"id": REPO_GITHUB_ID, "full_name": "acme/agent", "private": False},
+        "installation": {"id": INSTALLATION_ID},
+        "sender": SENDER,
+    }
+    r = post_webhook(client, "repository", event)
+    assert r.status_code == 200 and r.json()["changed"] is True, r.text
+    session.expire_all()
+    row = session.get(Repo, repo.id)
+    assert row.full_name == "acme/agent" and row.private is False
+    stranger = {**event, "repository": {"id": 1, "full_name": "x/y"}}
+    assert post_webhook(client, "repository", stranger).json()["skipped"] == "repo not installed"
+    assert post_webhook(client, "repository", {**event, "action": "starred"}).status_code == 202
 
 
 def test_pull_request_closed_enqueues_pr_outcome_only_for_kintsua_branches(client, factory):
@@ -360,6 +494,28 @@ def test_issues_closed_by_a_human_dismisses_the_impact(client, session, factory)
     post_webhook(client, "issues", done)
     session.expire_all()
     assert session.get(Impact, merged.id).status == "merged"
+
+
+def test_issue_closed_by_merging_the_fix_pr_leaves_the_outcome_to_the_pr(client, session, factory):
+    """api-correctness-7: merging Kintsua's PR ("Closes #N") closes the issue as completed;
+    that must not dismiss the impact before the pull_request event records the merge."""
+    org = factory.org()
+    repo = factory.repo(org)
+    impact, _, _ = factory.breaking_impact(
+        repo, status="pr_open", github_issue_number=7, github_pr_number=12
+    )
+    payload = load_payload("issues_closed")
+    payload["issue"]["state_reason"] = "completed"
+    r = post_webhook(client, "issues", payload)
+    assert r.status_code == 200 and r.json()["skipped"] == "fix PR is open", r.text
+    session.expire_all()
+    row = session.get(Impact, impact.id)
+    assert row.status == "pr_open" and row.fix_reason is None and row.resolved_at is None
+
+    # closing it as "not planned" is a human dismissing the change
+    payload["issue"]["state_reason"] = "not_planned"
+    r = post_webhook(client, "issues", payload)
+    assert r.status_code == 200 and r.json()["status"] == "dismissed"
 
 
 def test_check_run_completed_calls_record_ci_result(client, factory, monkeypatch):

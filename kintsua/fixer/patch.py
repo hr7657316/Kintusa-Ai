@@ -157,12 +157,36 @@ def _strip_prefix(p: str) -> str | None:
 
 def parse_unified_diff(text: str) -> list[FilePatch]:
     """Parse a (git) unified diff into ``FilePatch`` objects. Tolerant of ``diff --git``
-    headers, ``index`` lines, mode lines, binary notices and renames."""
+    headers, ``index`` lines, mode lines, binary notices and renames.
+
+    The open hunk's remaining old/new line counts (from its ``@@`` header) decide what is
+    hunk body: while lines remain, a removed line whose content starts with ``-- `` (shown
+    as ``--- ...``) or an added one starting with ``++ `` (``+++ ...``) is body, never a
+    file header."""
     patches: list[FilePatch] = []
     cur: FilePatch | None = None
     hunk: Hunk | None = None
+    old_left = new_left = 0  # lines the open hunk still expects
     for raw in text.splitlines():
         line = raw.rstrip("\r")
+        if hunk is not None and (old_left > 0 or new_left > 0):
+            tag = line[:1]
+            if tag == "\\":
+                continue  # "\ No newline at end of file"
+            if tag in (" ", "") and old_left > 0 and new_left > 0:
+                hunk.lines.append(line if tag else " ")
+                old_left -= 1
+                new_left -= 1
+                continue
+            if tag == "-" and old_left > 0:
+                hunk.lines.append(line)
+                old_left -= 1
+                continue
+            if tag == "+" and new_left > 0:
+                hunk.lines.append(line)
+                new_left -= 1
+                continue
+            old_left = new_left = 0  # the counts were wrong: fall back to header parsing
         m = _DIFF_GIT_RE.match(line)
         if m:
             cur = FilePatch(path=m.group(2), old_path=m.group(1), new_path=m.group(2))
@@ -221,11 +245,12 @@ def parse_unified_diff(text: str) -> list[FilePatch]:
                 new_count=int(hm.group(4) or "1"),
             )
             cur.hunks.append(hunk)
+            old_left, new_left = hunk.old_count, hunk.new_count
             continue
         if hunk is not None and line[:1] in (" ", "+", "-", "\\"):
             if line.startswith("\\"):
                 continue  # "\ No newline at end of file"
-            hunk.lines.append(line)
+            hunk.lines.append(line)  # past the header's counts (hand-written diffs)
             continue
         if hunk is not None and line == "":
             hunk.lines.append(" ")

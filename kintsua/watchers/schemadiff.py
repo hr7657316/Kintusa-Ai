@@ -18,6 +18,11 @@ one ``ChangeOp`` per atomic change, with JSON-pointer paths under ``base_pointer
 passes one per side, backed by that document's ``components``); resolution is cycle-safe
 (a ref pair already on the current path stops the walk) and bounded by ``max_ref_depth``.
 
+``residual_schema_ops(before, after, base_pointer)`` covers what the walk does not model
+(``default``, ``readOnly``, ``examples`` ...): nothing when the schemas are equivalent up to
+the order of ``required`` / ``enum`` / ``type`` lists (``schemas_equivalent``), else
+``text_changed`` ops, never a breaking op.
+
 Pure Python, pydantic only, so the open-source CLI can use it.
 """
 
@@ -26,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from kintsua.core.events import ChangeOp, json_pointer_escape
+from kintsua.core.events import ChangeOp, canonical_json, json_pointer_escape
 
 Resolver = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -318,6 +323,65 @@ def _walk_list(
             ctx.ops.append(ChangeOp(op="removed", path=p, before=b[i], after=None))
         else:
             _walk(b[i], a[i], p, ctx, stack, depth + 1)
+
+
+ORDER_FREE_KEYS = ("required", "enum", "type")
+RESIDUAL_MAX_OPS = 20
+
+
+def _canonical_schema(node: Any) -> Any:
+    """The schema with ``required`` / ``enum`` / ``type`` lists sorted (their order carries
+    no meaning), recursively."""
+    if isinstance(node, dict):
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            if k in ORDER_FREE_KEYS and isinstance(v, list):
+                out[k] = sorted((_canonical_schema(x) for x in v), key=canonical_json)
+            else:
+                out[k] = _canonical_schema(v)
+        return out
+    if isinstance(node, list):
+        return [_canonical_schema(v) for v in node]
+    return node
+
+
+def schemas_equivalent(before: Any, after: Any) -> bool:
+    """Equal up to the order of ``required`` / ``enum`` / ``type`` lists."""
+    return _canonical_schema(before or {}) == _canonical_schema(after or {})
+
+
+def residual_schema_ops(before: Any, after: Any, base_pointer: str) -> list[ChangeOp]:
+    """Ops for two schemas that differ although ``diff_json_schema`` found nothing (a changed
+    ``default``, ``readOnly``, ``examples``, a reordered ``required`` list ...).
+
+    Equivalent schemas yield nothing. Otherwise every difference becomes a ``text_changed``
+    op at its own pointer (one op at ``base_pointer`` when there are many): never a breaking
+    op, so the classifier routes it to the model instead of calling it a type change."""
+    from kintsua.watchers.base import generic_json_diff
+
+    b, a = _canonical_schema(before or {}), _canonical_schema(after or {})
+    if b == a:
+        return []
+    ptr = base_pointer.rstrip("/")
+    ops = generic_json_diff(b, a)
+    if not ops or len(ops) > RESIDUAL_MAX_OPS:
+        return [
+            ChangeOp(
+                op="text_changed",
+                path=ptr or "/",
+                before=schema_summary(before),
+                after=schema_summary(after),
+            )
+        ]
+    return [
+        ChangeOp(
+            op="text_changed",
+            path=(ptr + op.path) if op.path != "/" else (ptr or "/"),
+            before=op.before,
+            after=op.after,
+        )
+        for op in ops
+    ]
 
 
 def schema_summary(schema: Any) -> dict[str, Any]:

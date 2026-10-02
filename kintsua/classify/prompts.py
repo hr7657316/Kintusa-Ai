@@ -19,6 +19,7 @@ MAX_OPS_BYTES = 60_000
 MAX_VALUE_CHARS = 600
 MAX_TEXT_CHARS = 40_000
 MAX_CONSUMER_OPS = 100
+MAX_VERSION_CHARS = 100
 
 SYSTEM_PROMPT = """You are the change classifier inside Kintsua, a service that watches the external APIs, MCP servers, SDK packages and changelogs that AI-agent codebases depend on, and opens a GitHub issue (and sometimes a fix PR) when something upstream breaks existing code.
 
@@ -60,6 +61,15 @@ def _truncate(s: str, limit: int) -> str:
 def _neutralise_tags(s: str) -> str:
     """Stop fetched text from closing or opening our data tags."""
     return re.sub(r"(?i)</?\s*(vendor_data|rules_result|consumer_operations|event)\b", "<x-", s)
+
+
+def _version(v: Any) -> str:
+    """Versions come from vendor data (OpenAPI ``info.version``, MCP ``serverInfo.version``):
+    one line, bounded, and unable to close or open our tags."""
+    if v is None or v == "":
+        return "unknown"
+    flat = " ".join(str(v).split())
+    return _neutralise_tags(_truncate(flat, MAX_VERSION_CHARS)) or "unknown"
 
 
 def _value(v: Any) -> str:
@@ -104,8 +114,8 @@ def build_user_message(
     parts.append(f"source_kind: {event.source_kind}")
     if display_name:
         parts.append(f"display_name: {_neutralise_tags(_truncate(display_name, 200))}")
-    parts.append(f"from_version: {event.from_version or 'unknown'}")
-    parts.append(f"to_version: {event.to_version or 'unknown'}")
+    parts.append(f"from_version: {_version(event.from_version)}")
+    parts.append(f"to_version: {_version(event.to_version)}")
     shown = len(event.ops) - dropped
     if dropped:
         parts.append(f"op_count: {len(event.ops)} (showing {shown}; {dropped} dropped for size)")

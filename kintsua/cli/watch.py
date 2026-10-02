@@ -2,8 +2,9 @@
 
 The open-source core: the MCP / OpenAPI watchers, the rules classifier and the Markdown
 report, wired to a lockfile directory (``.kintsua/``). Exit codes: 0 nothing at or above
-``--fail-on``, 1 the gate fired, 2 usage error or missing lockfile, 3 the source could not be
-fetched (connection refused, authentication required, bad spec).
+``--fail-on``, 1 the gate fired, 2 usage error or an unreadable / foreign lockfile, 3 the source
+could not be fetched (connection refused, authentication required, bad spec), 4 no lockfile yet
+(``diff`` before the first ``snapshot``; the GitHub Action snapshots on exactly this code).
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from kintsua.report.markdown import (
 from kintsua.watchers.base import (
     BaseWatcher,
     FileSnapshotStore,
+    SnapshotRecord,
     SourceRef,
     compare,
     get_watcher,
@@ -51,7 +53,7 @@ from kintsua.watchers.base import (
 HOSTED = "https://github.com/apps/kintsua"
 DEFAULT_URL = "https://api.kintsua.dev"
 TAGLINE = f"get issues and fix PRs at {HOSTED}"
-EXIT_GATE, EXIT_USAGE, EXIT_FETCH = 1, 2, 3
+EXIT_GATE, EXIT_USAGE, EXIT_FETCH, EXIT_NO_LOCKFILE = 1, 2, 3, 4
 MAX_ROWS = 200
 SEV_STYLE = {"breaking": "bold red", "degraded": "yellow", "safe": "green", "unknown": "dim"}
 SEV_MARK = {"breaking": "🔴", "degraded": "🟠", "safe": "🟢", "unknown": "⚪"}
@@ -210,6 +212,16 @@ def resolve_target(
         fail("pass exactly one of --server URL|CMD or --spec URL", EXIT_USAGE)
     meta: dict[str, Any] = {"headers": _kv(headers, "--header"), "timeout_s": timeout}
     if spec:
+        if auth_env:  # the OpenAPI fetch honours headers only: send the token as one
+            if not os.environ.get(auth_env):
+                fail(
+                    f"environment variable {auth_env} is not set (required to authenticate "
+                    f"with {spec})",
+                    EXIT_FETCH,
+                )
+            hdrs = {k: v for k, v in meta["headers"].items() if k.lower() != "authorization"}
+            # ``${VAR}`` is expanded at fetch time, so the token never sits in meta
+            meta["headers"] = {**hdrs, "Authorization": f"Bearer ${{{auth_env}}}"}
         src = SourceRef.stable("openapi", spec, display_name=_host(spec), meta=meta)
     else:
         meta.update(quiet=True, env=_kv(env, "--env"))
@@ -288,6 +300,49 @@ def fingerprints_of(doc: CanonicalDoc, kind: str) -> dict[str, str]:
     return out
 
 
+def read_lockfile(path: Path) -> dict[str, Any] | None:
+    """The lockfile's JSON object, or None when it is missing or not a JSON object."""
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def foreign_owner(t: Target, path: Path) -> str | None:
+    """``"<kind> <locator>"`` when ``path`` is another source's lockfile (same name)."""
+    data = read_lockfile(path)
+    sid = (data or {}).get("source_id")
+    if not sid or str(sid) == str(t.source.id):
+        return None
+    return f"{data.get('kind') or '?'} {data.get('locator') or '?'}"
+
+
+def load_previous(store: FileSnapshotStore, t: Target, lock_path: Path) -> SnapshotRecord | None:
+    """The lockfile ``diff`` compares against. A lockfile written for another source (two
+    servers on one host, or a ``--name`` reused) or a damaged one (merge conflict markers) is a
+    usage error (exit 2), never a bogus diff or a traceback with the gate's exit code."""
+    owner = foreign_owner(t, lock_path)
+    if owner:
+        fail(
+            f"{_rel(lock_path)} was written for {owner}, not {t.source.kind} "
+            f"{t.source.locator}; pass a different --name to keep a separate lockfile",
+            EXIT_USAGE,
+        )
+    try:
+        prev = store.latest(t.source.id, name=t.name)
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as e:  # JSONDecodeError too
+        fail(
+            f"{_rel(lock_path)} is not a valid kintsua lockfile ({type(e).__name__}: {e}); "
+            "fix or delete it, then re-run kintsua watch snapshot",
+            EXIT_USAGE,
+        )
+        return None
+    if prev is not None and str(prev.source_id) != str(t.source.id):
+        fail(f"{_rel(lock_path)} belongs to another source; pass --name", EXIT_USAGE)
+    return prev
+
+
 def write_lockfile(store: FileSnapshotStore, t: Target, doc: CanonicalDoc) -> Path:
     """``<dir>/<name>.lock.json``: the canonical body plus a top-level ``fingerprints`` map."""
     store.save(t.source, doc, t.name)
@@ -321,7 +376,11 @@ def push_snapshot(
     except httpx.HTTPError as e:
         warn(f"push to {endpoint} failed: {_describe(e)}")
         return False
-    if r.status_code >= 400:
+    if 300 <= r.status_code < 400:  # not followed: the key must not travel to another host
+        where = r.headers.get("location") or "?"
+        warn(f"push to {endpoint} failed: HTTP {r.status_code} redirect to {where}; fix --url")
+        return False
+    if not 200 <= r.status_code < 300:
         warn(f"push to {endpoint} failed: HTTP {r.status_code}: {r.text[:200]}")
         return False
     try:
@@ -486,6 +545,10 @@ def snapshot(
     store = FileSnapshotStore(dir)
     doc = fetch_doc(t, store)
     _refine_display(t, doc)
+    target = store.path_for(t.source, t.name)
+    owner = foreign_owner(t, target)
+    if owner:  # only with an explicit --name: the default name never takes another's lockfile
+        warn(f"overwriting {_rel(target)}, written for {owner}")
     path = write_lockfile(store, t, doc)
     n = len(fingerprints_of(doc, t.source.kind))
     info(f"kintsua watch: {n} {t.unit} snapshotted -> {_rel(path)} · {TAGLINE}")
@@ -524,13 +587,14 @@ def diff(
     t = resolve_target(server, spec, header, env, auth_env, name, timeout)
     store = FileSnapshotStore(dir)
     lock_path = store.path_for(t.source, t.name)
-    prev = store.latest(t.source.id, name=t.name)
+    prev = load_previous(store, t, lock_path)
     if prev is None:
         what = f"--spec {spec}" if spec else f"--server {server!r}"
         fail(
             f"no lockfile at {_rel(lock_path)}; run: kintsua watch snapshot {what} --dir {dir}",
-            EXIT_USAGE,
+            EXIT_NO_LOCKFILE,
         )
+        return
     doc = fetch_doc(t, store)
     _refine_display(t, doc)
     event_text = getattr(t.watcher, "event_text", lambda b, a: None)
@@ -608,6 +672,32 @@ def _parse_dt(value: Any) -> datetime | None:
     return d if d.tzinfo else d.replace(tzinfo=UTC)
 
 
+def read_history(store: FileSnapshotStore) -> list[dict[str, Any]]:
+    """``history.jsonl`` rows; a damaged line (merge conflict markers, a truncated write) is
+    skipped with a warning instead of failing the whole report."""
+    path = store.dir / "history.jsonl"
+    try:
+        lines = path.read_text("utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        fail(f"cannot read {_rel(path)}: {e}", EXIT_USAGE)
+        return []
+    rows: list[dict[str, Any]] = []
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if isinstance(row, dict):
+            rows.append(row)
+        else:
+            warn(f"{_rel(path)} line {n} is not a JSON object; skipped")
+    return rows
+
+
 def build_report(
     store: FileSnapshotStore, window: timedelta, now: datetime | None = None
 ) -> WeeklyReport:
@@ -619,7 +709,7 @@ def build_report(
     failing: dict[str, FailingSource] = {}
     all_locators: set[str] = set()
     seen: set[str] = set()
-    rows = sorted(store.history(), key=lambda r: _parse_dt(r.get("detected_at")) or until)
+    rows = sorted(read_history(store), key=lambda r: _parse_dt(r.get("detected_at")) or until)
     for row in rows:
         locator = str(row.get("locator") or row.get("source_id") or "?")
         all_locators.add(locator)

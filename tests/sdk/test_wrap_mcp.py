@@ -19,7 +19,7 @@ from mcp.types import (
 )
 
 from kintsua.sdk import wrap_mcp
-from kintsua.sdk.wrap import fingerprint, schema_diff, tools_of
+from kintsua.sdk.wrap import fingerprint, schema_diff, server_id, tools_of
 from kintsua.watchers.mcp import tool_fingerprint
 
 SCHEMA_V1 = {
@@ -118,6 +118,40 @@ async def test_server_name_comes_from_initialize_when_no_locator_is_known(report
     await s.initialize()
     await s.list_tools()
     assert "mcp:weather-mcp::get_weather" in json.loads(state_files(tmp_path)[0].read_text())
+
+
+async def test_the_server_locator_never_carries_credentials(reporter, tmp_path):
+    url = "https://user:pw@mcp.example.com/mcp?api_key=s3cret#frag"
+    await wrap_mcp(FakeSession(SCHEMA_V1), server=url).list_tools()
+    session = FakeSession(SCHEMA_V2)
+    session.url = url  # a session that knows its own URL
+    await wrap_mcp(session).list_tools()
+    (ev,) = events(reporter)
+    assert ev["sample"]["server"] == SERVER  # what sample.server carries to the hosted side
+    text = state_files(tmp_path)[0].read_text()
+    assert "s3cret" not in text and "pw@" not in text and "frag" not in text
+    assert f"{SERVER}::get_weather" in json.loads(text)
+
+
+async def test_sessions_of_one_server_share_its_fingerprints(reporter):
+    await wrap_mcp(FakeSession(SCHEMA_V1), server=SERVER).list_tools()
+    await wrap_mcp(FakeSession(SCHEMA_V1), server=SERVER).call_tool("get_weather", {})  # per call
+    await wrap_mcp(FakeSession(SCHEMA_V1), server="https://other.test/mcp").call_tool("search")
+    first, other = events(reporter)
+    assert first["schema_fingerprint"] == tool_fingerprint(SCHEMA_V1)
+    assert other["schema_fingerprint"] is None  # another server's cache is not consulted
+
+
+def test_server_id_forms():
+    assert server_id({"url": "https://h.test/mcp/?k=v"}) == "https://h.test/mcp/"
+    assert server_id({"url": "wss://u:p@h.test:8443/ws#x"}) == "wss://h.test:8443/ws"
+    assert server_id(type("P", (), {"url": None, "command": "npx", "args": ["-y", "a b"]})()) == (
+        "npx -y 'a b'"
+    )
+    line = server_id({"command": "uvx", "args": ["srv", "--api-key=abcdef123456"]})
+    assert line.startswith("uvx srv ") and "abcdef123456" not in line
+    assert server_id(None, "mcp:weather") == "mcp:weather" and server_id({}) == ""
+    assert server_id({"url": "http://[::1"}).startswith("http://")  # malformed: never raises
 
 
 async def test_call_tool_outcomes_and_sampling(reporter):

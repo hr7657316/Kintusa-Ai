@@ -6,13 +6,22 @@ the runtime SDK never import this module; only the hosted service does.
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+log = logging.getLogger(__name__)
+
+# Placeholder session secrets shipped in this repo (config default, docker-compose,
+# .env.example). Any of them in prod means anyone can forge a session cookie.
+DEFAULT_SESSION_SECRET = "dev-session-secret-change-me"
+KNOWN_PLACEHOLDER_SECRETS = frozenset({DEFAULT_SESSION_SECRET, "change-me", "changeme", "secret"})
+MIN_PROD_SESSION_SECRET_LEN = 32
 
 
 class Settings(BaseSettings):
@@ -39,7 +48,9 @@ class Settings(BaseSettings):
     github_write_concurrency: int = 2  # per-org concurrent writes (secondary rate limits)
 
     # --- web sessions ------------------------------------------------------------
-    session_secret: str = "dev-session-secret-change-me"
+    # signs the session cookie, the only thing that scopes a browser session to its
+    # installations; in prod it must be set to a random value of 32+ characters
+    session_secret: str = DEFAULT_SESSION_SECRET
     session_max_age_s: int = 60 * 60 * 24 * 14
 
     # --- LLM ---------------------------------------------------------------------
@@ -59,6 +70,10 @@ class Settings(BaseSettings):
     s3_region: str | None = None
     s3_access_key_id: str | None = None
     s3_secret_access_key: str | None = None
+    # Without S3_BUCKET, large documents go to files under DATA_DIR, which only the
+    # machine that wrote them can read. Prod refuses that unless every process shares
+    # DATA_DIR (one machine, or one shared volume): set DATA_DIR_SHARED=true then.
+    data_dir_shared: bool = False
 
     # --- watchers ----------------------------------------------------------------
     tick_interval_s: int = 15 * 60
@@ -110,6 +125,34 @@ class Settings(BaseSettings):
 
     # --- SDK ingest --------------------------------------------------------------
     ingest_max_batch: int = 500
+
+    # --- job queue / worker --------------------------------------------------------
+    # a 'running' job whose locked_at is older than this is treated as orphaned by a dead
+    # worker and handed out again; running jobs heartbeat locked_at, so the lease only
+    # needs to outlast a heartbeat gap, not the longest job
+    job_lease_s: int = 15 * 60
+    # after SIGTERM/SIGINT the worker lets the running job finish for this long, then
+    # aborts it (the job goes straight back to the queue and its sandbox is removed);
+    # keep it below the platform's kill timeout. 0 = wait for the job, however long
+    worker_shutdown_grace_s: float = 3.0
+
+    @model_validator(mode="after")
+    def _refuse_unsafe_prod_config(self) -> Settings:
+        secret = self.session_secret or ""
+        weak = (
+            secret in KNOWN_PLACEHOLDER_SECRETS
+            or "change-me" in secret
+            or len(secret) < MIN_PROD_SESSION_SECRET_LEN
+        )
+        if self.env == "prod" and weak:
+            raise ValueError(
+                "SESSION_SECRET must be set to a random value of at least "
+                f"{MIN_PROD_SESSION_SECRET_LEN} characters in prod (the default would let "
+                "anyone forge a session cookie)"
+            )
+        if self.env == "dev" and secret == DEFAULT_SESSION_SECRET:
+            log.warning("SESSION_SECRET is the built-in default; fine for local dev only")
+        return self
 
     @property
     def github_private_key_pem(self) -> str | None:

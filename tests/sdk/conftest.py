@@ -1,5 +1,6 @@
 """SDK test fixtures: an isolated fingerprint state dir, no SDK env vars, and a fresh reporter
-registry per test (threads are stopped and queues drained so nothing is posted at exit)."""
+registry and fingerprint cache per test (threads are stopped and queues drained so nothing is
+posted at exit)."""
 
 from __future__ import annotations
 
@@ -11,10 +12,11 @@ def sdk_env(tmp_path, monkeypatch):
     monkeypatch.setenv("KINTSUA_STATE_DIR", str(tmp_path / "state"))
     for k in ("KINTSUA_KEY", "KINTSUA_REPO", "KINTSUA_URL"):
         monkeypatch.delenv(k, raising=False)
-    from kintsua.sdk import report
+    from kintsua.sdk import report, wrap
 
     report._default = None
     report._pool.clear()
+    wrap._CACHES.clear()
     yield
     for r in (report._default, *report._pool.values()):
         if r is not None:

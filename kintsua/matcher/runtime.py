@@ -5,19 +5,34 @@ the repo's ``runtime_event`` rows of the last ``Settings.runtime_promotion_windo
 and does three idempotent things, so running it twice on the same events changes nothing:
 
 (a) **Discovery.** Every tool or host the indexer never saw gets a ``dependency`` (kind
-    ``mcp``, named after the server locator the sample carries or else the tool name; kind
+    ``mcp``, named after the server the sample carries or else the tool name; kind
     ``http`` named after the host for ``"GET api.stripe.com/v1/charges"`` tool names) and a
     ``call_site`` (``file_path="<runtime>"``, ``line=0``, ``symbol=tool_name``, normalised
-    operation) flagged ``discovered_at_runtime``.
+    operation) flagged ``discovered_at_runtime``. "Never saw" is judged per dependency: an
+    HTTP call counts as known only through a call site of a dependency for the same host
+    (or an SDK package of the vendor that owns the host), an MCP tool only through a call
+    site of an ``mcp`` dependency (of the same server when the sample names one).
 (b) **Promotion.** A tool with at least ``runtime_promotion_threshold`` ``schema_mismatch``
-    events in the window and no change event in the window for any source this repo's
-    dependencies for the tool point to gets a synthetic change event (source kind
+    events in the window and no documented change event in the window for any source this
+    repo's dependencies for the tool point to gets a synthetic change event (source kind
     ``observed``, severity ``breaking``, category ``behaviour``, rule ``runtime_promotion``)
-    and an impact, then ``open_issue`` under the usual auto-issue gate. The same
-    ``(source, to_version)`` pair is never promoted twice.
-(c) **Error spikes.** Open impacts (issued / fixing / pr_open) whose matched operations
-    include the tool get ``runtime_error_count`` = failed calls in the last hour and one
-    issue comment (``<!-- kintsua:runtime -->``) that is created once and edited after.
+    and an impact, then ``open_issue`` under the usual auto-issue gate. ``.kintsua.yml``
+    mutes apply as in ``match.py``. The same ``(source, to_version)`` pair is never promoted
+    twice.
+(c) **Error spikes.** Open impacts (issued / fixing / pr_open) whose matched call sites
+    cover the failing operation on the same host / server get ``runtime_error_count`` =
+    failed calls in the last hour and one issue comment (``<!-- kintsua:runtime -->``) that
+    is created once and edited after.
+
+Trust (docs/CONTRACTS.md, "Source trust"): runtime samples are customer data. Discovery
+creates a ``source`` only for an http(s) server URL that passes
+``netguard.check_url(url, resolve=False)`` (no localhost, private, link-local or metadata
+host literals, no credentials), with ``origin="runtime"``; a command line, an SDK label
+such as ``mcp:<serverInfo.name>`` or a blocked URL is recorded on the dependency and never
+becomes a source. HTTP hosts map to the curated ``sdk_map`` sources (``origin="seed"``) or
+to a source this org (or the seed) already uses for the host. Promoted events always hang
+off the repo's own inactive ``observed:<repo>:<tool>`` source (``origin="observed"``), so
+they are private to the repo and never shared between tenants.
 """
 
 from __future__ import annotations
@@ -29,10 +44,11 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -49,15 +65,23 @@ from kintsua.core.models import (
     RuntimeEvent,
     Source,
 )
+from kintsua.core.netguard import check_url, is_http_locator
 from kintsua.core.queue import JOB_MATCH_RUNTIME, NonRetryable, job_handler
-from kintsua.core.util import utcnow
+from kintsua.core.util import short_hash, utcnow
 from kintsua.matcher.issues import (
     RUNTIME_COMMENT_MARKER,
     RUNTIME_FILE_PATH,
     plain,
     upsert_impact_comment,
 )
-from kintsua.matcher.match import after_match, ensure_impact, site_record
+from kintsua.matcher.match import (
+    PACKAGE_KINDS,
+    after_match,
+    dependency_vendor,
+    ensure_impact,
+    site_record,
+)
+from kintsua.matcher.mute import clean_patterns, is_muted
 from kintsua.matcher.operations import (
     HTTP_METHODS,
     normalize_operation,
@@ -70,6 +94,12 @@ RULE_RUNTIME_PROMOTION = "runtime_promotion"
 ERROR_SPIKE_WINDOW_S = 3600
 MAX_EVENTS_PER_RUN = 50_000
 OPEN_ISSUE_STATUSES: tuple[str, ...] = ("issued", "fixing", "pr_open")
+RUNTIME_ORIGIN = "runtime"  # sources discovered from runtime samples (http(s) only)
+OBSERVED_ORIGIN = "observed"  # the synthetic per-repo source of promoted events
+SEED_ORIGIN = "seed"  # curated sdk_map spec / changelog URLs
+MAX_DEPENDENCY_NAME = 512  # Dependency.name is varchar(512)
+MAX_SERVER_URL = 2048  # a longer runtime server URL is recorded, never watched
+_SERVER_LABEL_PREFIXES = ("mcp:", "langchain:")  # SDK labels for servers without a URL
 _HTTP_TOOL_RE = re.compile(r"^([A-Za-z]+)\s+(\S+)$")
 _FINGERPRINT_KEYS = (
     "previous_fingerprint",
@@ -177,9 +207,104 @@ def _repo_sites(session: Session, repo: Repo) -> list[tuple[CallSite, Dependency
     return [(cs, dep) for cs, dep in rows]
 
 
-def _covered(operation: str, sites: Iterable[tuple[CallSite, Dependency]]) -> bool:
+# ---- which dependency a runtime event belongs to ---------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeScope:
+    """Where a runtime call went: ``kind`` ``http`` with the ``host`` of the tool name, or
+    ``mcp`` with the ``server`` the sample names (a URL, an SDK label, or None)."""
+
+    kind: str
+    host: str | None = None
+    server: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.kind, self.host or server_key(self.server))
+
+
+def event_scope(event: RuntimeEvent) -> RuntimeScope:
+    kind = runtime_kind(event)
+    if kind == "http":
+        return RuntimeScope("http", host=http_host(event.tool_name or ""))
+    return RuntimeScope("mcp", server=sample_server(event))
+
+
+def server_key(value: str | None) -> str:
+    """Comparable identity of an MCP server: an http(s) URL with scheme and host lowercased
+    and no trailing slash, or a label without its SDK prefix (``mcp:weather`` ->
+    ``weather``), lowercased."""
+    v = (value or "").strip()
+    if is_http_locator(v):
+        scheme, _, rest = v.rstrip("/").partition("://")
+        host, sep, path = rest.partition("/")
+        return f"{scheme.lower()}://{host.lower()}{sep}{path}"
+    low = v.lower()
+    for prefix in _SERVER_LABEL_PREFIXES:
+        if low.startswith(prefix):
+            return low[len(prefix) :].strip()
+    return low
+
+
+def _dep_server_keys(dep: Dependency) -> set[str]:
+    meta = dep.meta or {}
+    values = (dep.name, meta.get("server_name"), meta.get("pushed_locator"), meta.get("server"))
+    return {server_key(v) for v in values if isinstance(v, str) and v.strip()}
+
+
+@lru_cache(maxsize=4096)
+def _host_vendor(host: str) -> str | None:
+    """The curated vendor slug owning ``host`` (cached: called per call site per event)."""
+    try:
+        from kintsua.indexer import sdk_map  # optional seam: pure data, no DB
+    except ImportError:  # pragma: no cover - components missing in a partial checkout
+        return None
+    entry = sdk_map.vendor_for_host(host)
+    return entry.vendor if entry is not None else None
+
+
+def _dep_serves_host(dep: Dependency, host: str | None) -> bool:
+    """Does ``dep`` stand for calls to ``host``: an ``http`` dependency on that host, a
+    configured spec / changelog that lists it, or an SDK package of the vendor owning it."""
+    if not host:
+        return False
+    meta = dep.meta or {}
+    if dep.kind == "http":
+        return (dep.name or "").lower() == host or str(meta.get("host") or "").lower() == host
+    if dep.kind in ("openapi", "changelog"):
+        hosts = meta.get("hosts")
+        return isinstance(hosts, list) and host in {str(h).lower() for h in hosts}
+    if dep.kind in PACKAGE_KINDS:
+        vendor = _host_vendor(host)
+        return vendor is not None and dependency_vendor(dep, None) == vendor
+    return False
+
+
+def scoped_pairs(pairs: Iterable[tuple[Any, Dependency]], scope: RuntimeScope) -> list[Any]:
+    """The ``(site, dependency)`` pairs a runtime event of ``scope`` may refer to: for HTTP
+    the dependencies serving its host; for MCP the ``mcp`` dependencies, narrowed to the
+    sample's server when one of them is that server. A server URL that no dependency has
+    matches nothing (it is a server the indexer never saw); an SDK label that no dependency
+    carries (``mcp:<serverInfo.name>`` vs a config entry name) falls back to every ``mcp``
+    dependency, matched by tool name."""
+    if scope.kind == "http":
+        return [(s, dep) for s, dep in pairs if _dep_serves_host(dep, scope.host)]
+    mcp = [(s, dep) for s, dep in pairs if dep.kind == "mcp"]
+    if not scope.server:
+        return mcp
+    key = server_key(scope.server)
+    same = [(s, dep) for s, dep in mcp if key in _dep_server_keys(dep)]
+    if same or is_http_locator(scope.server):
+        return same
+    return mcp
+
+
+def _covered(
+    operation: str, sites: Iterable[tuple[CallSite, Dependency]], scope: RuntimeScope
+) -> bool:
     canonical = normalize_operation(operation)
-    for cs, _dep in sites:
+    for cs, _dep in scoped_pairs(sites, scope):
         if normalize_operation(cs.operation) == canonical or operations_match(
             cs.operation, operation
         ):
@@ -187,10 +312,48 @@ def _covered(operation: str, sites: Iterable[tuple[CallSite, Dependency]]) -> bo
     return False
 
 
-def _source_for_host(session: Session, host: str) -> tuple[Source | None, str | None, str | None]:
+# ---- sources and rows ------------------------------------------------------------------
+
+
+def watchable_server_url(server: str | None) -> str | None:
+    """``server`` when the hosted watcher may watch it: an http(s) URL of at most
+    ``MAX_SERVER_URL`` characters that passes ``netguard.check_url(..., resolve=False)``
+    (public host literal, no credentials). None for everything else: command lines, SDK
+    labels, ``localhost`` / private / link-local / metadata addresses."""
+    s = (server or "").strip()
+    if not s or len(s) > MAX_SERVER_URL or not is_http_locator(s):
+        return None
+    if any(ch.isspace() for ch in s):
+        return None
+    try:
+        check_url(s, resolve=False)
+    except ValueError:  # BlockedURL, or a URL urlsplit cannot parse
+        return None
+    return s
+
+
+def _unwatched_reason(server: str) -> str:
+    if not is_http_locator(server):
+        return "not an http(s) URL; runtime data never becomes a command the worker runs"
+    return "not a public http(s) URL"
+
+
+def dependency_name(name: str) -> str:
+    """``dependency.name`` for a runtime name: as is, or cut with a hash suffix when it does
+    not fit the column (tool names and server URLs from the SDK can be long)."""
+    if len(name) <= MAX_DEPENDENCY_NAME:
+        return name
+    suffix = "#" + short_hash(name, 16)
+    return name[: MAX_DEPENDENCY_NAME - len(suffix)] + suffix
+
+
+def _source_for_host(
+    session: Session, repo: Repo, host: str
+) -> tuple[Source | None, str | None, str | None]:
     """``(source, vendor, display_name)`` for a runtime-discovered HTTP host: the curated SDK
-    map when it is importable (the vendor's spec, else its changelog), otherwise the source
-    another repo's dependency on the same host already has."""
+    map when it is importable (the vendor's spec, else its changelog; ``origin="seed"``),
+    otherwise a source a dependency on the same host already has, if it is seeded or used
+    by this org (never another org's private or pushed source)."""
     vendor: str | None = None
     display: str | None = None
     try:
@@ -213,6 +376,7 @@ def _source_for_host(session: Session, host: str) -> tuple[Source | None, str | 
                 display_name=f"{spec.display_name} API",
                 vendor=spec.vendor,
                 meta=meta,
+                origin=SEED_ORIGIN,
             )
             return src, vendor, display
         if entry is not None and entry.changelog_url:
@@ -222,34 +386,40 @@ def _source_for_host(session: Session, host: str) -> tuple[Source | None, str | 
                 entry.changelog_url,
                 display_name=f"{entry.display_name} changelog",
                 vendor=entry.vendor,
+                origin=SEED_ORIGIN,
             )
             return src, vendor, display
-    other = session.scalar(
-        select(Dependency)
+    found = session.execute(
+        select(Dependency, Source)
+        .join(Source, Source.id == Dependency.source_id)
+        .join(Repo, Repo.id == Dependency.repo_id)
         .where(
-            Dependency.kind == "http", Dependency.name == host, Dependency.source_id.is_not(None)
+            Dependency.kind == "http",
+            Dependency.name == host,
+            Source.origin.not_in(("push", OBSERVED_ORIGIN)),
+            or_(Source.origin == SEED_ORIGIN, Repo.org_id == repo.org_id),
         )
+        .order_by(Dependency.created_at)
         .limit(1)
-    )
-    if other is not None:
-        return (
-            session.get(Source, other.source_id),
-            vendor or (other.meta or {}).get("vendor"),
-            display,
-        )
+    ).first()
+    if found is not None:
+        other, src = found
+        return src, vendor or (other.meta or {}).get("vendor"), display
     return None, vendor, display
 
 
-def _source_for_server(session: Session, locator: str) -> Source | None:
+def _source_for_server(session: Session, url: str) -> Source | None:
+    """The ``mcp`` source for a runtime server URL that ``watchable_server_url`` accepted:
+    created with ``origin="runtime"`` (an existing row, e.g. a seeded one, keeps its
+    origin). Never called with anything but an http(s) URL."""
     try:
         from kintsua.watchers.run import find_or_create_source
     except ImportError:  # pragma: no cover
-        return session.scalar(select(Source).where(Source.kind == "mcp", Source.locator == locator))
-    transport = "http" if locator.startswith(("http://", "https://")) else "stdio"
-    meta: dict[str, Any] = {"transport": transport, "discovered_at_runtime": True}
-    if transport == "stdio":
-        meta["quiet"] = True
-    return find_or_create_source(session, "mcp", locator, display_name=locator, meta=meta)
+        return session.scalar(select(Source).where(Source.kind == "mcp", Source.locator == url))
+    meta: dict[str, Any] = {"transport": "http", "discovered_at_runtime": True}
+    return find_or_create_source(
+        session, "mcp", url, display_name=url, meta=meta, origin=RUNTIME_ORIGIN
+    )
 
 
 def _get_or_create_dependency(
@@ -261,6 +431,7 @@ def _get_or_create_dependency(
     source: Source | None,
     meta: dict[str, Any],
 ) -> tuple[Dependency, bool]:
+    name = dependency_name(name)
     existing = session.scalar(
         select(Dependency).where(
             Dependency.repo_id == repo.id, Dependency.kind == kind, Dependency.name == name
@@ -315,55 +486,100 @@ def _ensure_runtime_site(
     return cs, True
 
 
+def _server_dependencies(session: Session, repo: Repo, server: str) -> list[Dependency]:
+    """The repo's ``mcp`` dependencies that are ``server`` (by locator, config name or
+    pushed locator), the indexer's before runtime-discovered ones."""
+    key = server_key(server)
+    deps = session.scalars(
+        select(Dependency)
+        .where(Dependency.repo_id == repo.id, Dependency.kind == "mcp")
+        .order_by(Dependency.discovered_at_runtime, Dependency.created_at)
+    )
+    return [d for d in deps if key in _dep_server_keys(d)]
+
+
+def _discover_one(
+    session: Session,
+    repo: Repo,
+    ev: RuntimeEvent,
+    scope: RuntimeScope,
+    operation: str,
+    *,
+    now: datetime,
+) -> tuple[Dependency, bool, CallSite, bool] | None:
+    tool = (ev.tool_name or "").strip()
+    meta: dict[str, Any] = {
+        "discovered_at_runtime": True,
+        "runtime_first_seen": now.isoformat(),
+        "runtime_tool_kind": scope.kind,
+    }
+    if scope.kind == "http":
+        if not scope.host:
+            return None
+        source, vendor, display = _source_for_host(session, repo, scope.host)
+        meta["host"] = scope.host
+        if vendor:
+            meta["vendor"] = vendor
+        if display:
+            meta["display_name"] = display
+        dep, created = _get_or_create_dependency(
+            session, repo, "http", scope.host, source=source, meta=meta
+        )
+    else:
+        server = scope.server
+        known = _server_dependencies(session, repo, server) if server else []
+        if known:
+            dep, created = known[0], False  # a server this repo already knows: a new tool
+        else:
+            url = watchable_server_url(server)
+            source = _source_for_server(session, url) if url else None
+            if server:
+                meta["server_name"] = server
+                if url:
+                    meta["transport"] = "http"
+                else:
+                    meta["server_unwatched"] = _unwatched_reason(server)
+            dep, created = _get_or_create_dependency(
+                session, repo, "mcp", server or tool, source=source, meta=meta
+            )
+    cs, cs_created = _ensure_runtime_site(session, dep, operation, tool, _arg_keys(ev))
+    return dep, created, cs, cs_created
+
+
 def discover_dependencies(
     session: Session, repo: Repo, events: list[RuntimeEvent], *, now: datetime
 ) -> tuple[int, int]:
-    """(a): ``(dependencies_created, call_sites_created)``."""
+    """(a): ``(dependencies_created, call_sites_created)``. Each event's rows are written in
+    a savepoint: one malformed event is logged and skipped, it never stops the run."""
     sites = _repo_sites(session, repo)
     deps_created = sites_created = 0
-    seen_ops: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     for ev in events:
-        tool = (ev.tool_name or "").strip()
-        if not tool:
+        if not (ev.tool_name or "").strip():
             continue
-        operation = runtime_operation(ev)
-        key = normalize_operation(operation)
-        if key in seen_ops:
-            continue
-        seen_ops.add(key)
-        if _covered(operation, sites):
-            continue
-        kind = runtime_kind(ev)
-        meta: dict[str, Any] = {
-            "discovered_at_runtime": True,
-            "runtime_first_seen": now.isoformat(),
-            "runtime_tool_kind": kind,
-        }
-        if kind == "http":
-            host = http_host(tool)
-            if not host:
+        try:
+            operation = runtime_operation(ev)
+            scope = event_scope(ev)
+            key = (*scope.key, normalize_operation(operation))
+            if key in seen:
                 continue
-            source, vendor, display = _source_for_host(session, host)
-            meta["host"] = host
-            if vendor:
-                meta["vendor"] = vendor
-            if display:
-                meta["display_name"] = display
-            dep, created = _get_or_create_dependency(
-                session, repo, "http", host, source=source, meta=meta
+            seen.add(key)
+            if _covered(operation, sites, scope):
+                continue
+            with session.begin_nested():
+                out = _discover_one(session, repo, ev, scope, operation, now=now)
+        except Exception as e:  # noqa: BLE001 - one bad event must not disable the repo's run
+            log.warning(
+                "runtime: skipping event %s (%r) on %s: %s",
+                ev.id,
+                (ev.tool_name or "")[:120],
+                repo.full_name,
+                e,
             )
-        else:
-            server = sample_server(ev)
-            name = server or tool
-            source = _source_for_server(session, server) if server else None
-            if server:
-                meta["transport"] = (
-                    "http" if server.startswith(("http://", "https://")) else "stdio"
-                )
-                meta["server_name"] = server
-            dep, created = _get_or_create_dependency(
-                session, repo, "mcp", name, source=source, meta=meta
-            )
+            continue
+        if out is None:
+            continue
+        dep, created, cs, cs_created = out
         if created:
             deps_created += 1
             log.info(
@@ -372,7 +588,6 @@ def discover_dependencies(
                 dep.kind,
                 dep.name,
             )
-        cs, cs_created = _ensure_runtime_site(session, dep, operation, tool, _arg_keys(ev))
         if cs_created:
             sites_created += 1
             sites.append((cs, dep))
@@ -386,9 +601,15 @@ def discover_dependencies(
 
 
 def _sites_for_tool(
-    sites: list[tuple[CallSite, Dependency]], operation: str
+    sites: list[tuple[CallSite, Dependency]], operation: str, scope: RuntimeScope
 ) -> list[tuple[CallSite, Dependency]]:
-    out = [(cs, dep) for cs, dep in sites if operations_match(cs.operation, operation)]
+    """The call sites a runtime operation refers to: same host / server (``scoped_pairs``)
+    and matching operation."""
+    out = [
+        (cs, dep)
+        for cs, dep in scoped_pairs(sites, scope)
+        if operations_match(cs.operation, operation)
+    ]
     out.sort(key=lambda p: (not p[0].discovered_at_runtime, p[0].file_path, p[0].line))
     return out
 
@@ -407,11 +628,17 @@ def _source_ids_of(deps: Iterable[Dependency]) -> set[UUID]:
 
 
 def _documented_change_exists(session: Session, source_ids: set[UUID], since: datetime) -> bool:
+    """A real (watcher / push) change event in the window on one of ``source_ids``; earlier
+    runtime promotions do not count (they are not documentation of anything)."""
     if not source_ids:
         return False
     row = session.scalar(
         select(ChangeEventRow.id)
-        .where(ChangeEventRow.source_id.in_(list(source_ids)), ChangeEventRow.detected_at >= since)
+        .where(
+            ChangeEventRow.source_id.in_(list(source_ids)),
+            ChangeEventRow.detected_at >= since,
+            ChangeEventRow.diff["source_kind"].astext.is_distinct_from("observed"),
+        )
         .limit(1)
     )
     return row is not None
@@ -422,22 +649,27 @@ def observed_locator(repo: Repo, tool_name: str) -> str:
 
 
 def observed_source(session: Session, repo: Repo, tool_name: str, server: str | None) -> Source:
-    """The ``mcp`` source a promoted event hangs off: the real server when the sample names
-    one, else a synthetic inactive ``observed:<repo>:<tool>`` source (never polled)."""
-    if server:
-        src = _source_for_server(session, server)
-        if src is not None:
-            return src
+    """The source a promoted event hangs off: always the repo's own synthetic inactive
+    ``observed:<repo>:<tool>`` source (``origin="observed"``: never polled, never public).
+    Runtime evidence is one customer's private data, so it never lands on a shared server
+    source where other tenants' matching or the public report would see it. The server the
+    samples named, if any, is kept in ``meta.server``."""
     locator = observed_locator(repo, tool_name)
     src = session.scalar(select(Source).where(Source.kind == "mcp", Source.locator == locator))
     if src is not None:
+        if server and not (src.meta or {}).get("server"):
+            src.meta = {**(src.meta or {}), "server": server}
         return src
+    meta: dict[str, Any] = {"observed": True, "repo": repo.full_name, "tool": tool_name}
+    if server:
+        meta["server"] = server
     src = Source(
         kind="mcp",
         locator=locator,
         display_name=tool_name,
         active=False,
-        meta={"observed": True, "repo": repo.full_name, "tool": tool_name},
+        origin=OBSERVED_ORIGIN,
+        meta=meta,
     )
     try:
         with session.begin_nested():
@@ -553,7 +785,13 @@ def synthesize_observed_event(
         text=f"{n} schema_mismatch runtime events for tool {tool_name} reported by the Kintsua SDK",
     )
     now = utcnow()
-    row = ChangeEventRow(source_id=source.id, diff=event.model_dump(mode="json"), detected_at=now)
+    diff = event.model_dump(mode="json")
+    # private runtime evidence of one repo: never on the public report, never shared
+    diff["private"] = True
+    diff["repo_id"] = str(repo.id)
+    if server:
+        diff["server"] = server
+    row = ChangeEventRow(source_id=source.id, diff=diff, detected_at=now)
     session.add(row)
     session.flush()
     classification = Classification(
@@ -617,12 +855,30 @@ def promote_mismatches(
         return [], []
     org = session.get(Org, repo.org_id)
     sites = _repo_sites(session, repo)
+    mutes = clean_patterns((repo.config or {}).get("mute"))
     promoted: list[ChangeEventRow] = []
     impacts: list[Impact] = []
     for tool, cluster in sorted(clusters.items()):
         if len(cluster) < threshold:
             continue
-        tool_sites = _sites_for_tool(sites, tool)
+        server = next((sample_server(e) for e in cluster if sample_server(e)), None)
+        scope = event_scope(cluster[0])
+        if scope.kind == "mcp":
+            scope = RuntimeScope("mcp", server=server)
+        operation = runtime_operation(cluster[0])
+        all_sites = _sites_for_tool(sites, operation, scope)
+        tool_sites = [
+            (cs, dep)
+            for cs, dep in all_sites
+            if not is_muted(
+                mutes, dependency_vendor(dep, None), cs.operation, tool=dep.kind == "mcp"
+            )
+        ]
+        if is_muted(mutes, None, operation, tool=scope.kind == "mcp") or (
+            all_sites and not tool_sites
+        ):
+            log.info("runtime: %s on %s is muted; not promoting", tool, repo.full_name)
+            continue
         if _documented_change_exists(
             session, _source_ids_of(dep for _cs, dep in tool_sites), since
         ):
@@ -632,7 +888,6 @@ def promote_mismatches(
                 repo.full_name,
             )
             continue
-        server = next((sample_server(e) for e in cluster if sample_server(e)), None)
         source = observed_source(session, repo, tool, server)
         _from_fp, to_fp = _fingerprints(session, repo, tool, cluster)
         row = _existing_promotion(session, source, to_fp)
@@ -674,7 +929,12 @@ def runtime_evidence_comment(count: int, error_class: str | None) -> str:
 def attach_error_spikes(
     session: Session, repo: Repo, events: list[RuntimeEvent], *, now: datetime
 ) -> dict[str, int]:
-    """(c): ``{impact_id: failed calls in the last hour}`` for impacts that were updated."""
+    """(c): ``{impact_id: failed calls in the last hour}`` for impacts that were updated.
+
+    A failed call counts for an impact when one of its matched call sites has the same
+    operation **and** belongs to a dependency the call went to (``scoped_pairs``: the same
+    host, or the same MCP server), so two vendors sharing a path shape never pool their
+    failures on each other's issues."""
     since = now - timedelta(seconds=ERROR_SPIKE_WINDOW_S)
     errors = [e for e in events if e.outcome == "error" and e.observed_at >= since]
     impacts = list(
@@ -687,20 +947,35 @@ def attach_error_spikes(
     out: dict[str, int] = {}
     if not impacts:
         return out
-    by_tool: dict[str, list[RuntimeEvent]] = defaultdict(list)
+    repo_deps = [
+        (None, dep)
+        for dep in session.scalars(select(Dependency).where(Dependency.repo_id == repo.id))
+    ]
+    # (kind, host / server, operation) -> (ids of the dependencies it may hit, op, events)
+    groups: dict[tuple[str, str, str], tuple[set[str], str, list[RuntimeEvent]]] = {}
     for ev in errors:
-        by_tool[runtime_operation(ev)].append(ev)
+        scope = event_scope(ev)
+        op = runtime_operation(ev)
+        key = (*scope.key, normalize_operation(op))
+        if key not in groups:
+            ids = {str(dep.id) for _none, dep in scoped_pairs(repo_deps, scope)}
+            groups[key] = (ids, op, [])
+        groups[key][2].append(ev)
     for impact in impacts:
-        ops = [
-            str(s.get("operation"))
+        sites = [
+            (str(s.get("operation")), str(s.get("dependency_id") or ""))
             for s in (impact.matched_call_sites or [])
             if isinstance(s, dict) and s.get("operation")
         ]
-        if not ops:
+        if not sites:
             continue
         hits: list[RuntimeEvent] = []
-        for tool_op, evs in by_tool.items():
-            if any(operations_match(op, tool_op) or operations_match(tool_op, op) for op in ops):
+        for dep_ids, tool_op, evs in groups.values():
+            if any(
+                dep_id in dep_ids
+                and (operations_match(op, tool_op) or operations_match(tool_op, op))
+                for op, dep_id in sites
+            ):
                 hits.extend(evs)
         count = len(hits)
         if count == 0:
@@ -791,8 +1066,11 @@ def handle_match_runtime(session: Session, payload: dict[str, Any]) -> dict[str,
 __all__ = [
     "RULE_RUNTIME_PROMOTION",
     "RuntimeMatchResult",
+    "RuntimeScope",
     "attach_error_spikes",
+    "dependency_name",
     "discover_dependencies",
+    "event_scope",
     "handle_match_runtime",
     "http_host",
     "match_runtime",
@@ -803,5 +1081,8 @@ __all__ = [
     "runtime_kind",
     "runtime_operation",
     "sample_server",
+    "scoped_pairs",
+    "server_key",
     "synthesize_observed_event",
+    "watchable_server_url",
 ]

@@ -3,7 +3,9 @@
 # Python 3.12 + Node 20 + git + the common test runners and static checkers. No
 # ENTRYPOINT and no CMD: the fixer starts the container with `sleep infinity` and execs
 # every step itself. Runs as the non-root `sandbox` user; the clone lives on a volume
-# mounted at /work.
+# mounted at /work, and a second per-job volume is mounted over /opt/venv (Docker seeds
+# it from this image's venv on first mount) so what the networked install helper puts
+# there is what the no-network test container imports.
 #
 # Build: make sandbox-image   (docker build -t kintsua-sandbox:latest -f docker/sandbox.Dockerfile docker)
 FROM python:3.12-slim
@@ -40,6 +42,7 @@ RUN useradd -m -u 10001 -s /bin/bash sandbox \
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     HOME=/home/sandbox \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
     GIT_TERMINAL_PROMPT=0 \
     CI=1
 
