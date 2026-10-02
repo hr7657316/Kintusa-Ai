@@ -29,12 +29,17 @@ services:
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
       GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      # ENV=prod refuses this default: set a random 32+ character SESSION_SECRET
       SESSION_SECRET: ${SESSION_SECRET:-dev-session-secret-change-me}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
       SANDBOX_BACKEND: ${SANDBOX_BACKEND:-docker}
       DATA_DIR: /data
+      # every service mounts the same "data" volume, so local snapshot files are shared
+      DATA_DIR_SHARED: ${DATA_DIR_SHARED:-true}
+      WORKER_SHUTDOWN_GRACE_S: ${WORKER_SHUTDOWN_GRACE_S:-50}
+      NET_GUARD: ${NET_GUARD:-true}
     depends_on:
       db: { condition: service_healthy }
 
@@ -57,6 +62,7 @@ services:
   worker:
     build: .
     command: ["python", "-m", "kintsua.worker"]
+    stop_grace_period: 60s
     environment: *env
     volumes: ["data:/data", "/var/run/docker.sock:/var/run/docker.sock"]
     deploy:

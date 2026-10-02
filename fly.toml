@@ -1,7 +1,17 @@
 # Fly.io: one web process and two worker processes sharing one image.
-# fly launch --no-deploy && fly postgres create && fly postgres attach <pg> && fly secrets set ...
+# fly launch --no-deploy && fly postgres create && fly postgres attach <pg>
+# fly secrets set SESSION_SECRET=$(openssl rand -hex 32) \
+#   GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY="$(cat app.pem)" GITHUB_WEBHOOK_SECRET=... \
+#   GITHUB_OAUTH_CLIENT_ID=... GITHUB_OAUTH_CLIENT_SECRET=... ANTHROPIC_API_KEY=... \
+#   S3_BUCKET=... S3_ENDPOINT_URL=... S3_REGION=... S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... \
+#   STRIPE_SECRET_KEY=... STRIPE_WEBHOOK_SECRET=... STRIPE_PRICE_ID=...
+# Prod refuses to start with a placeholder SESSION_SECRET, and the worker refuses to start
+# without S3 (web and workers run on separate machines, so local snapshot files would not
+# be shared).
 app = "kintsua"
 primary_region = "iad"
+# seconds Fly waits after SIGTERM; WORKER_SHUTDOWN_GRACE_S below stays under it
+kill_timeout = 300
 
 [build]
   dockerfile = "Dockerfile"
@@ -12,6 +22,8 @@ primary_region = "iad"
   DATA_DIR = "/data"
   LLM_PROVIDER = "anthropic"
   SANDBOX_BACKEND = "docker"
+  # a worker lets its running job finish for this long after SIGTERM (below kill_timeout)
+  WORKER_SHUTDOWN_GRACE_S = "240"
 
 [processes]
   web = "python -m kintsua.api"

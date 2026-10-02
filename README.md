@@ -26,13 +26,14 @@ Pricing: Free for public repos and up to 5 watched integrations · Pro $29 per w
 2. [The GitHub App](#2-the-github-app)
 3. [Runtime SDK](#3-runtime-sdk)
 4. [`.kintsua.yml`](#4-kintsuayml)
-5. [What the fixer refuses](#5-what-the-fixer-refuses)
-6. [Known gaps](#6-known-gaps)
-7. [Architecture](#7-architecture)
-8. [Running it yourself](#8-running-it-yourself)
-9. [HTTP API](#9-http-api)
-10. [Testing](#10-testing)
-11. [Layout](#11-layout)
+5. [Trust and data boundaries](#5-trust-and-data-boundaries)
+6. [What the fixer refuses](#6-what-the-fixer-refuses)
+7. [Known gaps](#7-known-gaps)
+8. [Architecture](#8-architecture)
+9. [Running it yourself](#9-running-it-yourself)
+10. [HTTP API](#10-http-api)
+11. [Testing](#11-testing)
+12. [Layout](#12-layout)
 
 ---
 
@@ -70,7 +71,7 @@ As a GitHub Action:
     fail-on: breaking
 ```
 
-Exit codes: `0` no gate hit, `1` severity at or above `--fail-on`, `2` no lockfile yet (run `snapshot`), `3` could not connect (auth required, bad URL, server down).
+Exit codes: `0` no gate hit, `1` severity at or above `--fail-on`, `2` usage error or an unreadable lockfile (merge-conflict markers, or a lockfile another server wrote under the same `--name`), `3` could not connect (auth required, bad URL, server down), `4` no lockfile yet (run `snapshot`; the GitHub Action does this itself with `snapshot-if-missing: true`). `--auth-env` applies to `--spec` too, sent as `Authorization: Bearer`.
 
 ## 2. The GitHub App
 
@@ -132,7 +133,18 @@ fix:
 test_command: "uv run pytest -q"   # overrides detection (pyproject / package.json / Makefile)
 ```
 
-## 5. What the fixer refuses
+## 5. Trust and data boundaries
+
+Every watched source records where it came from (`source.origin`), and that decides what the hosted worker does with it:
+
+- **Operator-seeded sources** (`kintsua/seed/sources.yml` and the curated SDK map) are the only ones the worker will run as stdio MCP commands, and the only ones on the public weekly report.
+- **Sources from your repo or the settings page** (`.kintsua.yml`, MCP configs, raw HTTP hosts) are fetched over http(s) only. Kintsua never executes a command line it found in your repo; a stdio MCP server in your config is watched through its package on PyPI/npm, or through `kintsua watch --push` from your CI.
+- **Every customer-supplied URL is network-guarded:** localhost, private, link-local and cloud-metadata addresses are refused, each redirect hop is re-checked, response bodies are size-capped and every poll has a time limit.
+- **Pushed snapshots are scoped to your org.** A push can only change what your own repos see; it never touches a source another customer depends on.
+- **The public weekly report** lists only operator-seeded sources, never a customer's repo, source, issue or PR, and redacts secrets from error text.
+- **Runtime data stays thin:** the SDK sends tool names, latencies, outcomes and schema fingerprints, never arguments or results (keys only with `sample=True`); secrets in error bodies, URLs and paths are redacted on both the client and the server.
+
+## 6. What the fixer refuses
 
 The validator is the product: Kintsua never ships a PR whose tests did not run. The fixer leaves an issue (with a comment saying why) and opens no PR when:
 
@@ -140,13 +152,14 @@ The validator is the product: Kintsua never ships a PR whose tests did not run. 
 - the change touches authentication or secrets handling (category `auth`), or the patch would touch files matching `*.env`, `.env*`, `*secret*`, `*credential*`, `auth*.py|ts|js`, `*token*`, `*.pem`, `*.key`, `id_rsa*` or a `secrets/` / `credentials/` directory, or adds lines containing `api_key=`, `token=`, `secret=`, `password=`, `client_secret=`, `private_key=`, `Authorization` or a live key shape;
 - the change would need new credentials or scopes;
 - the repo has no test command and no static checks (adding either unlocks PRs);
+- the test suite did not actually run, on the baseline or after the patch (pytest collection or usage errors, no tests collected): matching the baseline's failures only counts when tests really ran;
 - the agent's patch exceeds 300 changed lines, touches files outside the affected call sites plus one import hop, fails the test command (or fails tests the baseline run on the unpatched tree passed), fails `ruff` / `tsc --noEmit` where present, or (for MCP tools) produces a call that does not validate against the new `inputSchema`;
 - the agent stops with `done(needs_human=true)` because the fix needs a decision a human should make (for example a new required parameter with no inferable value);
-- more than 3 fix jobs are already running (the job is deferred, not refused).
+- more than 3 fix jobs are already running: the job is deferred, not refused, and fails with a reason only after about 6 hours of deferrals. A fix job lost with its worker (a deploy or an out-of-memory kill) is re-queued once, then failed.
 
 Kintsua never pushes to a protected branch and never force-pushes. Everything it writes is prefixed `[Kintsua]`, labelled `kintsua`, and lives on `kintsua/*` branches so it can be found and reverted.
 
-## 6. Known gaps
+## 7. Known gaps
 
 - **Static indexing is partial by design.** Dynamic tool names built at runtime, URLs assembled from config or other modules, and monorepos with several services are indexed partially (constants are tracked per file; the first literal assignment wins). The runtime SDK closes these gaps by observing real calls.
 - **SDK symbol to HTTP operation equivalence** is table-driven and covers Stripe, Slack, GitHub (PyGithub/Octokit), OpenAI, Anthropic, Notion, HubSpot, Twilio and SendGrid; other SDK call sites match package-level events (major bumps) but not individual OpenAPI operations.
@@ -158,7 +171,7 @@ Kintsua never pushes to a protected branch and never force-pushes. Everything it
 - **Sandbox egress** is a name-level allowlist unless `SANDBOX_HTTPS_PROXY` is set; agent, test and validation steps run with no network at all.
 - No Slack or email alerts, no languages beyond Python and TypeScript, no self-hosting support, no rollback of agent actions (v1).
 
-## 7. Architecture
+## 8. Architecture
 
 One Python monorepo, one Postgres, one FastAPI service, one worker pool. Five components talk through the database and a job queue, never directly to each other, so each can be built and tested alone. The diagrams below are Mermaid; GitHub renders them inline.
 
@@ -290,7 +303,7 @@ flowchart TD
 
 ### Impact lifecycle
 
-State lives on `impact` and `job`; every event row is immutable.
+State lives on `impact` and `job`; every event row is immutable. Only the CI conclusions `failure` and `timed_out` move a PR to `failed`; `cancelled`, `action_required`, `neutral` and `skipped` are recorded without a status change.
 
 ```mermaid
 stateDiagram-v2
@@ -305,6 +318,9 @@ stateDiagram-v2
     pr_open --> merged: customer merged the PR
     pr_open --> failed: customer CI failed on the PR
     pr_open --> dismissed: PR closed without merging
+    fixing --> issued: worker died mid-job, re-queued once
+    failed --> pr_open: a CI re-run passes every check that had failed
+    dismissed --> pr_open: the PR was reopened
     merged --> [*]
     failed --> [*]
     dismissed --> [*]
@@ -423,7 +439,7 @@ Stack: Python 3.12, FastAPI, SQLAlchemy 2 + Alembic, Postgres 16 (also the queue
 
 Scheduling: a self-perpetuating `tick` job every 15 minutes enqueues `poll_source` for due sources (MCP 6h, OpenAPI 24h, packages 6h, changelog 24h; 1h for sources a paying customer depends on), with exponential backoff per failing source up to 48 hours. The weekly report runs on Mondays and the billing sync on the 1st.
 
-## 8. Running it yourself
+## 9. Running it yourself
 
 Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), Postgres 16 (local or Docker), Node 20 for stdio MCP servers and TypeScript checks, Docker for the fixer sandbox in production.
 
@@ -451,15 +467,17 @@ make watch                                 # python -m kintsua.watchers.run --al
 
 **Deploy:** `fly.toml` runs one `web` process and `worker` processes from the same image with `alembic upgrade head` as the release command; `docker-compose.yml` is the equivalent for a VM.
 
-Key environment variables (all in `.env.example`): `DATABASE_URL`, `BASE_URL`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID/SECRET`, `SESSION_SECRET`, `ANTHROPIC_API_KEY`, `AUTO_ISSUE`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID`.
+**Production guards:** with `ENV=prod` the service refuses to start unless `SESSION_SECRET` is a random value of 32+ characters, and the worker refuses to start without S3 unless every process shares `DATA_DIR` (`DATA_DIR_SHARED=true`, as in the single-host compose file). Jobs whose worker died are handed out again after `JOB_LEASE_S` (15 minutes; running jobs heartbeat). On SIGTERM a worker lets the running job finish for `WORKER_SHUTDOWN_GRACE_S`, then returns it to the queue; keep that below the platform's kill timeout. After an outage that outlasted the retries, re-drive failed jobs with `python -m kintsua.worker --requeue-failed [--kinds classify_event,open_issue] [--since 24h]`.
 
-## 9. HTTP API
+Key environment variables (all in `.env.example`): `DATABASE_URL`, `BASE_URL`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID/SECRET`, `SESSION_SECRET`, `DATA_DIR_SHARED`, `JOB_LEASE_S`, `WORKER_SHUTDOWN_GRACE_S`, `NET_GUARD`, `ANTHROPIC_API_KEY`, `AUTO_ISSUE`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID`.
+
+## 10. HTTP API
 
 Eleven endpoints from the spec plus the few the CLI and the setup flow need. Everything else happens in GitHub.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `POST /webhooks/github` | GitHub signature | installation, push, pull_request, issues, check_suite/check_run, workflow_run |
+| `POST /webhooks/github` | GitHub signature | installation, installation_repositories, repository (renames, default-branch changes), push, pull_request, issues, check_suite/check_run, workflow_run |
 | `POST /v1/ingest` | SDK key | runtime event batches |
 | `POST /v1/watch/push` | SDK key | a snapshot pushed by `kintsua watch --push` |
 | `GET /v1/repos/{id}/dependencies` | session | dependency map JSON |
@@ -478,7 +496,7 @@ Eleven endpoints from the spec plus the few the CLI and the setup flow need. Eve
 | `GET /setup/github` | | GitHub App manifest flow |
 | `GET /healthz`, `GET /` | public | health, landing page |
 
-## 10. Testing
+## 11. Testing
 
 ```bash
 make test        # uv run pytest -q -m "not network"   (~750 tests, under 2 minutes, needs Postgres)
@@ -489,7 +507,7 @@ What the suite covers: every watcher's `diff` against fixture pairs (MCP, OpenAP
 
 Tests marked `network` (real vendor specs, registries, public MCP servers) run on demand: `uv run pytest -m network`.
 
-## 11. Layout
+## 12. Layout
 
 ```
 kintsua/

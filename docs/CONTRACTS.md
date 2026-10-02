@@ -139,6 +139,10 @@ your side with a clearly named function and mention it in your final report.
 
 ## HTTP endpoints (owned by `kintsua/api`)
 
+GitHub webhook events handled: `installation`, `installation_repositories`, `repository`
+(renames and default-branch changes), `push`, `pull_request`, `issues`, `check_suite`, `check_run`,
+`workflow_run`, `ping`.
+
 The eleven from the spec plus:
 `POST /v1/watch/push` (SDK key; CLI `kintsua watch --push` sends `{repo, source: {kind, locator, display_name}, doc: {version, body}}`),
 `GET /healthz`, `GET /` (landing page with the one-line pricing and the privacy defaults),
@@ -211,3 +215,57 @@ Rules every component follows:
 5. The public weekly report (`GET /report/weekly`, the `weekly_report` job) includes only
    `Source.public` sources, never repo names, issue or PR links of customer repos, and runs
    every error string through `redact_secrets`. Operator CLIs may build an unfiltered report.
+
+## Seams added or changed by the review fixes
+
+Configuration and repo settings:
+
+* `Repo.config["settings"]` (`kintsua.indexer.config.API_SETTINGS_KEY`) holds what the settings
+  API set (`mute`, `fix.mode` / `fix.base`, `sources`). The indexer merges it back on every
+  re-index with `merge_api_settings(config)`: mutes and sources are a union deduped by
+  pattern / locator, and an API `fix.mode` or `fix.base` wins over the file. The file still owns
+  its own entries, so deleting a mute that `.kintsua.yml` defines brings it back on the next index.
+* `.kintsua.yml` `sources[].transport`: `http | sse | stdio` (guessed `sse` from a `/sse` path).
+* `Org.settings["github_account_id"]` matches a reinstall to the existing org.
+
+Matching and impacts:
+
+* `Impact.matched_call_sites` entries carry `dependency_kind`; when the indexer finds the same
+  call in another file it rewrites the entry (new `file_path` / `line` / `call_site_id`) and adds
+  `moved_from: "<old path>:<line>"`. Consumers use `dict.get`.
+* `kintsua.indexer.run.RUNTIME_FILE_PATH = "<runtime>"` is the pseudo file path of runtime
+  evidence and pushed call sites; re-indexing never treats it as vanished. Any `file_path`
+  starting with `<` has no blob link.
+* `kintsua.matcher.mute.is_muted(patterns, vendor, operation, *, tool=False)`: pass `tool=True`
+  for call sites of `mcp` dependencies.
+* `kintsua.matcher.match.requeue_stalled_issues(session, *, now=None) -> list[Impact]` re-queues
+  `open_issue` for `detected` impacts whose last `open_issue` job ran out of attempts.
+* Observed (runtime-promoted) change events hang off the per-repo `observed:<repo>:<tool>`
+  source (`origin="observed"`) and carry `diff.private=True`, `diff.repo_id`, `diff.server`.
+* Pushed snapshots: the pushing repo's dependency has `name` = the push source locator
+  (hash-shortened past 512 chars); its call sites have `file_path="<runtime>"`,
+  `symbol="kintsua watch --push"`, one per tool or operation, `discovered_at_runtime=True`.
+
+Watchers and the report:
+
+* `compare(...)` returns `None` when the diff has no ops, whatever the version string (the
+  snapshot is still stored).
+* A change event whose ops exceed the inline limit keeps a 200-op preview in `diff["ops"]` with
+  structural ops (removed, renamed, required_added, ...) first, plus `ops_truncated`, `ops_total`
+  and `storage_ref` (the `put_document` dict). The classifier loads the full ops from it.
+* `build_weekly_report(session, since, until, *, public_only=True)` and
+  `failing_sources(session, days=7, *, public_only=True)`; `WeeklyReport.public` marks a public
+  build and `kintsua.report.run.read_latest()` only serves a `latest.json` with `public=True`.
+* `FileSnapshotStore`: a second server on a host whose lockfile belongs to another source gets a
+  path-qualified name (`lockfile_name(source, qualified=True)`).
+
+Queue and worker:
+
+* Handlers receive the job id as `payload["_job_id"]`.
+* Running jobs heartbeat `locked_at`; `kintsua.core.queue.reap_stale(session, lease_s=...)`
+  (called from `claim`) hands a job whose worker died back to the queue after
+  `Settings.job_lease_s`, or fails it when it has no attempts left.
+* `python -m kintsua.worker --requeue-failed [--kinds k1,k2] [--since 24h]` re-drives failed jobs.
+* Prod guards: `Settings` refuses a placeholder or short `session_secret` when `env == "prod"`;
+  `kintsua.core.storage.storage_problem()` names a missing S3 configuration in prod unless
+  `data_dir_shared` is set, and the worker refuses to start on it.
