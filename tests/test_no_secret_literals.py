@@ -32,6 +32,10 @@ SHAPES = re.compile(
             r"kts_[A-Za-z0-9_-]{20,}",
             r"npm_[A-Za-z0-9]{30,}",
             r"\bsk-[A-Za-z0-9]{20,}",
+            # a Basic credential: base64 holding a digit, "+", "/" or "=" (not the prose word)
+            r"(?i:basic)\s+(?=[A-Za-z0-9+/]*[\d+/=])[A-Za-z0-9+/]{8,}={0,2}",
+            # DER key material (every PKCS#1/#8 key starts with MII...)
+            r"MII[A-Za-z0-9+/]{10,}",
         ]
     )
 )
