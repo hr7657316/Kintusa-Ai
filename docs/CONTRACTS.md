@@ -239,7 +239,9 @@ Matching and impacts:
 * `kintsua.matcher.mute.is_muted(patterns, vendor, operation, *, tool=False)`: pass `tool=True`
   for call sites of `mcp` dependencies.
 * `kintsua.matcher.match.requeue_stalled_issues(session, *, now=None) -> list[Impact]` re-queues
-  `open_issue` for `detected` impacts whose last `open_issue` job ran out of attempts.
+  `open_issue` for `detected` impacts whose last `open_issue` job ran out of attempts; the
+  watcher tick calls it through `kintsua.watchers.run.requeue_stalled(session)`, which never
+  raises (the tick's result carries `issues_requeued`).
 * Observed (runtime-promoted) change events hang off the per-repo `observed:<repo>:<tool>`
   source (`origin="observed"`) and carry `diff.private=True`, `diff.repo_id`, `diff.server`.
 * Pushed snapshots: the pushing repo's dependency has `name` = the push source locator
@@ -269,3 +271,35 @@ Queue and worker:
 * Prod guards: `Settings` refuses a placeholder or short `session_secret` when `env == "prod"`;
   `kintsua.core.storage.storage_problem()` names a missing S3 configuration in prod unless
   `data_dir_shared` is set, and the worker refuses to start on it.
+
+Cross-area follow-ups:
+
+* `kintsua.watchers.run.find_or_create_source` raises `SourceNotShareable` (a `ValueError`)
+  instead of returning an existing row whose origin is `push` or `observed` to a caller of
+  another origin, or a row whose `owner_org_id` belongs to another org. It raises before merging
+  anything. `ensure_shareable(row, *, origin, owner_org_id=None)` pre-checks a row a caller already
+  holds; `PRIVATE_ORIGINS = ("push", "observed")`. The indexer records such a dependency
+  unwatched with `meta.reason` (shown as `DependencyEntry.reason` on the map and the install
+  issue) and never resolves a repo-supplied locator starting with `push:` or `observed:`
+  (`kintsua.indexer.resolve.is_private_locator`). The API answers 422 (`/v1/repos/{id}/sources`)
+  or 409 (`/v1/watch/push`).
+* `POST /v1/repos/{id}/sources` refuses an MCP source that is not http(s) with 422 unless the
+  locator is already an operator-seeded row; its body takes an optional
+  `transport: http | sse | stdio` (`kintsua.api.schemas.guess_mcp_transport`).
+* `/v1/ingest` stores `tool_name` redacted, and HTTP tool names in the SDK's shape
+  (`kintsua.api.ingest.collapse_http_tool_name`: id segments `{id}`, credential-like segments
+  `{token}`).
+* `kintsua.matcher.runtime.server_key` reduces an http(s) URL to `scheme://host[:port]/path`
+  (no userinfo, query or fragment) before comparing with configured locators.
+* `kintsua.matcher.issues`: `PUSH_SITE_SYMBOL = "kintsua watch --push"`,
+  `is_pseudo_path(file_path)`; `blob_url` returns `None` for pseudo paths.
+* `kintsua.report.markdown.md_escape` / `md_code` escape every vendor- or model-derived field
+  in the report Markdown, and the page's fallback converter honours backslash escapes.
+* `GitHubApp.installation_token(id, *, min_ttl_s=120)` and `clone_url(id, full_name, *,
+  min_ttl_s=120)` return a token valid for at least `min_ttl_s`; the fixer pushes with 600 s.
+* `classify_with_llm(..., max_tokens=None, effort=None)`; `classify_change_event` retries a
+  truncated model answer once at a lower effort, then records rule hit `llm_truncated`.
+* Settings: `source_backoff_base_s` (900), `poll_timeout_s` (600, `meta.poll_timeout_s`
+  overrides), `poll_http_timeout_s` (per-request timeout, passed as `SourceRef.meta["timeout_s"]`).
+* Startup: `kintsua.api.app.startup_problem()` makes the API refuse to start on
+  `storage_problem()` in prod, like the worker.

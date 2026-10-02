@@ -128,8 +128,18 @@ class WatchPushBody(BaseModel):
 # ---- settings API -----------------------------------------------------------------
 
 
+def guess_mcp_transport(url: str) -> str:
+    """``sse`` for a URL whose path ends in ``/sse``, else ``http`` (streamable HTTP); the
+    same guess as ``kintsua.indexer.config.ConfigSource.mcp_transport``."""
+    return "sse" if urlsplit(url).path.rstrip("/").endswith("/sse") else "http"
+
+
 class AddSourceBody(BaseModel):
-    """``POST /v1/repos/{id}/sources``: a spec / changelog URL or an MCP server."""
+    """``POST /v1/repos/{id}/sources``: a spec / changelog URL or an MCP server.
+
+    ``transport`` (MCP only): ``http`` | ``sse`` for a URL (guessed from the path when
+    absent: ``.../sse`` is SSE), ``stdio`` for a command line; ``None`` for other kinds.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -139,6 +149,7 @@ class AddSourceBody(BaseModel):
     command: str | None = None
     display_name: str | None = Field(default=None, max_length=255)
     hosts: list[str] = Field(default_factory=list)
+    transport: Literal["http", "sse", "stdio"] | None = None
 
     @field_validator("hosts", mode="before")
     @classmethod
@@ -147,6 +158,17 @@ class AddSourceBody(BaseModel):
             return []
         if isinstance(v, str):
             return [h.strip() for h in v.split(",") if h.strip()]
+        return v
+
+    @field_validator("transport", mode="before")
+    @classmethod
+    def _transport(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v = v.strip().lower().replace("_", "-")
+            if not v:
+                return None
+            if v in ("streamable-http", "streamablehttp"):
+                return "http"
         return v
 
     @model_validator(mode="after")
@@ -167,19 +189,24 @@ class AddSourceBody(BaseModel):
             self.url = raw
             self.command = None
         self.locator = self.url or self.command
+        if self.kind != "mcp":
+            self.transport = None
+        elif self.url:
+            if self.transport == "stdio":
+                raise ValueError("transport stdio needs a command, not a url")
+            self.transport = self.transport or guess_mcp_transport(self.url)
+        else:
+            if self.transport not in (None, "stdio"):
+                raise ValueError(f"transport {self.transport} needs a url")
+            self.transport = "stdio"
         self.hosts = [h.lower().strip() for h in self.hosts if h and h.strip()]
         if self.display_name is not None:
             self.display_name = self.display_name.strip() or None
         return self
 
-    @property
-    def transport(self) -> str | None:
-        if self.kind != "mcp":
-            return None
-        return "http" if self.url else "stdio"
-
     def config_entry(self) -> dict[str, Any]:
-        """The ``sources[]`` entry stored on ``Repo.config`` (same shape as .kintsua.yml)."""
+        """The ``sources[]`` entry stored on ``Repo.config`` (same shape as .kintsua.yml,
+        including an MCP source's ``transport``)."""
         out: dict[str, Any] = {"kind": self.kind}
         if self.url:
             out["url"] = self.url
@@ -189,6 +216,8 @@ class AddSourceBody(BaseModel):
             out["name"] = self.display_name
         if self.hosts:
             out["hosts"] = list(self.hosts)
+        if self.transport:
+            out["transport"] = self.transport
         return out
 
 
@@ -290,4 +319,5 @@ __all__ = [
     "WatchDoc",
     "WatchPushBody",
     "WatchSource",
+    "guess_mcp_transport",
 ]

@@ -1,6 +1,10 @@
 """The FastAPI application: ``create_app()`` mounts every router, the static files and the
 Jinja2 templates, adds ``/healthz`` (pings Postgres), structured error handlers that never
 leak a stack trace, and request logging with a request id.
+
+Like the worker, the app refuses to start when ``kintsua.core.storage.storage_problem()``
+names a problem (prod without S3 or a shared ``DATA_DIR``): ``create_app()`` logs it and
+raises ``StorageNotConfigured``, and ``python -m kintsua.api`` exits with status 2.
 """
 
 from __future__ import annotations
@@ -18,7 +22,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from kintsua.api import auth, billing, ingest, keys, pages, report, repos, setup, webhooks
 from kintsua.api.deps import STATIC_DIR, is_htmx, render
-from kintsua.core.config import get_settings
+from kintsua.core.config import Settings, get_settings
+from kintsua.core.storage import StorageNotConfigured, storage_problem
 
 log = logging.getLogger(__name__)
 
@@ -69,8 +74,20 @@ def _validation_details(exc: RequestValidationError) -> list[dict[str, Any]]:
     return out
 
 
+def startup_problem(settings: Settings | None = None) -> str | None:
+    """Why the API must not start with this configuration (logged as an error), else None.
+    Today: the large-document storage check the worker also runs."""
+    problem = storage_problem(settings or get_settings())
+    if problem:
+        log.error("refusing to start: %s", problem)
+    return problem
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
+    problem = startup_problem(settings)
+    if problem:
+        raise StorageNotConfigured(problem)
     app = FastAPI(
         title="Kintsua",
         version="0.1.0",
@@ -184,4 +201,4 @@ def _title_for(status: int) -> str:
     }.get(status, f"HTTP {status}")
 
 
-__all__ = ["create_app"]
+__all__ = ["create_app", "startup_problem"]

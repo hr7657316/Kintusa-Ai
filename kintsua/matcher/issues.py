@@ -42,7 +42,8 @@ TITLE_MAX = 240
 MAX_OPS_SHOWN = 15
 MAX_SITES_SHOWN = 60
 MAX_VALUE_CHARS = 200
-RUNTIME_FILE_PATH = "<runtime>"
+RUNTIME_FILE_PATH = "<runtime>"  # any file_path starting with "<" is a pseudo path
+PUSH_SITE_SYMBOL = "kintsua watch --push"  # symbol of the call sites a pushed snapshot adds
 RUNTIME_COMMENT_MARKER = "<!-- kintsua:runtime -->"
 
 LABEL_COLOURS: dict[str, tuple[str, str]] = {
@@ -131,14 +132,17 @@ def is_fixable(classification: Classification | None) -> bool:
     )
 
 
+def is_pseudo_path(file_path: Any) -> bool:
+    """A call-site ``file_path`` that is not a file in the repo: empty, or a pseudo path such
+    as ``<runtime>`` (runtime evidence, pushed snapshots)."""
+    return not file_path or str(file_path).startswith("<")
+
+
 def has_file_located_site(sites: Any) -> bool:
-    """Does any matched call-site record point at a file in the repo? Runtime-observed
-    (``<runtime>``) sites and package impacts without call sites give the fixer nothing to
-    patch."""
-    return any(
-        isinstance(s, dict) and s.get("file_path") and s["file_path"] != RUNTIME_FILE_PATH
-        for s in sites or []
-    )
+    """Does any matched call-site record point at a file in the repo? Pseudo-path
+    (``<runtime>``, ...) sites and package impacts without call sites give the fixer nothing
+    to patch."""
+    return any(isinstance(s, dict) and not is_pseudo_path(s.get("file_path")) for s in sites or [])
 
 
 def change_event_marker(change_event_id: Any) -> str:
@@ -193,7 +197,8 @@ def relevant_ops(ops: list[dict[str, Any]], operations: list[str]) -> list[dict[
 
 
 def blob_url(repo: Repo, file_path: str, line: int | None) -> str | None:
-    if not file_path or file_path == RUNTIME_FILE_PATH:
+    """The GitHub link to ``file_path``; None for a pseudo path (``<runtime>``, ...)."""
+    if is_pseudo_path(file_path):
         return None
     path = quote(file_path.lstrip("/"), safe="/")
     url = f"https://github.com/{repo.full_name}/blob/{repo.default_branch or 'main'}/{path}"
@@ -207,8 +212,13 @@ def _site_row(repo: Repo, site: dict[str, Any]) -> str:
     line = site.get("line") or 0
     symbol = site.get("symbol") or ""
     operation = site.get("operation") or ""
-    if fp == RUNTIME_FILE_PATH or not fp:
+    if symbol == PUSH_SITE_SYMBOL and is_pseudo_path(fp):
+        where = f"pushed by {code(PUSH_SITE_SYMBOL)}"
+        symbol = ""
+    elif fp == RUNTIME_FILE_PATH or not fp:
         where = "runtime (observed by the SDK)"
+    elif is_pseudo_path(fp):
+        where = plain(f"{fp}:{line}" if line else fp)
     else:
         label = f"{fp}:{line}" if line else fp
         url = blob_url(repo, fp, int(line) if line else None)
@@ -529,8 +539,10 @@ def close_impact_issue(session: Session, impact: Impact, reason: str) -> None:
 __all__ = [
     "ACTIONABLE_SEVERITIES",
     "FIXABLE_CATEGORIES",
+    "PUSH_SITE_SYMBOL",
     "RUNTIME_COMMENT_MARKER",
     "RUNTIME_FILE_PATH",
+    "blob_url",
     "build_issue_body",
     "change_event_marker",
     "close_impact_issue",
@@ -542,6 +554,7 @@ __all__ = [
     "find_issue_with_marker",
     "has_file_located_site",
     "is_fixable",
+    "is_pseudo_path",
     "plain",
     "relevant_ops",
     "severity_label",

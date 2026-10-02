@@ -48,6 +48,9 @@ SECRET_PATTERNS = [
     re.compile(
         r"(?i)\b(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?[a-z][a-z0-9_\-]*\s+[^\s\"',}]{6,}"
     ),
+    # a Basic credential on its own (echoed, logged without the header name); the base64
+    # must hold a digit, '+', '/' or '=' so prose ("basic authentication") is left alone
+    re.compile(r"(?i)\bbasic\s+(?=[a-z]*[\d+/=])[a-z0-9+/=]{8,}"),
     re.compile(r"(?i)gh[pousr]_[0-9a-zA-Z]{20,}"),
     re.compile(r"github_pat_[0-9A-Za-z_]{22,}"),
     re.compile(r"(?i)xox[abeprs]-[0-9a-zA-Z\-]{10,}"),
@@ -61,7 +64,7 @@ SECRET_PATTERNS = [
     re.compile(r"npm_[0-9A-Za-z]{36}"),
     re.compile(r"pypi-[0-9A-Za-z_\-]{50,}"),
     re.compile(
-        r"(?i)(api[_-]?key|token|secret|password|authorization|client_secret|private_key)"
+        r"(?i)(api[_-]?key|token|secret|password|authorization|client_secret|private[_-]?key)"
         r"[\"']?\s*[:=]\s*(bearer\s+)?[\"']?[^\s\"',}]{6,}"
     ),
     re.compile(r"eyJ[0-9a-zA-Z_\-]{10,}\.[0-9a-zA-Z_\-]{10,}\.[0-9a-zA-Z_\-]{10,}"),

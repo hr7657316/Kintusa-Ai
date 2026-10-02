@@ -5,7 +5,8 @@ Seams (see docs/CONTRACTS.md):
 
 * ``source_ref_for(source_row) -> SourceRef``
 * ``find_or_create_source(session, kind, locator, *, display_name, vendor, meta, poll_interval_s,
-  origin, owner_org_id)``
+  origin, owner_org_id)``; raises ``SourceNotShareable`` for another caller's pushed /
+  observed / org-owned row
 * ``latest_snapshot(session, source_id) -> SnapshotRecord | None``
 * ``ingest_canonical_doc(session, source_row, doc, *, text=None) -> ChangeEventRow | None``
 * ``ensure_tick_job(session)``
@@ -18,11 +19,13 @@ Semantics worth knowing:
   not move it), so "failing for 7 days" = ``consecutive_failures > 0`` and the last success
   (or creation) is older than 7 days.
 * A fetch failure never fails the job: it is recorded on the source (``last_error``,
-  ``consecutive_failures``, ``backoff_until = now + min(min(poll_interval_s, 15 min) *
-  2**(failures - 1), settings.source_backoff_ceiling_s)``) and the next tick skips the
-  source until the backoff passes. Only a missing source raises ``NonRetryable``. A fetch
-  is bounded by ``meta["poll_timeout_s"]`` (default 10 min). The ingest runs in a
-  SAVEPOINT, so a failed ingest persists nothing but the failure.
+  ``consecutive_failures``, ``backoff_until = now + min(min(poll_interval_s,
+  settings.source_backoff_base_s) * 2**(failures - 1), settings.source_backoff_ceiling_s)``)
+  and the next tick skips the source until the backoff passes. Only a missing source raises
+  ``NonRetryable``. A whole fetch is bounded by ``meta["poll_timeout_s"]``, else
+  ``settings.poll_timeout_s`` (10 min); each HTTP request by ``meta["timeout_s"]``, else
+  ``settings.poll_http_timeout_s`` (handed to the adapters by ``source_ref_for``). The
+  ingest runs in a SAVEPOINT, so a failed ingest persists nothing but the failure.
 * Trust (docs/CONTRACTS.md, "Source trust"): only ``Source.pollable`` sources are polled;
   an ``mcp`` source whose locator is a command line is spawned only when
   ``Source.trusted`` (operator-seeded), otherwise the poll records why and deactivates it;
@@ -32,6 +35,8 @@ Semantics worth knowing:
   "unconfigured": not due, and a poll records it without counting a failure, so it never
   shows as failing on the weekly report.
 * MCP sources a paying (``pro``) org's active repo depends on are due every hour.
+* Each tick also calls ``kintsua.matcher.match.requeue_stalled_issues`` (``open_issue`` jobs
+  that ran out of attempts); a failure there is logged and never stops the tick.
 * The diff stored on ``change_event.diff`` is the full ``ChangeEvent`` dump. When the ops
   list serialises above 256 KB the full dump goes through ``put_document`` (file/S3),
   ``raw_diff_ref`` / ``storage_ref`` point at it and the row keeps 200 ops, structural ones
@@ -109,9 +114,8 @@ PAID_PLANS = ("pro",)
 DIFF_INLINE_LIMIT_BYTES = 256 * 1024
 DIFF_OPS_PREVIEW = 200
 FAILING_DAYS = 7
-BACKOFF_BASE_S = 15 * 60  # first retry after a failure: min(poll interval, 15 min)
-POLL_TIMEOUT_S = 10 * 60  # whole fetch (connect, listings, release notes ...)
 NOT_POLLED_ORIGINS = ("push", "observed")  # Source.pollable, as SQL
+PRIVATE_ORIGINS = ("push", "observed")  # handed only to a caller of the same origin
 UNCONFIGURED_PREFIX = "unconfigured: "
 STDIO_REFUSED = (
     "refused: the hosted watcher only runs stdio MCP commands from the operator's seed list; "
@@ -153,10 +157,14 @@ def default_poll_interval(kind: str, meta: dict[str, Any] | None = None) -> int:
 def source_ref_for(source_row: Source) -> SourceRef:
     """The adapter's view of a row. Runtime-only keys (``_...``) are never read from the
     row; ``meta["_net_guard"] = True`` is added for every source that is not
-    operator-seeded while ``Settings.net_guard`` is on (rule 3 in docs/CONTRACTS.md)."""
+    operator-seeded while ``Settings.net_guard`` is on (rule 3 in docs/CONTRACTS.md).
+    ``user_agent`` and ``timeout_s`` (the per-request HTTP timeout every adapter reads)
+    default to ``Settings.user_agent`` / ``Settings.poll_http_timeout_s``."""
     settings = get_settings()
     meta = {k: v for k, v in (source_row.meta or {}).items() if not str(k).startswith("_")}
     meta.setdefault("user_agent", settings.user_agent)
+    if not meta.get("timeout_s"):
+        meta["timeout_s"] = settings.poll_http_timeout_s
     if settings.net_guard and not source_row.trusted:
         meta["_net_guard"] = True
     return SourceRef(
@@ -167,6 +175,39 @@ def source_ref_for(source_row: Source) -> SourceRef:
         vendor=source_row.vendor,
         meta=meta,
     )
+
+
+class SourceNotShareable(ValueError):
+    """``find_or_create_source`` found a row under this (kind, locator) that the caller may
+    not use: another org's pushed snapshot, a repo's synthetic ``observed`` source, or a row
+    owned by a different org. Callers record the dependency as unwatched (indexer) or answer
+    409/422 (API) instead of attaching it."""
+
+    def __init__(self, source: Source, *, origin: str):
+        self.source_id = source.id
+        self.kind = source.kind
+        self.locator = source.locator
+        self.source_origin = source.origin
+        self.caller_origin = origin
+        owner = "an org-scoped" if source.owner_org_id is not None else "a private"
+        super().__init__(
+            f"{source.kind} source {source.locator!r} is {owner} {source.origin} source "
+            "and cannot be shared"
+        )
+
+
+def _same_org(a: Any, b: Any) -> bool:
+    return a is not None and b is not None and str(a) == str(b)
+
+
+def ensure_shareable(row: Source, *, origin: str, owner_org_id: Any = None) -> None:
+    """Raise ``SourceNotShareable`` unless a caller with this ``origin`` / ``owner_org_id``
+    may be handed ``row``: a ``push`` / ``observed`` row only to a caller of the same origin,
+    and a row with an ``owner_org_id`` only to a caller of that org."""
+    if row.origin in PRIVATE_ORIGINS and origin != row.origin:
+        raise SourceNotShareable(row, origin=origin)
+    if row.owner_org_id is not None and not _same_org(row.owner_org_id, owner_org_id):
+        raise SourceNotShareable(row, origin=origin)
 
 
 def find_or_create_source(
@@ -189,7 +230,12 @@ def find_or_create_source(
     ``seed`` by naming the same locator. Only the seed loader promotes rows to ``seed``.
     A seeded row named by anyone else is returned unchanged (its meta decides what the
     worker runs, so no caller may add keys to it), and runtime-only meta keys (``_...``,
-    e.g. ``_net_guard``) are never stored."""
+    e.g. ``_net_guard``) are never stored.
+
+    Raises ``SourceNotShareable`` (a ``ValueError``) instead of handing out an existing
+    ``push`` / ``observed`` row to a caller of another origin, or a row whose
+    ``owner_org_id`` differs from the caller's: a repo naming ``push:<other org>:...`` must
+    not get a dependency on another org's pushed snapshots."""
     if kind not in SOURCE_KINDS:
         raise ValueError(f"unknown source kind {kind!r}")
     locator = locator.strip()
@@ -198,6 +244,7 @@ def find_or_create_source(
     meta = {k: v for k, v in (meta or {}).items() if not str(k).startswith("_")}
     row = session.scalar(select(Source).where(Source.kind == kind, Source.locator == locator))
     if row is not None:
+        ensure_shareable(row, origin=origin, owner_org_id=owner_org_id)
         if row.trusted and origin != "seed":
             return row
         if display_name and (not row.display_name or row.display_name == row.locator):
@@ -231,6 +278,7 @@ def find_or_create_source(
         )
         if existing is None:  # pragma: no cover - cannot happen
             raise
+        ensure_shareable(existing, origin=origin, owner_org_id=owner_org_id)
         return existing
     return row
 
@@ -408,13 +456,15 @@ class PollResult:
 def record_failure(source: Source, error: str) -> int:
     """Exponential backoff with the configured ceiling. Returns the backoff seconds.
 
-    The base is the poll interval capped at ``BACKOFF_BASE_S`` (15 min), so one transient
-    error is retried soon instead of skipping the next regular poll: a daily source waits
-    15 min, 30 min, 1 h ... and reaches the 48 h ceiling only after sustained failure."""
+    The base is the poll interval capped at ``Settings.source_backoff_base_s`` (15 min), so
+    one transient error is retried soon instead of skipping the next regular poll: a daily
+    source waits 15 min, 30 min, 1 h ... and reaches the ceiling
+    (``Settings.source_backoff_ceiling_s``, 48 h) only after sustained failure."""
     settings = get_settings()
     source.consecutive_failures = (source.consecutive_failures or 0) + 1
     source.last_error = error[:4000]
-    base = max(1, min(source.poll_interval_s or BACKOFF_BASE_S, BACKOFF_BASE_S))
+    cap = max(1, settings.source_backoff_base_s)
+    base = max(1, min(source.poll_interval_s or cap, cap))
     delay = min(
         base * (2 ** min(source.consecutive_failures - 1, 30)),
         settings.source_backoff_ceiling_s,
@@ -449,11 +499,14 @@ class PollTimeout(TimeoutError):
 
 
 def _poll_timeout_s(source: Source) -> float:
+    """The whole-fetch budget: ``meta.poll_timeout_s`` (per-source override), else
+    ``Settings.poll_timeout_s``."""
+    default = float(get_settings().poll_timeout_s)
     try:
-        value = float((source.meta or {}).get("poll_timeout_s") or POLL_TIMEOUT_S)
+        value = float((source.meta or {}).get("poll_timeout_s") or default)
     except (TypeError, ValueError):
-        value = POLL_TIMEOUT_S
-    return value if value > 0 else POLL_TIMEOUT_S
+        value = default
+    return value if value > 0 else default
 
 
 async def _fetch_bounded(w: BaseWatcher, source: Source) -> CanonicalDoc:
@@ -660,8 +713,29 @@ def tick(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
             scheduled.append(key)
     enqueue(session, JOB_TICK, {}, delay_s=settings.tick_interval_s, dedupe_key="tick")
     session.commit()
-    log.info("tick: %d sources due, scheduled=%s", len(due), scheduled or "-")
-    return {"polls_enqueued": len(due), "scheduled": scheduled}
+    requeued = requeue_stalled(session, now)
+    log.info(
+        "tick: %d sources due, scheduled=%s, open_issue requeued=%d",
+        len(due),
+        scheduled or "-",
+        requeued,
+    )
+    return {"polls_enqueued": len(due), "scheduled": scheduled, "issues_requeued": requeued}
+
+
+def requeue_stalled(session: Session, now: datetime | None = None) -> int:
+    """Once per tick: ``kintsua.matcher.match.requeue_stalled_issues`` (re-queues
+    ``open_issue`` for draft impacts whose last job ran out of attempts). Runs after the
+    tick's own work is committed and never raises: a matcher error is logged and rolled
+    back, so it can never stop the scheduler. Returns how many impacts were re-queued."""
+    try:
+        from kintsua.matcher.match import requeue_stalled_issues
+
+        return len(requeue_stalled_issues(session, now=now))
+    except Exception:  # noqa: BLE001 - the tick must go on
+        session.rollback()
+        log.exception("tick: requeue_stalled_issues failed; skipped this tick")
+        return 0
 
 
 def ensure_tick_job(session: Session) -> None:

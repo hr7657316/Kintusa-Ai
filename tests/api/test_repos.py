@@ -161,24 +161,22 @@ def test_add_source_creates_source_dependency_job_and_config(client, factory, se
     session.expire_all()
     assert len(session.get(Repo, repo.id).config["sources"]) == 1
 
-    # an MCP stdio command is recorded, but the hosted watcher never runs a customer's
-    # command line, so no poll is queued for it
+    # an MCP server URL is polled; its transport is recorded on the source and the entry
     r = client.post(
         f"/v1/repos/{repo.id}/sources",
-        json={"kind": "mcp", "command": "npx -y @modelcontextprotocol/server-filesystem /tmp"},
+        json={"kind": "mcp", "url": "https://mcp.vendor.example/mcp"},
     )
     assert r.status_code == 201, r.text
-    assert r.json()["polled"] is False and r.json()["poll_job_id"] is None
+    assert r.json()["polled"] is True
     mcp = session.get(Source, UUID(r.json()["source_id"]))
-    assert (
-        mcp.kind == "mcp" and mcp.locator == "npx -y @modelcontextprotocol/server-filesystem /tmp"
-    )
-    assert mcp.meta["transport"] == "stdio" and mcp.origin == "customer" and not mcp.trusted
-    assert len(factory.jobs("poll_source")) == 1
+    assert mcp.kind == "mcp" and mcp.locator == "https://mcp.vendor.example/mcp"
+    assert mcp.meta["transport"] == "http" and mcp.origin == "customer" and not mcp.trusted
+    assert len(factory.jobs("poll_source")) == 2
     session.expire_all()
     assert session.get(Repo, repo.id).config["sources"][1] == {
         "kind": "mcp",
-        "command": "npx -y @modelcontextprotocol/server-filesystem /tmp",
+        "url": "https://mcp.vendor.example/mcp",
+        "transport": "http",
     }
 
     # bad inputs
@@ -223,23 +221,28 @@ def test_add_source_ignores_caller_trust_flags_and_meta(client, factory, session
     org = factory.org()
     repo = factory.repo(org)
     mint_session(client)
+    flags = {
+        "origin": "seed",
+        "trusted": True,
+        "allow_stdio": True,
+        "meta": {"_net_guard": False, "trusted": True, "allow_stdio": True},
+        "_net_guard": False,
+    }
+    # a stdio command stays refused whatever the body claims
     r = client.post(
         f"/v1/repos/{repo.id}/sources",
-        json={
-            "kind": "mcp",
-            "command": "python -c 'import os; os.system(\"id\")'",
-            "origin": "seed",
-            "trusted": True,
-            "allow_stdio": True,
-            "meta": {"_net_guard": False, "trusted": True, "allow_stdio": True},
-            "_net_guard": False,
-        },
+        json={"kind": "mcp", "command": "python -c 'import os; os.system(\"id\")'", **flags},
+    )
+    assert r.status_code == 422, r.text
+    assert session.scalars(select(Source)).all() == []
+    r = client.post(
+        f"/v1/repos/{repo.id}/sources",
+        json={"kind": "mcp", "url": "https://mcp.vendor.example/mcp", **flags},
     )
     assert r.status_code == 201, r.text
     src = session.get(Source, UUID(r.json()["source_id"]))
     assert src.origin == "customer" and src.trusted is False and src.owner_org_id is None
-    assert set(src.meta) == {"configured_by", "transport", "quiet"}
-    assert factory.jobs("poll_source") == []
+    assert set(src.meta) == {"configured_by", "transport"}
     # the same holds for a URL source
     r = client.post(
         f"/v1/repos/{repo.id}/sources",

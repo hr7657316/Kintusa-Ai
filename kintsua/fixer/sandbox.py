@@ -14,7 +14,9 @@ Two backends share one interface (``Sandbox``):
     One container per job from ``settings.sandbox_image`` (Python 3.12, Node 20, git,
     pytest, ruff, uv, typescript) with ``mem_limit=settings.sandbox_memory`` and
     ``nano_cpus`` from ``settings.sandbox_cpus``. The container is destroyed in
-    ``cleanup``.
+    ``cleanup``; its command is a ``sleep`` bounded by the wall clock plus
+    ``MAIN_CONTAINER_SLACK_S``, so one a killed worker orphaned exits on its own, and every
+    container and volume carries the ``kintsua.job`` label the worker's reaper looks for.
 
     **Network trade-off.** Docker has no per-host egress allowlist. Rather than pretend
     one exists, the Docker backend splits the job into two kinds of step:
@@ -57,6 +59,7 @@ from __future__ import annotations
 import fnmatch
 import io
 import logging
+import math
 import os
 import re
 import shlex
@@ -91,6 +94,8 @@ log = logging.getLogger(__name__)
 _USERINFO_RE = re.compile(r"://[^/@\s]+@")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_RUN_TIMEOUT_S = 300.0
+#: the Docker backend's main container sleeps for the wall clock plus this, then exits
+MAIN_CONTAINER_SLACK_S = 300
 GIT_IDENTITY = {"name": "kintsua[bot]", "email": "bot@kintsua.dev"}
 #: Directories never listed, searched or read by the agent.
 IGNORED_DIRS: frozenset[str] = frozenset(
@@ -852,6 +857,12 @@ class DockerSandbox(Sandbox):
         env["KINTSUA_EGRESS_ALLOWLIST"] = ",".join(self.settings.sandbox_egress_allowlist)
         return env
 
+    def main_command(self) -> list[str]:
+        """The long-lived no-network container's command: a sleep bounded by the job's wall
+        clock plus ``MAIN_CONTAINER_SLACK_S``, so a container a killed worker orphaned exits
+        on its own (the worker's startup reaper removes it via the ``kintsua.job`` label)."""
+        return ["sleep", str(int(math.ceil(self.deadline.total_s)) + MAIN_CONTAINER_SLACK_S)]
+
     def prepare(self, clone_url: str, branch: str, *, sha: str | None = None) -> str:
         self.secrets = secrets_in_url(clone_url)
         self.volume = self.client.volumes.create(
@@ -876,7 +887,7 @@ class DockerSandbox(Sandbox):
             )
         self.container = self.client.containers.create(
             self.image,
-            command=["sleep", "infinity"],
+            command=self.main_command(),
             network_mode="none",
             working_dir=self.REPO_DIR,
             environment=self._env_base,

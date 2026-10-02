@@ -134,9 +134,22 @@ def _safe_href(url: str) -> str | None:
     return html.escape(url, quote=True) if _SAFE_HREF_RE.match(url) else None
 
 
+_BACKSLASH_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
+
+
 def render_inline(text: str) -> str:
-    """Escape, then code spans, links, bold and italic."""
-    escaped = html.escape(text, quote=False)
+    """Backslash escapes, then HTML-escape, then code spans, links, bold and italic.
+
+    A backslash before ASCII punctuation makes that character literal, as in CommonMark:
+    ``kintsua.report.markdown.md_escape`` relies on it so vendor text such as
+    ``[x](https://evil.example)`` or ``*bold*`` renders as plain characters."""
+    literals: list[str] = []
+
+    def _literal(m: re.Match[str]) -> str:
+        literals.append(m.group(1))
+        return f"\x01{len(literals) - 1}\x01"
+
+    escaped = html.escape(_BACKSLASH_ESCAPE_RE.sub(_literal, text), quote=False)
     spans: list[str] = []
 
     def _code(m: re.Match[str]) -> str:
@@ -154,7 +167,10 @@ def render_inline(text: str) -> str:
     out = _LINK_RE.sub(_link, out)
     out = _BOLD_RE.sub(r"<strong>\1</strong>", out)
     out = _ITALIC_RE.sub(r"<em>\1</em>", out)
-    return re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], out)
+    out = re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], out)
+    return re.sub(
+        r"\x01(\d+)\x01", lambda m: html.escape(literals[int(m.group(1))], quote=False), out
+    )
 
 
 def _split_row(line: str) -> list[str]:

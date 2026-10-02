@@ -23,6 +23,12 @@ SECRET_SAMPLES = [
     ("fetch https://user:SECRETPW@api.example.com/x failed", "SECRETPW"),
     ("git clone https://x-access-token:ghs_tok123@github.com/a/b.git", "ghs_tok123"),
     ("postgresql+psycopg://postgres:dev-pass@db:5432/kintsua", "dev-pass"),
+    # a Basic credential without its header name; private key spellings
+    ("echo: basic dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNzd29yZDEyMw=="),
+    ("upstream said Basic YWxhZGRpbjpvcGVuc2VzYW1l", "YWxhZGRpbjpvcGVuc2VzYW1l"),
+    ("private-key=MIIEvQIBADANBgkqhkiG9w0BAQEFAAS", "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"),
+    ('{"privateKey": "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"}', "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"),
+    ('{"private_key": "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"}', "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"),
     # still covered
     ("ghp_" + "a" * 36, "a" * 36),
     ("sk_live_" + "b" * 24, "b" * 24),
@@ -46,3 +52,13 @@ def test_redaction_keeps_the_url_host_and_plain_text():
     plain = "GET https://api.example.com:8443/v1/items?id=42 returned 500: Basic auth failed"
     assert redact_secrets(plain) == plain
     assert redact_secrets("kts_short") == "kts_short"  # the 12-char key prefix shown in the UI
+
+
+def test_basic_and_private_key_patterns_leave_prose_alone():
+    for prose in (
+        "basic authentication failed",
+        "Basic auth is not supported; see the private keys docs",
+        "a basic example",
+        "the privatekey field is required",
+    ):
+        assert redact_secrets(prose) == prose

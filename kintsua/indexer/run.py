@@ -46,13 +46,14 @@ from kintsua.indexer import mcp_config, python_extract, ts_extract
 from kintsua.indexer.clone import CloneError, clone_repo, read_repo_file, temp_clone_dir
 from kintsua.indexer.config import merge_api_settings, parse_kintsua_yml
 from kintsua.indexer.depmap import DependencyMap, dependency_map, render_install_issue
-from kintsua.indexer.resolve import resolve_dependencies
+from kintsua.indexer.resolve import is_private_locator, resolve_dependencies
 from kintsua.indexer.schema import (
     CallSiteInfo,
     DependencyInfo,
     ExtractResult,
     IndexBudgetExceeded,
 )
+from kintsua.watchers.run import SourceNotShareable, ensure_shareable
 
 log = logging.getLogger(__name__)
 
@@ -178,7 +179,9 @@ def known_tools_lookup(
     and is fetched (spawned) only when its ``Source`` row is operator-seeded
     (``Source.trusted``); otherwise only its snapshot is read. An http(s) URL of a source
     that is not trusted passes ``kintsua.core.netguard.check_url`` first (and every request
-    is guarded) when ``Settings.net_guard`` is on."""
+    is guarded) when ``Settings.net_guard`` is on. A private source (``push:`` /
+    ``observed:`` locator, or a row a repo may not share) is neither read nor fetched: its
+    tool names belong to another org or repo."""
     cache: dict[str, list[str] | None] = {}
     net_guard = bool(get_settings().net_guard)
 
@@ -186,7 +189,13 @@ def known_tools_lookup(
         if locator in cache:
             return cache[locator]
         names: list[str] | None = None
+        if is_private_locator(locator):
+            cache[locator] = None
+            return None
         src = session.scalar(select(Source).where(Source.kind == "mcp", Source.locator == locator))
+        if src is not None and not _shareable(src):
+            cache[locator] = None
+            return None
         if src is not None:
             snap = session.scalar(
                 select(Snapshot)
@@ -208,6 +217,16 @@ def known_tools_lookup(
         return names
 
     return lookup
+
+
+def _shareable(src: Source) -> bool:
+    """May a repo's indexer read ``src`` (not another org's pushed or a private observed
+    source; the rule of ``kintsua.watchers.run.ensure_shareable``)?"""
+    try:
+        ensure_shareable(src, origin="customer")
+    except SourceNotShareable:
+        return False
+    return True
 
 
 def _live_fetch_meta(locator: str, src: Source | None, *, net_guard: bool) -> dict[str, Any] | None:
@@ -318,6 +337,16 @@ def write_index(
         key = dep.key
         meta = _jsonable_meta(dep)
         row = existing.get(key)
+        if (
+            row is not None
+            and row.discovered_at_runtime
+            and row.source_id is not None
+            and dep.source_id is None
+            and is_private_locator(dep.name)
+        ):
+            # the repo names its own org's pushed source: the push owns that row
+            rows[key] = row
+            continue
         if row is None:
             row = Dependency(
                 repo_id=repo.id,

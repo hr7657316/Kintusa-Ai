@@ -2,11 +2,15 @@
 
 * ``GET  /v1/repos/{id}/dependencies`` - the dependency map (``kintsua.indexer.depmap``).
 * ``GET  /v1/repos/{id}/changes``      - impacts with their change event / classification.
-* ``POST /v1/repos/{id}/sources``      - add a spec / changelog URL or an MCP server
-  (``origin="customer"``; a stdio command is recorded but never run by the hosted watcher)
-  and queue a re-index so the new source's ``hosts`` pick up existing call sites.
+* ``POST /v1/repos/{id}/sources``      - add a spec / changelog URL or an MCP server URL
+  (``origin="customer"``; ``transport`` http | sse, guessed from a ``/sse`` path) and queue a
+  re-index so the new source's ``hosts`` pick up existing call sites. A stdio MCP command is
+  refused with a 422 (the hosted watcher never runs a customer's command line; push it from
+  CI with ``kintsua watch --push``) unless it names an operator-seeded source. A locator
+  that belongs to a pushed / synthetic / org-owned source (``SourceNotShareable``) is a 422.
 * ``POST /v1/repos/{id}/mute``, ``DELETE ...?pattern=`` - mute patterns (open impacts that
-  are now fully muted are dismissed with a comment on their issue).
+  are now fully muted, by the same rules the matcher suppresses with, are dismissed with a
+  comment on their issue).
 * ``POST /v1/repos/{id}/fix-mode``     - ``pr`` | ``issue_only``.
 * ``POST /v1/repos/{id}/issues/open``  - turn a draft impact (or all drafts) into a GitHub
   issue; this is how a human reviews drafts while ``auto_issue`` is off.
@@ -18,14 +22,16 @@ The ``async`` routes only await the request body; the database and GitHub work r
 threadpool (``run_in_threadpool``) so it never blocks the event loop.
 
 Values set here are written to the ``Repo.config`` keys the other components read
-(``sources`` / ``mute`` / ``fix``) and remembered under ``Repo.config["settings"]``, which the
-indexer keeps across re-indexes so it can merge them back after parsing ``.kintsua.yml``.
+(``sources`` / ``mute`` / ``fix``) and remembered under ``Repo.config[API_SETTINGS_KEY]``
+(``kintsua.indexer.config``), which the indexer keeps across re-indexes so it can merge them
+back after parsing ``.kintsua.yml`` (``merge_api_settings``).
 """
 
 from __future__ import annotations
 
 import logging
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -52,13 +58,13 @@ from kintsua.core.models import (
 from kintsua.core.netguard import is_http_locator
 from kintsua.core.queue import JOB_POLL_SOURCE, enqueue
 from kintsua.core.util import utcnow
-from kintsua.indexer.config import effective_fix_mode
+from kintsua.indexer.config import API_SETTINGS_KEY, effective_fix_mode
 from kintsua.indexer.depmap import dependency_map
 from kintsua.indexer.run import enqueue_index_repo
 from kintsua.matcher.issues import close_impact_issue, create_issue_for_impact
-from kintsua.matcher.match import maybe_enqueue_fix, open_issues_for_pending
+from kintsua.matcher.match import PACKAGE_KINDS, maybe_enqueue_fix, open_issues_for_pending
 from kintsua.matcher.mute import is_muted
-from kintsua.watchers.run import find_or_create_source
+from kintsua.watchers.run import SourceNotShareable, find_or_create_source
 
 log = logging.getLogger(__name__)
 
@@ -66,11 +72,15 @@ router = APIRouter(prefix="/v1/repos", tags=["repos"])
 
 ACTIVE_IMPACT_STATUSES: tuple[str, ...] = ("detected", "issued", "fixing", "pr_open")
 DEFAULT_CHANGES_LIMIT = 50
-SETTINGS_KEY = "settings"  # Repo.config[SETTINGS_KEY]: what the settings API set, by key
-# a repo may only be attached to sources of these origins (pushed and synthetic sources are
-# private to the org / repo that produced them)
-ATTACHABLE_ORIGINS: tuple[str, ...] = ("seed", "customer", "runtime")
 SOURCE_REINDEX_DELAY_S = 60
+STDIO_REFUSED = (
+    "stdio MCP servers are not run by the hosted watcher; use a remote URL or "
+    "kintsua watch --push from CI"
+)
+NOT_SHAREABLE = (
+    "this locator belongs to a pushed, synthetic or another organisation's source and cannot "
+    "be added"
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -100,18 +110,18 @@ def _entry_locator(entry: dict[str, Any]) -> str | None:
 
 
 def remember_setting(cfg: dict[str, Any], key: str, value: Any) -> None:
-    """Record an API-set value under ``cfg["settings"]`` (``None`` forgets it)."""
-    current = cfg.get(SETTINGS_KEY)
+    """Record an API-set value under ``cfg[API_SETTINGS_KEY]`` (``None`` forgets it)."""
+    current = cfg.get(API_SETTINGS_KEY)
     saved = dict(current) if isinstance(current, dict) else {}
     if value is None:
         saved.pop(key, None)
     else:
         saved[key] = value
-    cfg[SETTINGS_KEY] = saved
+    cfg[API_SETTINGS_KEY] = saved
 
 
 def saved_settings(repo: Repo) -> dict[str, Any]:
-    saved = (repo.config or {}).get(SETTINGS_KEY)
+    saved = (repo.config or {}).get(API_SETTINGS_KEY)
     return dict(saved) if isinstance(saved, dict) else {}
 
 
@@ -246,29 +256,35 @@ def hosted_watcher_polls(source: Source) -> bool:
 
 
 def add_source(session: Session, repo: Repo, body: AddSourceBody) -> dict[str, Any]:
+    """Attach ``body``'s source to ``repo`` (``origin="customer"`` when created).
+
+    422 for an MCP stdio command unless it names an operator-seeded (trusted) source: the
+    hosted watcher would only deactivate it (CONTRACTS, Source trust, rule 2). 422 when
+    ``find_or_create_source`` raises ``SourceNotShareable`` (a pushed / observed / org-owned
+    row under that locator)."""
     assert body.locator is not None
-    existing = session.scalar(
-        select(Source).where(Source.kind == body.kind, Source.locator == body.locator)
-    )
-    if existing is not None and existing.origin not in ATTACHABLE_ORIGINS:
-        raise HTTPException(
-            status_code=422,
-            detail="this locator belongs to a pushed or synthetic source and cannot be added",
+    if body.kind == "mcp" and not is_http_locator(body.locator):
+        existing = session.scalar(
+            select(Source).where(Source.kind == body.kind, Source.locator == body.locator)
         )
+        if existing is None or not existing.trusted:
+            raise HTTPException(status_code=422, detail=STDIO_REFUSED)
     # built here only: nothing the caller sends becomes source meta, origin or a trust flag
     meta: dict[str, Any] = {"configured_by": "settings"}
     if body.transport:
         meta["transport"] = body.transport
-        if body.transport == "stdio":
-            meta["quiet"] = True
-    source = find_or_create_source(
-        session,
-        body.kind,
-        body.locator,
-        display_name=body.display_name,
-        meta=meta,
-        origin="customer",
-    )
+    try:
+        source = find_or_create_source(
+            session,
+            body.kind,
+            body.locator,
+            display_name=body.display_name,
+            meta=meta,
+            origin="customer",
+        )
+    except SourceNotShareable as e:
+        log.info("add source %s %s refused for %s: %s", body.kind, body.locator, repo.full_name, e)
+        raise HTTPException(status_code=422, detail=NOT_SHAREABLE)
     polled = hosted_watcher_polls(source)
     if polled and not source.active and source.origin in ("customer", "runtime"):
         source.active = True
@@ -382,16 +398,49 @@ def _impact_vendor(session: Session, impact: Impact) -> str | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _MuteCandidate:
+    """One thing a mute pattern has to cover: a matched call site (or an affected path)."""
+
+    vendor: str | None
+    operation: str
+    tool: bool = False  # a call site of an ``mcp`` dependency: the operation is a tool name
+    package: str | None = None  # the package of a ``pypi`` / ``npm`` dependency's call site
+
+    def muted_by(self, patterns: list[str]) -> bool:
+        """The matcher's rule (``kintsua.matcher.match.match_call_sites``): the operation,
+        as a tool name for an ``mcp`` dependency, or ``package:<name>`` for a package."""
+        if is_muted(patterns, self.vendor, self.operation, tool=self.tool):
+            return True
+        return self.package is not None and is_muted(
+            patterns, self.vendor, f"package:{self.package}"
+        )
+
+
+def _site_candidate(site: dict[str, Any], vendor: str | None) -> _MuteCandidate:
+    kind = site.get("dependency_kind")
+    package = str(site["dependency"]) if kind in PACKAGE_KINDS and site.get("dependency") else None
+    return _MuteCandidate(
+        str(site.get("vendor") or vendor or "") or None,
+        str(site["operation"]),
+        tool=kind == "mcp",
+        package=package,
+    )
+
+
 def muting_pattern(session: Session, impact: Impact, patterns: list[str]) -> str | None:
     """The pattern that mutes every matched call site of ``impact`` (or its affected paths
-    when it has none), else None."""
+    when it has none), else None. A site is muted exactly when the matcher would have
+    suppressed it: ``tool:`` patterns apply to the sites of ``mcp`` dependencies, and
+    ``package:<name>`` patterns to the sites of ``pypi`` / ``npm`` dependencies."""
     if not patterns:
         return None
     vendor = _impact_vendor(session, impact)
-    candidates: list[tuple[str | None, str]] = []
-    for site in impact.matched_call_sites or []:
-        if isinstance(site, dict) and site.get("operation"):
-            candidates.append((str(site.get("vendor") or vendor or ""), str(site["operation"])))
+    candidates: list[_MuteCandidate] = [
+        _site_candidate(site, vendor)
+        for site in impact.matched_call_sites or []
+        if isinstance(site, dict) and site.get("operation")
+    ]
     if not candidates:
         cls = (
             session.get(Classification, impact.classification_id)
@@ -399,12 +448,12 @@ def muting_pattern(session: Session, impact: Impact, patterns: list[str]) -> str
             else None
         )
         paths = [str(p) for p in (cls.affected_paths or [])] if cls is not None else []
-        candidates = [(vendor, p) for p in paths] or [(vendor, "*")]
-    if not all(is_muted(patterns, v or None, op) for v, op in candidates):
+        candidates = [_MuteCandidate(vendor, p) for p in paths] or [_MuteCandidate(vendor, "*")]
+    if not all(c.muted_by(patterns) for c in candidates):
         return None
     # name the single pattern that covers everything when there is one, else the first
     for pattern in patterns:
-        if all(is_muted([pattern], v or None, op) for v, op in candidates):
+        if all(c.muted_by([pattern]) for c in candidates):
             return pattern
     return patterns[0]
 
@@ -651,8 +700,8 @@ def delete_data(
 
 __all__ = [
     "ACTIVE_IMPACT_STATUSES",
-    "ATTACHABLE_ORIGINS",
-    "SETTINGS_KEY",
+    "NOT_SHAREABLE",
+    "STDIO_REFUSED",
     "add_source",
     "change_entries",
     "config_sources",
