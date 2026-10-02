@@ -258,7 +258,9 @@ def test_added_credential_line_is_refused(sandbox: LocalSandbox, settings, data_
         {
             "path": "agent/billing.py",
             "old": "        source=source,\n",
-            "new": '        payment_method=source,\n        api_key="sk_live_abcdefghijk",\n',
+            "new": (
+                '        payment_method=source,\n        api_key="sk_live_a' + 'bcdefghijk",\n'
+            ),
         }
     )[0]
     verdict = validate(

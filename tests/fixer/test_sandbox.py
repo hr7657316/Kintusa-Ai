@@ -102,9 +102,9 @@ def test_scrub_removes_tokens_from_output_and_logs(sandbox: LocalSandbox):
     assert "***" in res.stdout
     assert all("ghs_fake_token_12345" not in line for line in sandbox.log_lines)
     assert secrets_in_url("https://x-access-token:abc123456@github.com/a/b.git") == ("abc123456",)
-    scrubbed = scrub("token=ghp_abcdefghijklmnopqrstuvwxyz0123", ())
+    scrubbed = scrub(("token=ghp_abcdefghijklm" + "nopqrstuvwxyz0123"), ())
     assert "ghp_" not in scrubbed and "[REDACTED]" in scrubbed
-    raw = scrub("token=ghp_abcdefghijklmnopqrstuvwxyz0123", (), generic=False)
+    raw = scrub(("token=ghp_abcdefghijklm" + "nopqrstuvwxyz0123"), (), generic=False)
     assert raw.startswith("token=ghp_")
 
 
