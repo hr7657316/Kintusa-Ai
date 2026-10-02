@@ -173,3 +173,41 @@ the SDK; the server redacts again with `redact_secrets`).
 * The full suite must stay under 10 minutes. Mark anything slower than ~20 s `slow`.
 * Docker is not available in CI or the dev box: the fixer's `LocalSandbox` runs the same
   steps in a temp directory with the same interface; tests use it.
+
+## Source trust, privacy and the network guard
+
+Every `source` row carries `origin` (`kintsua.core.models.SOURCE_ORIGINS`) and, for pushed
+snapshots, `owner_org_id`. The origin decides what the hosted worker may do with a row; the
+model exposes it as `Source.trusted`, `Source.public` and `Source.pollable`.
+
+| origin | created by | worker may spawn its stdio command | network guard on fetch | public weekly report | polled |
+|---|---|---|---|---|---|
+| `seed` | `kintsua/seed` loader; also sources derived from the curated `indexer/sdk_map.py` (registry sources for curated packages, curated vendor spec/changelog URLs) | yes | no | yes | yes |
+| `customer` | `.kintsua.yml`, repo MCP configs, raw HTTP hosts, declared non-curated packages, `POST /v1/repos/{id}/sources` | **never** | yes | no | yes (http(s) and registries only) |
+| `push` | `POST /v1/watch/push` | never | n/a | no | **never** (the push is the snapshot) |
+| `runtime` | `matcher/runtime.py` discovery | never | yes | no | yes (http(s) only) |
+| `observed` | runtime promotion (`observed:<repo>:<tool>`) | never | n/a | no | never |
+
+Rules every component follows:
+
+1. `find_or_create_source(..., origin=..., owner_org_id=...)` sets the origin only when it
+   creates the row; an existing row keeps its origin (a customer naming a seeded locator
+   gets the seeded row, unchanged). Only the seed loader promotes a row to `seed`.
+2. The hosted worker never executes a command line that came from a customer, a repo, a push
+   or a runtime sample. An `mcp` source whose locator is not http(s) is fetched only when
+   `source.trusted`; otherwise `poll_source` records a clear `last_error`, sets
+   `active=False` and spawns nothing. The indexer never calls `fetch_tools` for such a
+   locator (it may read tool names from an existing snapshot).
+3. Every fetch for a non-`seed` source goes through `kintsua.core.netguard` when
+   `Settings.net_guard` is on: `check_url(url)` before the first request and
+   `request_hook` / `async_request_hook` in httpx `event_hooks["request"]` so every redirect
+   hop is checked. `watchers.run.source_ref_for` passes this to the adapters as
+   `SourceRef.meta["_net_guard"] = True` (never persisted). A blocked URL is recorded as the
+   source's `last_error`.
+4. Pushed snapshots are org-scoped: `POST /v1/watch/push` stores them on a source with
+   `origin="push"`, `owner_org_id=<org>`, locator `push:<org_id>:<kind>:<locator>` and
+   `meta.pushed_locator=<locator>`; the dependency row of the pushing org's repo points at it.
+   A push never writes a snapshot or change event onto a source another org depends on.
+5. The public weekly report (`GET /report/weekly`, the `weekly_report` job) includes only
+   `Source.public` sources, never repo names, issue or PR links of customer repos, and runs
+   every error string through `redact_secrets`. Operator CLIs may build an unfiltered report.

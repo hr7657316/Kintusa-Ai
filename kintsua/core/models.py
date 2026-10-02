@@ -37,6 +37,15 @@ RUNTIME_OUTCOMES = ("ok", "error", "schema_mismatch")
 JOB_STATUSES = ("queued", "running", "done", "failed")
 DEPENDENCY_KINDS = ("openapi", "mcp", "pypi", "npm", "http")
 PLANS = ("free", "pro")
+# Where a source row came from. It decides what the hosted worker may do with it:
+#   seed      operator-curated (kintsua/seed/sources.yml): may run stdio commands, no network
+#             guard, appears on the public weekly report
+#   customer  added through .kintsua.yml, the settings API or the indexer: http(s) only, fetched
+#             through kintsua.core.netguard, private to the repos that depend on it
+#   push      snapshots pushed by `kintsua watch --push`: org-scoped (owner_org_id), never polled
+#   runtime   discovered by the runtime SDK: http(s) only, network-guarded, private
+#   observed  synthetic source for runtime-promoted change events: never polled, private
+SOURCE_ORIGINS = ("seed", "customer", "push", "runtime", "observed")
 FIX_MODES = ("pr", "issue_only")
 
 
@@ -121,8 +130,14 @@ class Source(Base):
     )  # openapi | mcp | pypi | npm | changelog
     # spec URL | MCP server URL or stdio command | package name | page URL
     locator: Mapped[str] = mapped_column(Text, nullable=False)
-    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
     vendor: Mapped[str | None] = mapped_column(String(128))  # "stripe", "slack" ... for grouping
+    origin: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="customer", server_default="customer"
+    )  # see SOURCE_ORIGINS
+    owner_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("org.id", ondelete="CASCADE")
+    )  # set for origin "push": the only org whose repos may depend on it
     poll_interval_s: Mapped[int] = mapped_column(Integer, nullable=False, default=6 * 3600)
     last_polled_at: Mapped[datetime | None] = _ts()
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -135,6 +150,21 @@ class Source(Base):
     created_at: Mapped[datetime] = _created_at()
 
     snapshots: Mapped[list[Snapshot]] = relationship(back_populates="source")
+
+    @property
+    def trusted(self) -> bool:
+        """Operator-seeded: the worker may spawn its stdio command and skip the net guard."""
+        return self.origin == "seed"
+
+    @property
+    def public(self) -> bool:
+        """May appear (name, locator, errors, changes) on the public weekly report."""
+        return self.origin == "seed"
+
+    @property
+    def pollable(self) -> bool:
+        """The hosted watcher polls it (pushed and synthetic sources are never polled)."""
+        return self.origin not in ("push", "observed")
 
 
 class Snapshot(Base):
