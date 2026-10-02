@@ -48,7 +48,7 @@ from sqlalchemy.orm import Session
 
 from kintsua.core.config import get_settings
 from kintsua.core.events import CanonicalDoc, ChangeEvent, canonical_json
-from kintsua.core.models import SOURCE_KINDS, ChangeEventRow, Job, Snapshot, Source
+from kintsua.core.models import SOURCE_KINDS, SOURCE_ORIGINS, ChangeEventRow, Job, Snapshot, Source
 from kintsua.core.queue import (
     JOB_BILLING_TICK,
     JOB_CLASSIFY_EVENT,
@@ -120,9 +120,15 @@ def find_or_create_source(
     vendor: str | None = None,
     meta: dict[str, Any] | None = None,
     poll_interval_s: int | None = None,
+    origin: str = "customer",
+    owner_org_id: Any = None,
 ) -> Source:
     """Unique on (kind, locator). An existing row is returned as-is except that missing
-    display_name / vendor / meta keys are filled in (never overwritten)."""
+    display_name / vendor / meta keys are filled in (never overwritten).
+
+    ``origin`` (see ``kintsua.core.models.SOURCE_ORIGINS``) is set only when the row is
+    created; an existing row keeps its origin, so a customer can never upgrade a source to
+    ``seed`` by naming the same locator. Only the seed loader promotes rows to ``seed``."""
     if kind not in SOURCE_KINDS:
         raise ValueError(f"unknown source kind {kind!r}")
     locator = locator.strip()
@@ -139,6 +145,8 @@ def find_or_create_source(
             if merged != (row.meta or {}):
                 row.meta = merged
         return row
+    if origin not in SOURCE_ORIGINS:
+        raise ValueError(f"unknown source origin {origin!r}")
     row = Source(
         kind=kind,
         locator=locator,
@@ -146,6 +154,8 @@ def find_or_create_source(
         vendor=vendor,
         meta=dict(meta or {}),
         poll_interval_s=poll_interval_s or default_poll_interval(kind, meta),
+        origin=origin,
+        owner_org_id=owner_org_id,
     )
     try:
         with session.begin_nested():

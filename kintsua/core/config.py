@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     tick_interval_s: int = 15 * 60
     source_backoff_ceiling_s: int = 48 * 3600
     poll_http_timeout_s: float = 60.0
+    # apply kintsua.core.netguard to every non-seed source fetch (SSRF protection)
+    net_guard: bool = True
     user_agent: str = "kintsua-watcher/0.1 (+https://github.com/hr7657316/Kintusa-Ai)"
 
     # --- indexer -----------------------------------------------------------------

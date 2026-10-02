@@ -114,8 +114,15 @@ def world(session, fake_github, fake_llm, settings, monkeypatch, tmp_path):
     )
     session.add(repo)
     session.flush()
+    # a stdio command: only operator-seeded sources may be spawned by the hosted worker
     source = find_or_create_source(
-        session, "mcp", LOCATOR, display_name="Weather MCP", vendor="weather", meta=_meta("v1")
+        session,
+        "mcp",
+        LOCATOR,
+        display_name="Weather MCP",
+        vendor="weather",
+        meta=_meta("v1"),
+        origin="seed",
     )
     dep = Dependency(
         repo_id=repo.id,

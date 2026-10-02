@@ -2,7 +2,9 @@
 
 The loader upserts by ``(kind, locator)``: new entries are inserted, existing rows get their
 display_name / vendor / poll_interval_s refreshed and their ``meta`` merged (seed keys win,
-other keys are preserved). It never deletes or deactivates anything. ``--dry-run`` reports
+other keys are preserved). Every seeded row gets ``origin = "seed"``: the operator's sources
+are the only ones the worker may run as stdio commands and the only ones on the public
+weekly report. It never deletes or deactivates anything. ``--dry-run`` reports
 what would change without writing.
 """
 
@@ -115,6 +117,8 @@ def upsert_sources(
                         vendor=e.vendor,
                         poll_interval_s=e.effective_interval,
                         meta=dict(e.meta),
+                        origin="seed",
+                        owner_org_id=None,
                     )
                 )
             continue
@@ -128,6 +132,11 @@ def upsert_sources(
         merged_meta = {**(row.meta or {}), **e.meta}
         if merged_meta != (row.meta or {}):
             changes["meta"] = merged_meta
+        # the seed file is the operator's list: its rows are trusted and public, even if a
+        # customer happened to add the same locator first
+        if row.origin != "seed":
+            changes["origin"] = "seed"
+            changes["owner_org_id"] = None
         if not changes:
             result.unchanged.append(label)
             continue
