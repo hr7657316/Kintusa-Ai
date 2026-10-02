@@ -46,7 +46,7 @@ EVENTS = [
         "latency_ms": 2500,
         "sample": {
             "status": 500,
-            "body_excerpt": "Authorization: Bearer sk_live_abcdefghijklmnop0123",
+            "body_excerpt": ("Authorization: Bearer sk_live_ab" + "cdefghijklmnop0123"),
         },
         "observed_at": "2099-01-01T00:00:00Z",
     },

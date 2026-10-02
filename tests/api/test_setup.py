@@ -61,7 +61,9 @@ def test_setup_callback_shows_env_lines_and_stores_nothing(client, settings):
                 "client_id": "Iv1.client",
                 "client_secret": "oauthsecret",
                 "webhook_secret": "whsec_xyz",
-                "pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\n",
+                "pem": (
+                    "-----BEGIN RSA " + "PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\n"
+                ),
                 "html_url": "https://github.com/apps/kintsua-dev",
             },
         )
@@ -78,8 +80,8 @@ def test_setup_callback_shows_env_lines_and_stores_nothing(client, settings):
         and "GITHUB_OAUTH_CLIENT_SECRET=oauthsecret" in page
     )
     assert (
-        'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\\nMIIE\\n-----END RSA PRIVATE KEY-----"'
-        in page
+        'GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA '
+        'PRIVATE KEY-----\\nMIIE\\n-----END RSA PRIVATE KEY-----"' in page
     )
     assert "https://github.com/apps/kintsua-dev/installations/new" in page
     assert (

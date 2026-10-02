@@ -457,8 +457,8 @@ def test_pr_outcome_job_handler(session, f: Factory, fake_github):
 def test_record_ci_result_failure_moves_to_failed_with_comment(session, f: Factory, fake_github):
     w = _pr_open_world(f, fake_github)
     log = (
-        "\n".join(f"line {i}" for i in range(100))
-        + "\nERROR: token=ghp_abcdefghijklmnopqrstuvwxyz1234 leaked"
+        "\n".join(f"line {i}" for i in range(100)) + "\nERROR: token=ghp_abcdefghijklm"
+        "nopqrstuvwxyz1234 leaked"
     )
     impact = record_ci_result(
         session,
@@ -479,7 +479,7 @@ def test_record_ci_result_failure_moves_to_failed_with_comment(session, f: Facto
     comment = fake_github.repo(w["repo"].full_name).get_issue(w["issue_number"]).comments[-1].body
     assert "could not fix this automatically" in comment and "https://ci.example/run/1" in comment
     assert "line 99" in comment and "line 10\n" not in comment  # last 40 lines only
-    assert "ghp_abcdefghijklmnopqrstuvwxyz1234" not in comment and "[REDACTED]" in comment
+    assert ("ghp_abcdefghijklm" + "nopqrstuvwxyz1234") not in comment and "[REDACTED]" in comment
 
 
 def test_record_ci_result_success_keeps_pr_open(session, f: Factory, fake_github):

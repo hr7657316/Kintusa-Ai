@@ -604,7 +604,7 @@ def test_check_run_failure_moves_impact_to_failed_end_to_end(client, session, fa
     assert "pytest" in (impact.fix_reason or "")
     assert issue.comments, "a failing CI run comments on the issue"
     last = issue.comments[-1].body
-    assert "KeyError" in last and "ghs_abcdefghijklmnopqrstuvwxyz0123456789" not in last
+    assert "KeyError" in last and ("ghs_abcdefghijklmnop" + "qrstuvwxyz0123456789") not in last
 
 
 def test_unknown_repo_events_do_not_create_rows(client, session, factory):

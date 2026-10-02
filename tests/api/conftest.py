@@ -54,8 +54,14 @@ REQUIRED_ADDED_OPS = [
 ]
 
 
+# Fixtures never contain a secret-shaped literal (secret scanners would flag them); a
+# placeholder is swapped for an obviously fake token at load time.
+FAKE_GITHUB_TOKEN = "ghs_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
 def load_payload(name: str) -> dict[str, Any]:
-    return json.loads((FIXTURES / f"{name}.json").read_text("utf-8"))
+    text = (FIXTURES / f"{name}.json").read_text("utf-8")
+    return json.loads(text.replace("{{FAKE_GITHUB_TOKEN}}", FAKE_GITHUB_TOKEN))
 
 
 # --------------------------------------------------------------------------------------

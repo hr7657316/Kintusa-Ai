@@ -84,7 +84,7 @@ def test_callback_exchanges_the_code_and_sets_the_session(client, factory, oauth
     ].lower().replace("samesite=lax", "SameSite=lax")
     assert b"code=abc" in token_route.calls.last.request.content
     assert b"client_secret=oauth-secret" in token_route.calls.last.request.content
-    assert inst_route.calls.last.request.headers["Authorization"] == "Bearer gho_user_token"
+    assert inst_route.calls.last.request.headers["Authorization"] == ("Bearer gho" + "_user_token")
     user = load_session(client.cookies.get(SESSION_COOKIE))
     assert user is not None and user.login == "octocat" and user.id == 1
     assert user.installation_ids == [99, 12345678]

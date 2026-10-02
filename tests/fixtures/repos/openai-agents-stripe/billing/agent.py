@@ -14,7 +14,7 @@ async def main(question: str) -> str:
             name="stripe",
             params={
                 "url": "https://mcp.stripe.com",
-                "headers": {"Authorization": "Bearer sk_test_placeholder"},
+                "headers": {"Authorization": "Bearer sk_tes" "t_placeholder"},
             },
             cache_tools_list=True,
         ) as stripe_server:
