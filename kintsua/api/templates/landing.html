@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Kintsua · self-maintaining integrations for AI agents{% endblock %}
+{% block content %}
+<section class="hero">
+  <h1>Your agent's integrations, kept working.</h1>
+  {% for s in sentences %}
+  <p class="lead">{{ s }}</p>
+  {% endfor %}
+  <p class="cta">
+    <a class="button primary" href="{{ install_url }}">Install the GitHub App</a>
+    <a class="button" href="/report/weekly">Read this week's drift report</a>
+  </p>
+  <p class="pricing" id="pricing">{{ pricing_line }}</p>
+</section>
+
+<section class="grid">
+  <div>
+    <h2>How it works</h2>
+    <ol class="steps">
+      <li><strong>Install</strong> the GitHub App on a repo. Within an hour you get an issue with the dependency map: every API, SDK and MCP server the code calls, watched or not.</li>
+      <li><strong>Watch.</strong> Specs, MCP servers, package registries and changelogs are polled daily. A breaking change becomes a GitHub issue naming the files and lines in your repo that it hits.</li>
+      <li><strong>Fix.</strong> With <code>fix.mode: pr</code> Kintsua opens a branch, patches the call sites in a sandbox, runs your tests and opens a PR only when they pass.</li>
+    </ol>
+  </div>
+  <div>
+    <h2>Watch MCP servers from CI, no account needed</h2>
+    <pre><code>{{ cli_snippet }}</code></pre>
+    <p>Add <code>--push</code> to send snapshots to your account and get issues and PRs without running CI.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Privacy defaults</h2>
+  <p id="privacy">{{ privacy }}</p>
+</section>
+
+<section class="subscribe">
+  <h2>The weekly drift report</h2>
+  <p>Every breaking change detected across the watched APIs and MCP servers, every Monday. <a href="/report/weekly">Read the latest</a> or subscribe:</p>
+  <form hx-post="/report/subscribe" hx-target="#subscribe-result" hx-swap="innerHTML" method="post" action="/report/subscribe" class="row">
+    <input type="email" name="email" placeholder="you@company.com" required>
+    <button class="button primary" type="submit">Subscribe</button>
+  </form>
+  <div id="subscribe-result"></div>
+</section>
+{% endblock %}

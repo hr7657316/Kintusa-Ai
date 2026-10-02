@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Settings · Kintsua{% endblock %}
+{% block content %}
+<h1>Your repos</h1>
+{% if billing == "success" %}
+<div class="notice notice-ok">Thanks! Your subscription is active as soon as Stripe confirms the payment.</div>
+{% elif billing == "cancelled" %}
+<div class="notice notice-warn">Checkout cancelled. You are still on the free plan.</div>
+{% endif %}
+{% if not orgs %}
+<div class="notice notice-warn">
+  <p>No installation is visible to this session yet.</p>
+  <p><a class="button primary" href="{{ install_url }}">Install the GitHub App</a> on a repo, then sign in again.</p>
+</div>
+{% endif %}
+{% for row in orgs %}
+<section class="org">
+  <h2>{{ row.org.name }} <span class="badge plan-{{ row.org.plan }}">{{ row.org.plan }}</span>
+    {% if not row.org.active %}<span class="badge grey">inactive</span>{% endif %}</h2>
+  <p class="muted">{{ row.watched }} watched integration(s) · SDK key {% if row.key.has_key %}<code>{{ row.key.prefix }}…</code> created {{ row.key.created_at[:10] }}{% else %}not created yet{% endif %}
+    {% if billing_enabled and row.org.plan != "pro" %} · <button class="link" hx-post="/v1/billing/checkout" hx-vals='{"org_id": "{{ row.org.id }}"}' hx-swap="none">Upgrade to Pro</button>{% endif %}</p>
+  {% if row.repos %}
+  <table>
+    <thead><tr><th>Repo</th><th>Default branch</th><th>Indexed</th><th>Status</th></tr></thead>
+    <tbody>
+    {% for repo in row.repos %}
+    <tr>
+      <td><a href="/settings/{{ repo.full_name }}">{{ repo.full_name }}</a>{% if repo.private %} <span class="badge grey">private</span>{% endif %}</td>
+      <td><code>{{ repo.default_branch }}</code></td>
+      <td>{% if repo.indexed_at %}{{ repo.indexed_at | dt }}{% else %}<span class="muted">not yet</span>{% endif %}</td>
+      <td>{% if repo.active %}<span class="badge watched">active</span>{% else %}<span class="badge grey">inactive</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No repos in this installation. <a href="{{ install_url }}">Add some.</a></p>
+  {% endif %}
+</section>
+{% endfor %}
+<p class="muted">{{ pricing_line }}</p>
+{% endblock %}

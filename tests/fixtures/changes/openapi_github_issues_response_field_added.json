@@ -1,0 +1,32 @@
+{
+  "name": "openapi_github_issues_response_field_added",
+  "display_name": null,
+  "event": {
+    "source_id": "33333333-3333-4333-8333-333333333333",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "added",
+        "path": "/paths/~1repos~1{owner}~1{repo}~1issues/get/responses/200/content/application~1json/schema/items/properties/reactions",
+        "before": null,
+        "after": {
+          "$ref": "#/components/schemas/reaction-rollup"
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "safe",
+    "category": "behaviour"
+  },
+  "rule_hits_expected": [
+    "added_optional"
+  ],
+  "affected_paths_expected": [
+    "GET /repos/{owner}/{repo}/issues"
+  ]
+}

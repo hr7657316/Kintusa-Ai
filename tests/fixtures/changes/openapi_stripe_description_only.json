@@ -1,0 +1,30 @@
+{
+  "name": "openapi_stripe_description_only",
+  "display_name": "Stripe API",
+  "event": {
+    "source_id": "11111111-1111-4111-8111-111111111111",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/paths/~1v1~1charges/post/description",
+        "before": "<p>Use the Payment Intents API to initiate a new payment.</p>",
+        "after": "<p>This method is no longer recommended. Use the Payment Intents API to initiate a new payment instead.</p>"
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "unknown",
+    "category": "docs_only"
+  },
+  "rule_hits_expected": [
+    "text_only"
+  ],
+  "affected_paths_expected": [
+    "POST /v1/charges"
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "name": "mcp_weather_tool_input_required_added",
+  "display_name": "Weather MCP",
+  "event": {
+    "source_id": "44444444-4444-4444-8444-444444444444",
+    "source_kind": "mcp",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "required_added",
+        "path": "/tools/get_weather/inputSchema/required",
+        "before": [
+          "location"
+        ],
+        "after": [
+          "location",
+          "units"
+        ]
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "required_param"
+  },
+  "rule_hits_expected": [
+    "required_added"
+  ],
+  "affected_paths_expected": [
+    "tool:get_weather"
+  ],
+  "migration_hint_contains": "units"
+}

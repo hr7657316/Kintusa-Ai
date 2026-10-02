@@ -1,0 +1,34 @@
+{
+  "name": "openapi_github_issues_operation_deprecated",
+  "display_name": null,
+  "event": {
+    "source_id": "33333333-3333-4333-8333-333333333333",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "deprecated",
+        "path": "/paths/~1repos~1{owner}~1{repo}~1issues~1{issue_number}~1reactions/get",
+        "before": null,
+        "after": {
+          "deprecated": true,
+          "x-sunset": "2027-03-01"
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "degraded",
+    "category": "deprecation"
+  },
+  "rule_hits_expected": [
+    "deprecated"
+  ],
+  "affected_paths_expected": [
+    "GET /repos/{owner}/{repo}/issues/{issue_number}/reactions"
+  ],
+  "summary_contains": "deprecated"
+}

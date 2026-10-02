@@ -1,0 +1,141 @@
+name: "Kintsua watch"
+description: >-
+  Snapshot and diff an MCP server (or OpenAPI spec) in CI. Fails the job on breaking changes,
+  annotates the lockfile, and can push snapshots to the hosted Kintsua service so your repo gets
+  issues and tested fix PRs.
+author: "Kintsua"
+branding:
+  icon: "shield"
+  color: "purple"
+
+inputs:
+  server:
+    description: "MCP server: a streamable-HTTP URL or a stdio command (e.g. 'npx -y @vendor/mcp')."
+    required: false
+    default: ""
+  spec:
+    description: "OpenAPI spec URL (use instead of `server`)."
+    required: false
+    default: ""
+  fail-on:
+    description: "Exit 1 at this severity or worse: breaking | degraded."
+    required: false
+    default: "breaking"
+  push:
+    description: "Also send the snapshot to the hosted service ('true' / 'false'). Needs kintsua-key."
+    required: false
+    default: "false"
+  kintsua-key:
+    description: "SDK key for --push (store it as a repository secret)."
+    required: false
+    default: ""
+  kintsua-url:
+    description: "Hosted API base URL."
+    required: false
+    default: "https://api.kintsua.dev"
+  repo:
+    description: "owner/name used for --push (defaults to the current repository)."
+    required: false
+    default: ""
+  dir:
+    description: "Directory holding the lockfiles and history.jsonl (commit it)."
+    required: false
+    default: ".kintsua"
+  auth-env:
+    description: "Name of an environment variable holding a bearer token for the server."
+    required: false
+    default: ""
+  snapshot-if-missing:
+    description: >-
+      When no lockfile exists yet (diff exit code 4), write one instead of failing ('true' /
+      'false'). Usage errors and unreadable lockfiles (exit code 2) still fail the step.
+    required: false
+    default: "true"
+  update:
+    description: "Rewrite the lockfile after diffing ('true' / 'false')."
+    required: false
+    default: "false"
+  from-source:
+    description: "Install kintsua from the checked-out repository (`pip install .`) instead of PyPI."
+    required: false
+    default: "false"
+  version:
+    description: "pip version specifier for kintsua, e.g. '==0.1.0' (ignored with from-source)."
+    required: false
+    default: ""
+  python-version:
+    description: "Python version to set up."
+    required: false
+    default: "3.12"
+
+outputs:
+  exit-code:
+    description: >-
+      0 nothing at the gate, 1 gate fired, 2 usage error or unreadable lockfile, 3 could not
+      fetch, 4 no lockfile yet (only when snapshot-if-missing is 'false').
+    value: ${{ steps.watch.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install kintsua
+      shell: bash
+      env:
+        FROM_SOURCE: ${{ inputs.from-source }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ "$FROM_SOURCE" = "true" ]; then
+          python -m pip install --quiet .
+        else
+          python -m pip install --quiet "kintsua${VERSION}"
+        fi
+        kintsua --version
+
+    - name: kintsua watch diff
+      id: watch
+      shell: bash
+      env:
+        SERVER: ${{ inputs.server }}
+        SPEC: ${{ inputs.spec }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        PUSH: ${{ inputs.push }}
+        KINTSUA_KEY: ${{ inputs.kintsua-key }}
+        KINTSUA_URL: ${{ inputs.kintsua-url }}
+        KINTSUA_REPO: ${{ inputs.repo != '' && inputs.repo || github.repository }}
+        DIR: ${{ inputs.dir }}
+        AUTH_ENV: ${{ inputs.auth-env }}
+        SNAPSHOT_IF_MISSING: ${{ inputs.snapshot-if-missing }}
+        UPDATE: ${{ inputs.update }}
+      run: |
+        set -uo pipefail
+        case "$FAIL_ON" in
+          breaking|degraded) ;;
+          *)
+            echo "::error::kintsua watch: fail-on must be 'breaking' or 'degraded', got '$FAIL_ON'"
+            echo "exit-code=2" >> "$GITHUB_OUTPUT"
+            exit 2
+            ;;
+        esac
+        args=(--dir "$DIR")
+        if [ -n "$SERVER" ]; then args+=(--server "$SERVER"); fi
+        if [ -n "$SPEC" ]; then args+=(--spec "$SPEC"); fi
+        if [ -n "$AUTH_ENV" ]; then args+=(--auth-env "$AUTH_ENV"); fi
+        if [ "$PUSH" = "true" ]; then args+=(--push); fi
+        diff_args=(--github-action --fail-on "$FAIL_ON")
+        if [ "$UPDATE" = "true" ]; then diff_args+=(--update); fi
+
+        kintsua watch diff "${args[@]}" "${diff_args[@]}"
+        rc=$?
+        # 4 = no lockfile yet; 2 (usage error, unreadable lockfile) must not become a snapshot
+        if [ "$rc" -eq 4 ] && [ "$SNAPSHOT_IF_MISSING" = "true" ]; then
+          echo "::notice::kintsua watch: no lockfile yet; writing the first snapshot"
+          kintsua watch snapshot "${args[@]}"
+          rc=$?
+        fi
+        echo "exit-code=$rc" >> "$GITHUB_OUTPUT"
+        exit "$rc"

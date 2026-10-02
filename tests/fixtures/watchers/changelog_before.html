@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Acme API Changelog</title>
+  <script>window.dataLayer = [];</script>
+  <style>body { font-family: sans-serif; }</style>
+</head>
+<body>
+  <nav><a href="/">Home</a> | <a href="/docs">Docs</a> | <a href="/changelog">Changelog</a></nav>
+  <main>
+    <article>
+      <h1>Acme API Changelog</h1>
+      <section>
+        <h2>September 15, 2026</h2>
+        <p>Added the <code>uploadPhoto</code> endpoint so you can attach images to a pet. It accepts multipart form data and returns the stored photo id.</p>
+        <p>The <code>listPets</code> endpoint now supports a <code>page</code> query parameter for cursor-free pagination through large collections.</p>
+      </section>
+      <section>
+        <h2>August 1, 2026</h2>
+        <p>We improved rate limit headers: every response now carries <code>X-RateLimit-Remaining</code> alongside the existing <code>X-RateLimit-Limit</code> header for easier client side throttling.</p>
+        <ul>
+          <li>Fixed a bug where <code>weight_kg</code> was returned as an integer for some legacy records.</li>
+          <li>Documentation for the owners resource was expanded with more examples.</li>
+        </ul>
+      </section>
+    </article>
+  </main>
+  <footer><p>&copy; 2026 Acme Inc. All rights reserved.</p></footer>
+</body>
+</html>

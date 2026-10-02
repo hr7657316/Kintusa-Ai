@@ -1,0 +1,7 @@
+[project]
+name = "ops-agent"
+version = "0.2.0"
+dependencies = ["httpx>=0.27", "aiohttp>=3.10", "anthropic>=0.40", "pyyaml"]
+
+[project.optional-dependencies]
+test = ["pytest", "respx"]

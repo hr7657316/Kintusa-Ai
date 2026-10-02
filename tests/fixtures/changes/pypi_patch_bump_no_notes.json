@@ -1,0 +1,32 @@
+{
+  "name": "pypi_patch_bump_no_notes",
+  "display_name": "stripe",
+  "event": {
+    "source_id": "66666666-6666-4666-8666-666666666666",
+    "source_kind": "pypi",
+    "from_version": "11.6.0",
+    "to_version": "11.6.1",
+    "ops": [
+      {
+        "op": "added",
+        "path": "/versions/11.6.1",
+        "before": null,
+        "after": {
+          "requires_python": ">=3.8"
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "safe",
+    "category": "behaviour"
+  },
+  "rule_hits_expected": [
+    "version_bump"
+  ],
+  "affected_paths_expected": [
+    "package:stripe"
+  ]
+}
