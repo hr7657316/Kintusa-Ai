@@ -1,4 +1,4 @@
-.PHONY: install db migrate seed api worker watch test lint fmt sandbox-image dev
+.PHONY: install db migrate seed api worker watch test smoke lint fmt sandbox-image dev
 
 install:
 	uv sync --all-extras
@@ -24,11 +24,14 @@ watch:
 test:
 	uv run pytest -q -m "not network"
 
+smoke:
+	uv run python scripts/smoke_e2e.py
+
 lint:
-	uv run ruff check kintsua tests alembic/env.py && uv run ruff format --check kintsua tests alembic/env.py
+	uv run ruff check kintsua tests scripts alembic/env.py && uv run ruff format --check kintsua tests scripts alembic/env.py
 
 fmt:
-	uv run ruff check --fix kintsua tests alembic/env.py && uv run ruff format kintsua tests alembic/env.py
+	uv run ruff check --fix kintsua tests scripts alembic/env.py && uv run ruff format kintsua tests scripts alembic/env.py
 
 sandbox-image:
 	docker build -t kintsua-sandbox:latest -f docker/sandbox.Dockerfile docker

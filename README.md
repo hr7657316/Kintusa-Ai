@@ -649,6 +649,7 @@ Eleven endpoints from the spec plus the few the CLI and the setup flow need. Eve
 
 ```bash
 make test        # uv run pytest -q -m "not network"   (~750 tests, under 2 minutes, needs Postgres)
+make smoke       # live end-to-end: real API + worker processes, a signed webhook, the CLI and the SDK (needs Postgres)
 make lint        # ruff check + ruff format --check
 ```
 
