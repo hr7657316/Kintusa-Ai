@@ -49,6 +49,7 @@ class DependencyEntry(BaseModel):
     transport: str | None = None
     server_name: str | None = None
     first_seen_sha: str | None = None
+    reason: str | None = None  # why it is unwatched, when the indexer refused its source
 
 
 class DependencyTotals(BaseModel):
@@ -156,6 +157,7 @@ def dependency_map(
                 transport=meta.get("transport"),
                 server_name=meta.get("server_name"),
                 first_seen_sha=d.first_seen_sha,
+                reason=meta.get("reason") if src is None else None,
             )
         )
     entries.sort(key=_entry_sort_key)
@@ -236,7 +238,9 @@ def _status_cell(e: DependencyEntry) -> str:
     else:
         text = "unwatched"
         prefix = "⚪"
-        if e.kind == "http":
+        if e.reason:
+            text += f" — {_md(e.reason)}"
+        elif e.kind == "http":
             text += " — no spec or changelog known for this host"
         elif e.kind == "mcp" and e.transport == "stdio" and e.source_id:
             text += (

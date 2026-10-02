@@ -84,8 +84,8 @@ class FakeContainer:
     # ---- lifecycle --------------------------------------------------------------------
     def start(self) -> None:
         self.started = True
-        if self.command == ["sleep", "infinity"]:
-            return  # the long-lived main container
+        if _is_main(self):
+            return  # the long-lived main container (a bounded sleep)
         self.code, self.out, self.err = self._run(
             list(self.command), self.kwargs.get("working_dir"), self.kwargs.get("environment")
         )
@@ -124,6 +124,11 @@ class FakeContainer:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
             tar.extractall(host, filter="data")
         return True
+
+
+def _is_main(c: FakeContainer) -> bool:
+    """The long-lived no-network container (every other container is a one-shot helper)."""
+    return c.kwargs.get("network_mode") == "none"
 
 
 class _Volumes:
@@ -178,8 +183,8 @@ def docker_sandbox(settings, tmp_path: Path, fixture_git_repo: Path, monkeypatch
 def test_prepare_uses_a_networked_helper_then_a_no_network_container(docker_sandbox):
     sb, client = docker_sandbox
     assert [v.name for v in client.volumes_created] == ["kintsua-fix-job1", "kintsua-venv-job1"]
-    helpers = [c for c in client.containers_created if c.command != ["sleep", "infinity"]]
-    main = [c for c in client.containers_created if c.command == ["sleep", "infinity"]]
+    helpers = [c for c in client.containers_created if not _is_main(c)]
+    main = [c for c in client.containers_created if _is_main(c)]
     assert helpers and main and len(main) == 1
     clone = next(
         c for c in helpers if "git" in " ".join(c.command) and "clone" in " ".join(c.command)
@@ -239,13 +244,29 @@ def test_run_read_write_list_diff_and_timeouts(docker_sandbox):
     assert ok, msg
 
 
+def test_main_container_sleep_is_bounded_and_labelled(docker_sandbox):
+    """An orphaned main container (worker killed mid-job) must exit on its own: its sleep
+    is the wall clock plus slack, never ``infinity``; containers and volumes keep the
+    ``kintsua.job`` label the worker's startup reaper removes them by."""
+    from kintsua.fixer.sandbox import MAIN_CONTAINER_SLACK_S
+
+    sb, client = docker_sandbox
+    main = next(c for c in client.containers_created if _is_main(c))
+    assert main.command == ["sleep", str(600 + MAIN_CONTAINER_SLACK_S)]
+    assert MAIN_CONTAINER_SLACK_S == 300 and sb.main_command() == main.command
+    assert all(c.kwargs["labels"]["kintsua.job"] == "job1" for c in client.containers_created)
+    assert all(v.labels["kintsua.job"] == "job1" for v in client.volumes_created)
+    odd = DockerSandbox(settings=sb.settings, client=client, job_id="odd", wall_clock_s=90.2)
+    assert odd.main_command() == ["sleep", str(91 + MAIN_CONTAINER_SLACK_S)]
+
+
 def test_networked_run_and_cleanup(docker_sandbox):
     sb, client = docker_sandbox
     res = sb.run("echo $KINTSUA_EGRESS_ALLOWLIST", timeout_s=10, network=True)
     assert "registry.npmjs.org" in res.stdout
     helper = client.containers_created[-1]
     assert helper.kwargs["network_mode"] == "bridge" and helper.removed
-    main = next(c for c in client.containers_created if c.command == ["sleep", "infinity"])
+    main = next(c for c in client.containers_created if _is_main(c))
     sb.cleanup()
     assert main.removed and all(v.removed for v in client.volumes_created)
     sb.cleanup()  # idempotent
@@ -290,8 +311,8 @@ def test_installs_reach_the_no_network_container(docker_sandbox):
     """``pip install`` runs in the networked helper and writes to the image venv; the
     test container must see it (a per-job volume over /opt/venv in both containers)."""
     sb, client = docker_sandbox
-    helpers = [c for c in client.containers_created if c.command != ["sleep", "infinity"]]
-    main = next(c for c in client.containers_created if c.command == ["sleep", "infinity"])
+    helpers = [c for c in client.containers_created if not _is_main(c)]
+    main = next(c for c in client.containers_created if _is_main(c))
     for c in [*helpers, main]:
         binds = {spec["bind"]: name for name, spec in c.kwargs["volumes"].items()}
         assert binds == {"/work": "kintsua-fix-job1", "/opt/venv": "kintsua-venv-job1"}

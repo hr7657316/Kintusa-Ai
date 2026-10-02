@@ -4,8 +4,10 @@ The loader upserts by ``(kind, locator)``: new entries are inserted, existing ro
 display_name / vendor / poll_interval_s refreshed and their ``meta`` merged (seed keys win,
 other keys are preserved). Every seeded row gets ``origin = "seed"``: the operator's sources
 are the only ones the worker may run as stdio commands and the only ones on the public
-weekly report. It never deletes or deactivates anything. ``--dry-run`` reports
-what would change without writing.
+weekly report. A row it promotes to ``seed`` is reactivated with its failure state cleared
+(``active``, ``last_error``, ``consecutive_failures``, ``backoff_until``), so a customer stdio
+locator the worker refused comes back once the operator seeds it. It never deletes or
+deactivates anything. ``--dry-run`` reports what would change without writing.
 """
 
 from __future__ import annotations
@@ -133,10 +135,16 @@ def upsert_sources(
         if merged_meta != (row.meta or {}):
             changes["meta"] = merged_meta
         # the seed file is the operator's list: its rows are trusted and public, even if a
-        # customer happened to add the same locator first
+        # customer happened to add the same locator first. A promoted row starts afresh: a
+        # customer stdio locator the worker refused and deactivated (or a failing customer
+        # row in backoff) is polled again as the operator's source on the next tick.
         if row.origin != "seed":
             changes["origin"] = "seed"
             changes["owner_org_id"] = None
+            changes["active"] = True
+            changes["last_error"] = None
+            changes["consecutive_failures"] = 0
+            changes["backoff_until"] = None
         if not changes:
             result.unchanged.append(label)
             continue

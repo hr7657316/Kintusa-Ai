@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import or_, select
@@ -232,14 +233,21 @@ def event_scope(event: RuntimeEvent) -> RuntimeScope:
 
 
 def server_key(value: str | None) -> str:
-    """Comparable identity of an MCP server: an http(s) URL with scheme and host lowercased
-    and no trailing slash, or a label without its SDK prefix (``mcp:weather`` ->
-    ``weather``), lowercased."""
+    """Comparable identity of an MCP server: an http(s) URL reduced to
+    ``scheme://host[:port]/path`` (what the SDK sends) with scheme and host lowercased, no
+    userinfo, query string or fragment (a configured URL may carry ``?api_key=...``) and
+    no trailing slash; or a label without its SDK prefix (``mcp:weather`` -> ``weather``),
+    lowercased."""
     v = (value or "").strip()
     if is_http_locator(v):
-        scheme, _, rest = v.rstrip("/").partition("://")
-        host, sep, path = rest.partition("/")
-        return f"{scheme.lower()}://{host.lower()}{sep}{path}"
+        try:
+            parts = urlsplit(v)
+        except ValueError:  # e.g. an unbalanced IPv6 bracket: compare it textually
+            scheme, _, rest = v.rstrip("/").partition("://")
+            host, sep, path = rest.partition("/")
+            return f"{scheme.lower()}://{host.lower()}{sep}{path}"
+        host = parts.netloc.rpartition("@")[2].lower()
+        return f"{parts.scheme.lower()}://{host}{parts.path.rstrip('/')}"
     low = v.lower()
     for prefix in _SERVER_LABEL_PREFIXES:
         if low.startswith(prefix):

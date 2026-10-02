@@ -449,6 +449,86 @@ def test_model_refusal_falls_back_to_needs_human(session, fake_llm, monkeypatch)
     assert out.rule_hits == ["llm", "llm_refused"]
 
 
+def _changelog_row(session, locator: str):
+    source = make_source(session, kind="changelog", locator=locator, display_name="Z changelog")
+    row = make_event(
+        session,
+        source,
+        [{"op": "text_changed", "path": "/paragraphs/1", "before": None, "after": "t"}],
+        text="t",
+    )
+    session.commit()
+    return row
+
+
+TRUNCATION_ANSWER = {
+    "severity": "degraded",
+    "category": "behaviour",
+    "summary": "rate limits tightened",
+    "affected_paths": [],
+    "migration_hint": None,
+    "confidence": 0.9,
+}
+
+
+def test_truncated_answer_is_retried_with_more_room_and_less_effort(session, fake_llm, settings):
+    """``LLMTruncated`` subclasses ``LLMRefused``: it must not be recorded as a refusal.
+    The classifier retries once with a bigger budget (at most 20000) and lower effort."""
+    from kintsua.classify.run import TRUNCATED_RETRY_MAX_TOKENS
+    from kintsua.core.llm import JSON_MAX_TOKENS, LLMTruncated
+
+    row = _changelog_row(session, "https://z/changelog")
+    fake_llm.queue_json(LLMTruncated("hit max_tokens"))
+    fake_llm.queue_json(TRUNCATION_ANSWER)
+    out = classify_change_event(session, row)
+    assert out.severity == "degraded" and out.needs_human is False
+    assert out.rule_hits == ["llm"] and "llm_refused" not in out.rule_hits
+    first, second = [c for c in fake_llm.calls if c["op"] == "json"]
+    assert first["max_tokens"] == JSON_MAX_TOKENS
+    assert first["effort"] == settings.llm_classifier_effort == "medium"
+    assert JSON_MAX_TOKENS < second["max_tokens"] == TRUNCATED_RETRY_MAX_TOKENS <= 20000
+    assert second["effort"] == "low"
+    assert len(match_jobs(session, row.id)) == 1
+
+
+def test_truncated_twice_records_llm_truncated_and_needs_human(session, fake_llm):
+    from kintsua.core.llm import LLMTruncated
+
+    row = _changelog_row(session, "https://z2/changelog")
+    fake_llm.queue_json(LLMTruncated("hit max_tokens"))
+    fake_llm.queue_json(LLMTruncated("hit max_tokens again"))
+    fake_llm.queue_json(TRUNCATION_ANSWER)  # never asked for: one retry only
+    out = classify_change_event(session, row)
+    assert len([c for c in fake_llm.calls if c["op"] == "json"]) == 2
+    assert out.severity == "unknown" and out.needs_human is True
+    assert out.rule_hits == ["llm", "llm_truncated"]
+    assert out.llm_model is None
+    assert len(match_jobs(session, row.id)) == 1
+
+
+def test_refusal_on_the_truncation_retry_is_a_refusal(session, fake_llm):
+    from kintsua.core.llm import LLMRefused, LLMTruncated
+
+    row = _changelog_row(session, "https://z3/changelog")
+    fake_llm.queue_json(LLMTruncated("hit max_tokens"))
+    fake_llm.queue_json(LLMRefused("policy"))
+    out = classify_change_event(session, row)
+    assert out.severity == "unknown" and out.rule_hits == ["llm", "llm_refused"]
+
+
+def test_lower_effort_steps_down_once():
+    from kintsua.classify.run import lower_effort
+
+    assert [lower_effort(e) for e in ("low", "medium", "high", "xhigh", "max")] == [
+        "low",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+    assert lower_effort("weird") == "weird"
+
+
 def test_provider_outage_propagates_so_the_job_retries(session, fake_llm, monkeypatch):
     source = make_source(
         session, kind="changelog", locator="https://y/changelog", display_name="Y changelog"

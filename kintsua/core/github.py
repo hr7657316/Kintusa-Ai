@@ -27,6 +27,12 @@ ISSUE_PREFIX = "[Kintsua]"
 BRANCH_PREFIX = "kintsua/"
 
 
+#: a cached installation token is reused only while it stays valid at least this long
+DEFAULT_MIN_TOKEN_TTL_S = 120.0
+#: GitHub installation tokens live one hour; assume a little less when it does not say
+_FALLBACK_TOKEN_LIFETIME_S = 3300.0
+
+
 @dataclass
 class InstallationToken:
     token: str
@@ -70,14 +76,22 @@ class GitHubApp:
 
         return Auth.AppAuth(int(self.app_id), self.private_key).create_jwt()
 
-    def installation_token(self, installation_id: int) -> str:
-        """Installation access token, cached until ~2 minutes before expiry."""
+    def installation_token(
+        self, installation_id: int, *, min_ttl_s: float = DEFAULT_MIN_TOKEN_TTL_S
+    ) -> str:
+        """Installation access token valid for at least ``min_ttl_s`` more seconds. The
+        cached token is returned while it qualifies; otherwise a fresh one is minted (and
+        cached). A token lives one hour, so ``min_ttl_s`` must stay well below that."""
         with self._lock:
             tok = self._tokens.get(installation_id)
-            if tok and tok.expires_at - 120 > time.time():
+            if tok and tok.expires_at - float(min_ttl_s) > time.time():
                 return tok.token
         auth = self._integration_client().get_access_token(installation_id)
-        expires = auth.expires_at.timestamp() if auth.expires_at else time.time() + 3300
+        expires = (
+            auth.expires_at.timestamp()
+            if auth.expires_at
+            else time.time() + _FALLBACK_TOKEN_LIFETIME_S
+        )
         with self._lock:
             self._tokens[installation_id] = InstallationToken(token=auth.token, expires_at=expires)
         return auth.token
@@ -92,8 +106,16 @@ class GitHubApp:
             per_page=100,
         )
 
-    def clone_url(self, installation_id: int, full_name: str) -> str:
-        tok = self.installation_token(installation_id)
+    def clone_url(
+        self,
+        installation_id: int,
+        full_name: str,
+        *,
+        min_ttl_s: float = DEFAULT_MIN_TOKEN_TTL_S,
+    ) -> str:
+        """``https://x-access-token:<token>@<host>/<full_name>.git`` with a token valid for
+        at least ``min_ttl_s`` more seconds."""
+        tok = self.installation_token(installation_id, min_ttl_s=min_ttl_s)
         host = (
             "github.com"
             if "api.github.com" in self.base_url

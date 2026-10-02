@@ -224,6 +224,10 @@ def test_sdk_redaction_is_a_superset_of_the_core():
         "sk-abcdefghijklmnopqrstuvwx kts_abcdefghijklmnopqrstuvwxyz0123",
         "npm_" + "a1" * 18 + " pypi-" + "A" * 60,
         'client_secret="abcdefghijkl" private_key=MIIEvQIBADANBgkqh',
+        "private-key=MIIEvQIBADANBgkqh privateKey: MIIEvQIBADANBgkqh",
+        "token=abcdefghij private_key: MIIEvQIBADANBgkqh password = hunter2hunter2",
+        "token=Bearer 'abcdefghijklmnop' Authorization: Token abcdef1234567890",
+        "echo: basic dXNlcjpwYXNzd29yZDEyMw== then Basic YWxhZGRpbjpvcGVuc2VzYW1l",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlc2lnbmF0dXJl",
         "https://alice:hunter2pass@proxy.internal/",
     ]

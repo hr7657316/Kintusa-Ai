@@ -77,7 +77,13 @@ class Settings(BaseSettings):
 
     # --- watchers ----------------------------------------------------------------
     tick_interval_s: int = 15 * 60
+    # after a failed poll: min(poll interval, base) * 2**(failures - 1), capped at the ceiling
+    source_backoff_base_s: int = 15 * 60
     source_backoff_ceiling_s: int = 48 * 3600
+    # one whole fetch (connect, listings, release notes ...); a source's meta.poll_timeout_s
+    # overrides it
+    poll_timeout_s: int = 10 * 60
+    # each HTTP request of a fetch (meta.timeout_s overrides it)
     poll_http_timeout_s: float = 60.0
     # apply kintsua.core.netguard to every non-seed source fetch (SSRF protection)
     net_guard: bool = True

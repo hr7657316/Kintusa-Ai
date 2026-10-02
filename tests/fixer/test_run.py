@@ -186,13 +186,28 @@ def _no_tools(wd, cfg):
     return detect_test_command(wd, cfg, tool_available=lambda n: False)
 
 
-def _live_fixing(f: Factory, fake_github, started_s_ago: float = 5.0):
-    """An impact in ``fixing`` whose job started ``started_s_ago`` seconds ago."""
+def _live_fixing(
+    f: Factory, fake_github, started_s_ago: float = 5.0, job_status: str | None = "running"
+):
+    """An impact in ``fixing`` whose job started ``started_s_ago`` seconds ago; the job row
+    its ``fix_job_id`` points at has ``job_status`` (None: no job recorded)."""
     other = f.seed_break(
         load_break("stripe_charge_source_renamed"), fake_github=fake_github, status="fixing"
     )
     started = utcnow() - timedelta(seconds=started_s_ago)
     other["impact"].ci_result = {"fix_started_at": started.isoformat()}
+    if job_status is not None:
+        job = Job(
+            kind=JOB_FIX_IMPACT,
+            payload={"impact_id": str(other["impact"].id)},
+            status=job_status,
+            attempts=1,
+            locked_at=started if job_status == "running" else None,
+        )
+        f.session.add(job)
+        f.session.flush()
+        other["impact"].fix_job_id = job.id
+        other["job"] = job
     f.session.commit()
     return other
 
@@ -224,6 +239,48 @@ def test_concurrency_defers_and_reenqueues(session, f: Factory, ready, monkeypat
     session.commit()
     _script_fix(ready["llm"], RENAME)
     assert handle_fix_impact(session, {"impact_id": str(impact.id)})["status"] == "pr_open"
+
+
+def test_reaped_fix_job_frees_its_concurrency_slot(session, f: Factory, ready, monkeypatch):
+    """Only impacts whose ``fix_job_id`` is a ``running`` job hold a slot: a fix job the
+    queue reaped (lease expired: re-queued or failed) or never recorded frees its slot at
+    once, even though the impact is still ``fixing`` and freshly stamped."""
+    import kintsua.fixer.run as runmod
+
+    monkeypatch.setattr(ready["settings"], "fix_concurrency", 1)
+    reaped = _live_fixing(f, ready["github"], job_status="queued")  # reaped, re-queued
+    failed = _live_fixing(f, ready["github"], job_status="failed")  # reaped, out of attempts
+    done = _live_fixing(f, ready["github"], job_status="done")
+    unrecorded = _live_fixing(f, ready["github"], job_status=None)
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    assert runmod._fixing_count(session, world["impact"]) == 0
+    _script_fix(ready["llm"], RENAME)
+    result = handle_fix_impact(session, {"impact_id": str(world["impact"].id)})
+    assert result["status"] == "pr_open", result  # not deferred behind reaped jobs
+    for w in (reaped, failed, done, unrecorded):  # still fixing; the sweep is time-based
+        assert session.get(Impact, w["impact"].id).status == "fixing"
+
+    # a running job holds the slot
+    live = _live_fixing(f, ready["github"])
+    other = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    assert runmod._fixing_count(session, other["impact"]) == 1
+    assert handle_fix_impact(session, {"impact_id": str(other["impact"].id)})["deferred"] is True
+    # the queue reaps it: the slot is free on the next attempt
+    live["job"].status = "queued"
+    live["job"].locked_at = None
+    session.commit()
+    assert runmod._fixing_count(session, other["impact"]) == 0
+
+
+def test_fix_impact_records_its_job_id(session, f: Factory, ready):
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    job = Job(kind=JOB_FIX_IMPACT, payload={}, status="running", attempts=1, locked_at=utcnow())
+    session.add(job)
+    session.commit()
+    _script_fix(ready["llm"], RENAME)
+    payload = {"impact_id": str(world["impact"].id), "_job_id": str(job.id)}
+    assert handle_fix_impact(session, payload)["status"] == "pr_open"
+    assert session.get(Impact, world["impact"].id).fix_job_id == job.id
 
 
 def test_needs_human_fails_with_comment(session, f: Factory, ready):
@@ -341,6 +398,38 @@ def test_record_pr_outcome_merged_as_is_vs_edited_vs_closed(session, f: Factory,
     assert impact.status == "pr_open" and impact.pr_outcome is None
 
     assert record_pr_outcome(session, w3["repo"], 9999, True, "closed") is None
+
+
+def test_merge_after_close_clears_the_dismissal_reason(session, f: Factory, fake_github):
+    """Closed (dismissed, "PR closed without merge"), reopened, then merged: the merged
+    impact must not keep the dismissal's ``fix_reason``."""
+    w = _pr_open_world(f, fake_github)
+    impact = record_pr_outcome(session, w["repo"], w["pr"].number, False, "closed")
+    assert impact.status == "dismissed" and impact.fix_reason == "PR closed without merge"
+    impact = record_pr_outcome(session, w["repo"], w["pr"].number, False, "reopened")
+    assert impact.status == "pr_open" and impact.fix_reason is None
+    # the close reason is set again by a second close, and a merge clears it
+    impact = record_pr_outcome(session, w["repo"], w["pr"].number, False, "closed")
+    assert impact.fix_reason == "PR closed without merge"
+    impact.status = "pr_open"  # e.g. the reopen webhook was lost
+    session.commit()
+    impact = record_pr_outcome(
+        session, w["repo"], w["pr"].number, True, "closed", head_sha="a" * 40
+    )
+    assert impact.status == "merged" and impact.pr_outcome == "merged_as_is"
+    assert impact.fix_reason is None
+    session.expire_all()
+    assert session.get(Impact, impact.id).fix_reason is None
+
+    # a merge after a CI failure drops the CI reason too
+    w2 = _pr_open_world(f, fake_github)
+    record_ci_result(session, w2["repo"], w2["pr"].number, "failure", {"name": "tests"})
+    impact = session.get(Impact, w2["impact"].id)
+    assert impact.status == "failed" and impact.fix_reason
+    impact = record_pr_outcome(
+        session, w2["repo"], w2["pr"].number, True, "closed", head_sha="a" * 40
+    )
+    assert impact.status == "merged" and impact.fix_reason is None
 
 
 def test_pr_outcome_job_handler(session, f: Factory, fake_github):
@@ -601,3 +690,15 @@ def test_record_ci_result_recovers_when_the_failed_checks_pass(session, f: Facto
     record_pr_outcome(session, w["repo"], n, False, "closed")
     impact = record_ci_result(session, w["repo"], n, "success", {"name": "test"})
     assert impact.status == "failed" and impact.pr_outcome == "closed"
+
+
+def test_push_url_token_outlives_the_push(session, f: Factory, ready):
+    from kintsua.fixer.run import PUSH_TOKEN_MIN_TTL_S
+
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    _script_fix(ready["llm"], RENAME)
+    assert handle_fix_impact(session, {"impact_id": str(world["impact"].id)})["status"] == "pr_open"
+    ttls = [
+        ttl for (_, name, ttl) in ready["github"].clone_requests if name == world["repo"].full_name
+    ]
+    assert PUSH_TOKEN_MIN_TTL_S in ttls

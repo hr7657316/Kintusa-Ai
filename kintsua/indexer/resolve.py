@@ -20,8 +20,11 @@ than an http(s) URL is never run by the hosted worker: it is created inactive wi
 ``last_error`` saying why, and no poll is queued for it (an operator-seeded row with the
 same locator is attached unchanged).
 
-Sources are created through ``kintsua.watchers.run.find_or_create_source`` when that module
-exists, with a local upsert of identical semantics as the fallback.
+Sources are created through ``kintsua.watchers.run.find_or_create_source``. A locator that
+names a private source (``push:<org>:...`` pushed snapshots, ``observed:<repo>:<tool>``
+runtime promotions) is never resolved from a repo: the dependency is recorded unwatched with
+``meta["reason"]`` (``NOT_SHAREABLE``), whether the prefix gives it away or
+``find_or_create_source`` refuses the row (``SourceNotShareable``), and the index goes on.
 """
 
 from __future__ import annotations
@@ -33,7 +36,6 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from kintsua.core.models import Source
@@ -42,16 +44,10 @@ from kintsua.indexer import sdk_map
 from kintsua.indexer.config import ConfigSource, config_sources
 from kintsua.indexer.mcp_config import vendor_for_locator
 from kintsua.indexer.schema import DependencyInfo
+from kintsua.watchers.run import SourceNotShareable, find_or_create_source
 
 log = logging.getLogger(__name__)
 
-DEFAULT_POLL_S = {
-    "mcp": 6 * 3600,
-    "openapi": 24 * 3600,
-    "pypi": 6 * 3600,
-    "npm": 6 * 3600,
-    "changelog": 24 * 3600,
-}
 PACKAGE_DISPLAY = {"pypi": "PyPI", "npm": "npm"}
 SEED = "seed"  # derived from the curated sdk_map
 CUSTOMER = "customer"  # taken from the customer's repo
@@ -59,6 +55,14 @@ MAX_DISPLAY_NAME = 255
 STDIO_NOT_RUN = (
     "not polled: the hosted watcher never runs a command line from a repo; watch this server "
     "through its http(s) URL or with `kintsua watch --push` from CI"
+)
+# locator prefixes of private sources: ``push:<org_id>:<kind>:<locator>`` (api/ingest.py)
+# and ``observed:<repo>:<tool>`` (matcher/runtime.py); a repo never names one into a source
+PRIVATE_LOCATOR_PREFIXES = ("push:", "observed:")
+NOT_SHAREABLE = (
+    "names a private source (another organisation's pushed snapshot or a repo's observed "
+    "runtime source), which a repo cannot depend on; pushed sources are attached by "
+    "`kintsua watch --push` itself"
 )
 
 
@@ -79,77 +83,24 @@ class ResolveResult:
         return sum(1 for d in self.dependencies if d.source_id is not None)
 
 
-def _local_find_or_create_source(
-    session: Session,
-    kind: str,
-    locator: str,
-    *,
-    display_name: str | None = None,
-    vendor: str | None = None,
-    meta: dict[str, Any] | None = None,
-    poll_interval_s: int | None = None,
-    origin: str = CUSTOMER,
-    owner_org_id: Any = None,
-) -> Source:
-    """Same semantics as ``kintsua.watchers.run.find_or_create_source`` (fallback)."""
-    locator = locator.strip()
-    meta = {k: v for k, v in (meta or {}).items() if not str(k).startswith("_")}
-    row = session.scalar(select(Source).where(Source.kind == kind, Source.locator == locator))
-    if row is not None:
-        if row.trusted and origin != SEED:
-            return row
-        if display_name and (not row.display_name or row.display_name == row.locator):
-            row.display_name = display_name
-        if vendor and not row.vendor:
-            row.vendor = vendor
-        if meta:
-            merged = {**meta, **(row.meta or {})}
-            if merged != (row.meta or {}):
-                row.meta = merged
-        return row
-    row = Source(
-        kind=kind,
-        locator=locator,
-        display_name=display_name or locator,
-        vendor=vendor,
-        meta=dict(meta or {}),
-        poll_interval_s=poll_interval_s or DEFAULT_POLL_S.get(kind, 6 * 3600),
-        origin=origin,
-        owner_org_id=owner_org_id,
-    )
-    try:
-        with session.begin_nested():
-            session.add(row)
-            session.flush()
-    except IntegrityError:
-        existing = session.scalar(
-            select(Source).where(Source.kind == kind, Source.locator == locator)
-        )
-        if existing is None:  # pragma: no cover
-            raise
-        return existing
-    return row
-
-
-def _find_or_create_source_fn():  # type: ignore[no-untyped-def]
-    try:
-        from kintsua.watchers.run import find_or_create_source
-
-        return find_or_create_source
-    except ImportError:  # watchers.run not written yet
-        return _local_find_or_create_source
+def is_private_locator(locator: str) -> bool:
+    """A ``push:`` / ``observed:`` locator: private to the org or repo that created it."""
+    return locator.strip().lower().startswith(PRIVATE_LOCATOR_PREFIXES)
 
 
 class SourceCache:
     """Find-or-create with a per-run cache and a record of which rows are new.
 
     ``new_ids`` lists the new rows that should be polled now; a new customer ``mcp`` row
-    with a command-line locator is created inactive and left out (rule 2)."""
+    with a command-line locator is created inactive and left out (rule 2). ``get`` returns
+    None for a locator the repo may not use (``is_private_locator``, or
+    ``SourceNotShareable`` from ``find_or_create_source``); ``refused`` maps its
+    ``(kind, locator)`` to the reason."""
 
     def __init__(self, session: Session):
         self.session = session
-        self._fn = _find_or_create_source_fn()
-        self.cache: dict[tuple[str, str], Source] = {}
+        self.cache: dict[tuple[str, str], Source | None] = {}
+        self.refused: dict[tuple[str, str], str] = {}
         self.new_ids: list[UUID] = []
         self.sources: dict[UUID, Source] = {}
 
@@ -162,26 +113,32 @@ class SourceCache:
         vendor: str | None = None,
         meta: dict[str, Any] | None = None,
         origin: str = CUSTOMER,
-    ) -> Source:
+    ) -> Source | None:
         locator = locator.strip()
         key = (kind, locator)
         if key in self.cache:
             return self.cache[key]
+        if is_private_locator(locator):
+            return self._refuse(key, NOT_SHAREABLE)
         existed = (
             self.session.scalar(
                 select(Source.id).where(Source.kind == kind, Source.locator == locator)
             )
             is not None
         )
-        row = self._fn(
-            self.session,
-            kind,
-            locator,
-            display_name=short_display(display_name) if display_name else None,
-            vendor=vendor,
-            meta=meta,
-            origin=origin,
-        )
+        try:
+            row = find_or_create_source(
+                self.session,
+                kind,
+                locator,
+                display_name=short_display(display_name) if display_name else None,
+                vendor=vendor,
+                meta=meta,
+                origin=origin,
+            )
+        except SourceNotShareable as e:
+            log.info("not resolving %s %r: %s", kind, locator[:200], e)
+            return self._refuse(key, NOT_SHAREABLE)
         if never_run_here(row):
             # rule 2: the worker never spawns a command a repo supplied, so never poll it
             if row.active or not row.last_error:
@@ -193,11 +150,27 @@ class SourceCache:
         self.sources[row.id] = row
         return row
 
+    def _refuse(self, key: tuple[str, str], reason: str) -> None:
+        self.cache[key] = None
+        self.refused[key] = reason
+        return None
+
+    def reason(self, kind: str, locator: str) -> str | None:
+        return self.refused.get((kind, locator.strip()))
+
 
 def never_run_here(source: Source) -> bool:
     """An ``mcp`` source the hosted worker must not spawn: a command line (not an http(s)
     URL) whose row is not operator-seeded."""
     return source.kind == "mcp" and not is_http_locator(source.locator) and not source.trusted
+
+
+def _record_unwatched(dep: DependencyInfo, cache: SourceCache, kind: str, locator: str) -> None:
+    """``dep`` stays unwatched because ``cache`` refused its source; say why on the row."""
+    dep.source_id = None
+    reason = cache.reason(kind, locator)
+    if reason:
+        dep.meta["reason"] = reason
 
 
 def _host_of_url(url: str) -> str | None:
@@ -233,14 +206,17 @@ def _config_source_rows(
         dep = DependencyInfo(
             kind=cs.kind,
             name=locator,
-            vendor=row.vendor,
+            vendor=row.vendor if row is not None else vendor,
             display_name=display,
             meta={"config_file": ".kintsua.yml", "configured": True, "hosts": list(cs.hosts)},
-            source_id=row.id,
+            source_id=row.id if row is not None else None,
         )
         if cs.kind == "mcp":
             dep.meta["transport"] = meta["transport"]
         deps.append(dep)
+        if row is None:
+            dep.meta["reason"] = cache.reason(cs.kind, locator)
+            continue  # unwatched; it covers no hosts
         if cs.kind in ("openapi", "changelog"):
             for h in cs.hosts:
                 by_host.setdefault(h, row)
@@ -268,6 +244,9 @@ def _resolve_package(dep: DependencyInfo, cache: SourceCache) -> None:
             vendor=entry.vendor,
             origin=SEED,
         )
+        if row is None:
+            _record_unwatched(dep, cache, dep.kind, dep.name)
+            return
         dep.source_id = row.id
         if entry.openapi_url:
             meta = {"format": entry.openapi_format} if entry.openapi_format else {}
@@ -279,7 +258,8 @@ def _resolve_package(dep: DependencyInfo, cache: SourceCache) -> None:
                 meta=meta,
                 origin=SEED,
             )
-            dep.meta["openapi_source_id"] = str(spec.id)
+            if spec is not None:
+                dep.meta["openapi_source_id"] = str(spec.id)
         elif entry.changelog_url:
             cl = cache.get(
                 "changelog",
@@ -288,14 +268,18 @@ def _resolve_package(dep: DependencyInfo, cache: SourceCache) -> None:
                 vendor=entry.vendor,
                 origin=SEED,
             )
-            dep.meta["changelog_source_id"] = str(cl.id)
+            if cl is not None:
+                dep.meta["changelog_source_id"] = str(cl.id)
         return
     if dep.meta.get("mcp_server_package") and not dep.meta.get("inferred"):
         # an MCP server distributed as a package: a new version is a new tool surface. The
         # name came from the repo, so the registry row is a customer one.
         row = cache.get(dep.kind, dep.name, display_name=f"{dep.name} ({label})", origin=CUSTOMER)
-        dep.source_id = row.id
         dep.meta.setdefault("sdk_kind", "mcp-server")
+        if row is None:
+            _record_unwatched(dep, cache, dep.kind, dep.name)
+            return
+        dep.source_id = row.id
 
 
 def _resolve_http(dep: DependencyInfo, cache: SourceCache, by_host: dict[str, Source]) -> None:
@@ -316,9 +300,10 @@ def _resolve_http(dep: DependencyInfo, cache: SourceCache, by_host: dict[str, So
             meta=meta,
             origin=SEED,
         )
-        dep.source_id = row.id
-        dep.meta["resolved_via"] = "sdk_map"
-        return
+        if row is not None:
+            dep.source_id = row.id
+            dep.meta["resolved_via"] = "sdk_map"
+            return
     cfg = by_host.get(host) or by_host.get(bare)
     if cfg is None:
         for h, row in by_host.items():
@@ -337,9 +322,10 @@ def _resolve_http(dep: DependencyInfo, cache: SourceCache, by_host: dict[str, So
             vendor=entry.vendor,
             origin=SEED,
         )
-        dep.source_id = row.id
-        dep.meta["resolved_via"] = "changelog"
-        return
+        if row is not None:
+            dep.source_id = row.id
+            dep.meta["resolved_via"] = "changelog"
+            return
     dep.meta["resolved_via"] = None
 
 
@@ -361,6 +347,9 @@ def _resolve_mcp(dep: DependencyInfo, cache: SourceCache) -> None:
     row = cache.get(
         "mcp", dep.name, display_name=display, vendor=dep.vendor, meta=meta, origin=CUSTOMER
     )
+    if row is None:
+        _record_unwatched(dep, cache, "mcp", dep.name)
+        return
     dep.source_id = row.id
     dep.vendor = dep.vendor or row.vendor
 
@@ -399,9 +388,12 @@ def resolve_dependencies(
 
 
 __all__ = [
+    "NOT_SHAREABLE",
+    "PRIVATE_LOCATOR_PREFIXES",
     "STDIO_NOT_RUN",
     "ResolveResult",
     "SourceCache",
+    "is_private_locator",
     "never_run_here",
     "resolve_dependencies",
     "short_display",

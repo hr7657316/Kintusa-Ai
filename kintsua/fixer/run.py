@@ -13,10 +13,11 @@ commit, push (with an installation token minted right before the push) and open 
 with the scrubbed log excerpt). The sandbox is always cleaned up and token spend is
 logged per job.
 
-A ``fixing`` impact whose job died with its worker (deploy, OOM) would hold a concurrency
-slot forever: impacts stamped more than ``2 * sandbox_wall_clock_s`` ago (or never
-stamped) do not count, and the next ``fix_impact`` re-queues each of them once and fails
-it honestly the second time.
+Only ``fixing`` impacts whose ``fix_job_id`` points at a job in status ``running`` hold a
+concurrency slot, so a job the queue reaped (its worker died: deploy, OOM) frees its slot
+at once. An impact left in ``fixing`` more than ``2 * sandbox_wall_clock_s`` after it was
+stamped (or never stamped) is swept by the next ``fix_impact``: re-queued once, failed
+honestly the second time.
 
 ``pr_outcome`` (``{"repo_id", "pr_number", "action", "merged"}``): ``record_pr_outcome``.
 ``record_ci_result`` is called by the webhook handler for check results on our PR.
@@ -31,7 +32,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from kintsua.core.config import Settings, get_settings
@@ -42,6 +43,7 @@ from kintsua.core.models import (
     ChangeEventRow,
     Classification,
     Impact,
+    Job,
     Org,
     Repo,
     Snapshot,
@@ -85,6 +87,8 @@ CI_SUCCESS_CONCLUSIONS: frozenset[str] = frozenset({"success"})
 DEFER_DELAY_S = 60.0
 #: re-enqueues while the concurrency cap is hit before the job fails honestly (~6 h at 60 s)
 MAX_DEFERRALS = 360
+#: the push URL's installation token must stay valid at least this long
+PUSH_TOKEN_MIN_TTL_S = 600.0
 #: a ``fixing`` impact older than this many wall clocks lost its job (worker died)
 STALE_FIXING_WALL_CLOCKS = 2
 #: how often a lost fix job is re-queued before the impact is failed
@@ -401,16 +405,18 @@ def _sweep_lost_fixes(session: Session, settings: Settings, exclude: Impact) -> 
 
 
 def _fixing_count(session: Session, exclude: Impact, settings: Settings | None = None) -> int:
-    """Live fixes (``fixing`` and stamped within ``STALE_FIXING_WALL_CLOCKS`` wall
-    clocks); the caller sweeps lost ones first."""
-    settings = settings or get_settings()
-    cutoff = utcnow() - timedelta(
-        seconds=STALE_FIXING_WALL_CLOCKS * float(settings.sandbox_wall_clock_s)
+    """Live fixes: ``fixing`` impacts whose ``fix_job_id`` is a job still ``running``. A job
+    the queue reaped (lease expired: re-queued or failed), finished or never recorded frees
+    its slot at once; the caller sweeps impacts left in ``fixing`` first. ``settings`` is
+    accepted for backwards compatibility and unused."""
+    del settings
+    count = session.scalar(
+        select(func.count())
+        .select_from(Impact)
+        .join(Job, Job.id == Impact.fix_job_id)
+        .where(Impact.status == "fixing", Impact.id != exclude.id, Job.status == "running")
     )
-    rows = session.scalars(
-        select(Impact).where(Impact.status == "fixing", Impact.id != exclude.id)
-    ).all()
-    return sum(1 for imp in rows if (_fix_started_at(imp) or cutoff) > cutoff)
+    return int(count or 0)
 
 
 # --------------------------------------------------------------------------------------
@@ -565,7 +571,8 @@ def _run_fix(
         branch = branch_name(ctx.vendor, row.id)
         # the clone's token may expire during a 15-minute job: mint the push URL now, and
         # scrub its token like the clone's
-        push_url = app.clone_url(installation_id, repo.full_name)
+        # the push can follow a long test run: ask for a token that outlives it
+        push_url = app.clone_url(installation_id, repo.full_name, min_ttl_s=PUSH_TOKEN_MIN_TTL_S)
         sandbox.secrets = tuple(dict.fromkeys((*sandbox.secrets, *secrets_in_url(push_url))))
         try:
             pushed = commit_and_push(
@@ -726,9 +733,11 @@ def record_pr_outcome(
     merge_commit_sha: str | None = None,
 ) -> Impact | None:
     """Record what happened to a Kintsua PR. ``closed`` + merged -> status ``merged`` with
-    ``pr_outcome`` ``merged_as_is`` / ``merged_edited`` (head sha vs the sha Kintsua pushed);
-    ``closed`` without merge -> ``pr_outcome`` ``closed``, status ``dismissed``. Other
-    actions are recorded on ``ci_result`` and leave the status alone."""
+    ``pr_outcome`` ``merged_as_is`` / ``merged_edited`` (head sha vs the sha Kintsua pushed)
+    and ``fix_reason`` cleared; ``closed`` without merge -> ``pr_outcome`` ``closed``, status
+    ``dismissed``; ``reopened`` after such a close -> back to ``pr_open`` with the close
+    reason cleared. Other actions are recorded on ``ci_result`` and leave the status
+    alone."""
     impact = _impact_for_pr(session, repo, pr_number)
     if impact is None:
         return None
@@ -744,6 +753,9 @@ def record_pr_outcome(
                 ci["merged_head_sha"] = head
             impact.pr_outcome = merged_outcome(ci.get("pushed_sha"), head)
             impact.status = "merged"
+            # a merged PR has no failure to explain: drop a reason an earlier close
+            # ("PR closed without merge") or CI failure left behind
+            impact.fix_reason = None
         else:
             impact.pr_outcome = "closed"
             if impact.status not in ("merged", "failed"):
@@ -754,6 +766,7 @@ def record_pr_outcome(
         impact.status = "pr_open"
         impact.pr_outcome = None
         impact.resolved_at = None
+        impact.fix_reason = None
     impact.ci_result = ci
     session.commit()
     log.info(

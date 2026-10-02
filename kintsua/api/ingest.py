@@ -1,9 +1,11 @@
 """SDK and CLI ingest: ``POST /v1/ingest`` (runtime event batches) and ``POST /v1/watch/push``
 (``kintsua watch --push`` snapshots). Both authenticate with an SDK key.
 
-``/v1/ingest`` writes ``runtime_event`` rows (secrets in ``sample`` redacted again
-server-side, ``observed_at`` clamped to now, the ingest ``kind`` kept inside ``sample`` for
-the matcher) and queues ``match_runtime`` for the repo, debounced 30 s.
+``/v1/ingest`` writes ``runtime_event`` rows (secrets in ``tool_name`` and ``sample``
+redacted again server-side, an HTTP tool name's id / credential-like path segments collapsed
+to ``{id}`` / ``{token}`` the way the SDK names it, ``observed_at`` clamped to now, the
+ingest ``kind`` kept inside ``sample`` for the matcher) and queues ``match_runtime`` for the
+repo, debounced 30 s.
 
 ``/v1/watch/push`` stores the pushed canonical document as a snapshot of an org-scoped
 source (docs/CONTRACTS.md, "Source trust", rule 4): ``origin="push"``,
@@ -39,7 +41,7 @@ from kintsua.core.queue import JOB_MATCH_RUNTIME, enqueue
 from kintsua.core.storage import get_document
 from kintsua.core.util import redact_secrets, short_hash, utcnow
 from kintsua.matcher.issues import RUNTIME_FILE_PATH
-from kintsua.watchers.run import find_or_create_source, ingest_canonical_doc
+from kintsua.watchers.run import SourceNotShareable, find_or_create_source, ingest_canonical_doc
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +53,14 @@ MAX_SAMPLE_KEYS = 200
 MAX_SAMPLE_DEPTH = 6
 MAX_OP_VALUE_CHARS = 512
 HTTP_TOOL_RE = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+", re.IGNORECASE)
+HTTP_TOOL_NAME_RE = re.compile(r"(\S+)\s+(\S+)")
+# The SDK's path-segment rules (``kintsua.sdk.wrap.http_tool_name``), copied: ids become
+# ``{id}``; credential-like segments (bot tokens, webhook secrets: 20+ chars of [\w.-] with an
+# uppercase letter or a digit, or 8+ chars of [A-Z0-9] with a digit) become ``{token}``.
+ID_SEGMENT_RE = re.compile(r"\d+|[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{24,}", re.I)
+TOKEN_SEGMENT_RE = re.compile(
+    r"bot\d+:[\w-]+|(?=[\w.-]*[A-Z\d])[\w.-]{20,}|(?=[A-Z]*\d)[A-Z\d]{8,}"
+)
 PUSH_ORIGIN = "push"
 PUSH_SITE_SYMBOL = "kintsua watch --push"
 MAX_PUSH_CALL_SITES = 1000
@@ -176,11 +186,49 @@ def build_sample(event: IngestEvent) -> dict[str, Any]:
     return sample
 
 
+def _path_segment(segment: str) -> str:
+    if ID_SEGMENT_RE.fullmatch(segment):
+        return "{id}"
+    if TOKEN_SEGMENT_RE.fullmatch(segment):
+        return "{token}"
+    return segment
+
+
+def collapse_http_tool_name(tool_name: str) -> str:
+    """``"POST hooks.example/services/T0123ABCD/..."`` -> ``"POST hooks.example/services/
+    {token}/..."``: the shape ``kintsua.sdk.wrap.http_tool_name`` sends (method upper-cased,
+    host lower-cased, no userinfo, query or fragment, ids -> ``{id}``, credential-like
+    segments -> ``{token}``). Older SDKs and other clients send raw webhook paths; anything
+    that is not ``"<METHOD> <target>"`` is returned unchanged."""
+    m = HTTP_TOOL_NAME_RE.fullmatch(tool_name.strip())
+    if not m:
+        return tool_name
+    method, target = m.groups()
+    target = target.split("#", 1)[0].split("?", 1)[0]
+    prefix = ""
+    if "://" in target:
+        scheme, target = target.split("://", 1)
+        prefix = f"{scheme}://"
+    host, slash, path = target.partition("/")
+    host = host.rsplit("@", 1)[-1].lower()
+    collapsed = "/".join(_path_segment(seg) for seg in path.split("/")) if slash else ""
+    return f"{method.upper()} {prefix}{host}{slash}{collapsed}"
+
+
+def stored_tool_name(event: IngestEvent) -> str:
+    """``tool_name`` as stored: an HTTP name collapsed (``collapse_http_tool_name``), then
+    every tool name through ``redact_secrets``."""
+    name = event.tool_name
+    if infer_kind(event) == "http":
+        name = collapse_http_tool_name(name)
+    return redact_secrets(name)
+
+
 def runtime_event_row(repo: Repo, key_hash: str, event: IngestEvent, now: datetime) -> RuntimeEvent:
     return RuntimeEvent(
         repo_id=repo.id,
         sdk_key_hash=key_hash,
-        tool_name=event.tool_name,
+        tool_name=stored_tool_name(event),
         schema_fingerprint=event.schema_fingerprint,
         outcome=event.outcome,
         error_class=redact_secrets(event.error_class)[:255] if event.error_class else None,
@@ -267,16 +315,20 @@ def push_source(session: Session, org: Org, src: WatchSource) -> Source:
             existing.origin,
         )
         raise _conflict("this locator is not one of your pushed sources; the push was refused")
-    source = existing or find_or_create_source(
-        session,
-        src.kind,
-        locator,
-        display_name=src.display_name or src.locator,
-        vendor=src.vendor,
-        meta=push_source_meta(src),
-        origin=PUSH_ORIGIN,
-        owner_org_id=org.id,
-    )
+    try:
+        source = existing or find_or_create_source(
+            session,
+            src.kind,
+            locator,
+            display_name=src.display_name or src.locator,
+            vendor=src.vendor,
+            meta=push_source_meta(src),
+            origin=PUSH_ORIGIN,
+            owner_org_id=org.id,
+        )
+    except SourceNotShareable as e:  # lost a create race to a row this org may not use
+        log.warning("watch/push: %s refused: %s", locator, e)
+        raise _conflict("this locator is not one of your pushed sources; the push was refused")
     if source.origin != PUSH_ORIGIN or source.owner_org_id != org.id:  # lost a create race
         raise _conflict("this locator is not one of your pushed sources; the push was refused")
     foreign = session.scalar(
@@ -462,6 +514,7 @@ def watch_push(
 __all__ = [
     "build_sample",
     "change_event_ops",
+    "collapse_http_tool_name",
     "compact_diff",
     "dependency_name",
     "doc_operations",
@@ -476,5 +529,6 @@ __all__ = [
     "push_source_meta",
     "redact_sample",
     "router",
+    "stored_tool_name",
     "watch_push",
 ]

@@ -3,10 +3,18 @@
 Dependency-light so the CLI (``kintsua watch report``), the hosted job
 (``python -m kintsua.report.run``) and the public page (``GET /report/weekly``) all use the
 same renderer. ``kintsua.report.build`` fills the model from Postgres.
+
+Every vendor- or model-derived string (summaries, migration hints, vendor and source names,
+categories, versions, affected paths, failing-source errors) goes through ``md_escape`` /
+``md_code`` before it is placed in the Markdown, so fetched text can never add a link, a
+heading, raw HTML or a table cell to the page ``GET /report/weekly`` renders.
 """
 
 from __future__ import annotations
 
+import html
+import re
+import unicodedata
 from datetime import datetime
 from typing import Any
 
@@ -88,13 +96,41 @@ class WeeklyReport(BaseModel):
         return out
 
 
+# Markdown metacharacters that can start a link, an image, raw HTML / an autolink, emphasis,
+# a code span, a heading or a table cell; the backslash first so an escape in the text
+# cannot cancel ours
+_MD_META_RE = re.compile(r"([\\`*\[\]()<>#|])")
+# an underscore between two letters / digits (``get_weather``) never opens or closes
+# emphasis, so only the others are escaped and tool names stay readable
+_MD_UNDERSCORE_RE = re.compile(r"(?<![0-9A-Za-z])_|_(?![0-9A-Za-z])")
+
+
+def _one_line(text: object) -> str:
+    """Control characters dropped, every whitespace run (newlines included) one space."""
+    s = "".join(ch for ch in str(text) if ch.isspace() or unicodedata.category(ch) != "Cc")
+    return " ".join(s.split())
+
+
+def md_escape(text: object) -> str:
+    """``text`` as inert Markdown inline content: collapsed to one line, then the
+    metacharacters ``\\ ` * [ ] ( ) < > # |`` and non-intraword ``_`` backslash-escaped."""
+    s = _MD_META_RE.sub(r"\\\1", _one_line(text))
+    return _MD_UNDERSCORE_RE.sub(r"\\_", s)
+
+
+def md_code(text: object) -> str:
+    """``text`` as a code span: backslashes are literal inside one, so the only character
+    that could end it early (a backtick) is replaced instead."""
+    return "`" + _one_line(text).replace("`", "'") + "`"
+
+
 def _fmt_dt(d: datetime | None) -> str:
     return d.strftime("%Y-%m-%d") if d else "-"
 
 
 def _version_span(it: ReportItem) -> str:
     if it.from_version or it.to_version:
-        return f"{it.from_version or '?'} → {it.to_version or '?'}"
+        return f"{md_escape(it.from_version or '?')} → {md_escape(it.to_version or '?')}"
     return ""
 
 
@@ -167,8 +203,11 @@ def render_markdown(report: WeeklyReport, *, include_safe: bool = True, max_path
         lines.append("| Source | Kind | Failing since | Last error |")
         lines.append("|---|---|---|---|")
         for f in report.failing_sources:
-            err = (f.last_error or "").splitlines()[0][:120] if f.last_error else ""
-            lines.append(f"| {f.display_name} | {f.kind} | {_fmt_dt(f.failing_since)} | {err} |")
+            err = md_escape(_one_line(f.last_error.splitlines()[0])[:120]) if f.last_error else ""
+            lines.append(
+                f"| {md_escape(f.display_name)} | {md_escape(f.kind)} "
+                f"| {_fmt_dt(f.failing_since)} | {err} |"
+            )
         lines.append("")
 
     if report.notes:
@@ -185,14 +224,14 @@ def render_markdown(report: WeeklyReport, *, include_safe: bool = True, max_path
 
 
 def _render_item(it: ReportItem, max_paths: int) -> list[str]:
-    head = f"**{it.vendor or it.source_name}** · {it.source_kind}"
+    head = f"**{md_escape(it.vendor or it.source_name)}** · {md_escape(it.source_kind)}"
     span = _version_span(it)
     if span:
         head += f" · {span}"
     head += f" · {it.detected_at.strftime('%b %d')}"
-    out = [f"- {head}", f"  - {it.category}: {it.summary}"]
+    out = [f"- {head}", f"  - {md_escape(it.category)}: {md_escape(it.summary)}"]
     if it.affected_paths:
-        shown = ", ".join(f"`{p}`" for p in it.affected_paths[:max_paths])
+        shown = ", ".join(md_code(p) for p in it.affected_paths[:max_paths])
         more = (
             f" (+{len(it.affected_paths) - max_paths} more)"
             if len(it.affected_paths) > max_paths
@@ -200,10 +239,10 @@ def _render_item(it: ReportItem, max_paths: int) -> list[str]:
         )
         out.append(f"  - affects: {shown}{more}")
     if it.migration_hint:
-        out.append(f"  - fix: {it.migration_hint}")
+        out.append(f"  - fix: {md_escape(it.migration_hint)}")
     meta = []
     if it.rule_hits:
-        meta.append("rules: " + ", ".join(it.rule_hits[:4]))
+        meta.append("rules: " + ", ".join(md_escape(r) for r in it.rule_hits[:4]))
     if it.llm_confidence is not None:
         meta.append(f"model confidence {it.llm_confidence:.2f}")
     if it.url:
@@ -214,15 +253,18 @@ def _render_item(it: ReportItem, max_paths: int) -> list[str]:
 
 
 def render_rss(report: WeeklyReport, base_url: str) -> str:
-    """RSS 2.0 for ``GET /report/weekly?format=rss``. Items are the non-safe change events."""
+    """RSS 2.0 for ``GET /report/weekly?format=rss``. Items are the non-safe change events.
+
+    Titles are plain text on one line. A ``<description>`` is read as HTML by feed readers,
+    so the item's (escaped) Markdown is HTML-escaped as well: fetched text stays text."""
     from xml.sax.saxutils import escape
 
     items_xml = []
     for it in report.items:
         if it.severity == "safe":
             continue
-        title = f"[{it.severity}] {it.vendor or it.source_name}: {it.summary}"
-        desc = "\n".join(_render_item(it, 10))
+        title = _one_line(f"[{it.severity}] {it.vendor or it.source_name}: {it.summary}")
+        desc = html.escape("\n".join(_render_item(it, 10)), quote=False)
         link = it.url or f"{base_url}/report/weekly"
         items_xml.append(
             "<item>"

@@ -202,6 +202,7 @@ class FakeGitHubApp(GitHubApp):
         super().__init__(app_id="1", private_key="fake", base_url="https://api.github.com")
         self.repos: dict[str, FakeRepo] = {}
         self.tokens_issued: list[int] = []
+        self.clone_requests: list[tuple[int, str, float]] = []
 
     @property
     def configured(self) -> bool:
@@ -212,12 +213,13 @@ class FakeGitHubApp(GitHubApp):
             self.repos[full_name] = FakeRepo(full_name, repo_id=abs(hash(full_name)) % 10_000_000)
         return self.repos[full_name]
 
-    def installation_token(self, installation_id: int) -> str:
+    def installation_token(self, installation_id: int, *, min_ttl_s: float = 120) -> str:
         self.tokens_issued.append(installation_id)
         return f"ghs_fake_{installation_id}"
 
     def installation_client(self, installation_id: int):
         return FakeGithub(self, installation_id)
 
-    def clone_url(self, installation_id: int, full_name: str) -> str:
+    def clone_url(self, installation_id: int, full_name: str, *, min_ttl_s: float = 120) -> str:
+        self.clone_requests.append((installation_id, full_name, min_ttl_s))
         return f"https://x-access-token:{self.installation_token(installation_id)}@github.com/{full_name}.git"

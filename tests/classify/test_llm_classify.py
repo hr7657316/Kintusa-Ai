@@ -275,3 +275,24 @@ def test_model_summary_and_hint_are_one_bounded_line(fake_llm) -> None:
     assert result.migration_hint is not None
     assert "\n" not in result.migration_hint and len(result.migration_hint) <= 1000
     assert result.migration_hint.startswith("Do this # Then [click](https://evil.example) hhh")
+
+
+def test_max_tokens_and_effort_pass_through_to_complete_json(fake_llm, settings) -> None:
+    from kintsua.core.llm import JSON_MAX_TOKENS
+
+    answer = {
+        "severity": "safe",
+        "category": "docs_only",
+        "summary": "wording",
+        "affected_paths": [],
+        "migration_hint": None,
+        "confidence": 0.9,
+    }
+    fake_llm.queue_json(answer)
+    fake_llm.queue_json(answer)
+    classify_with_llm(changelog_event(), consumer_operations=[])
+    classify_with_llm(changelog_event(), consumer_operations=[], max_tokens=20000, effort="low")
+    default, explicit = fake_llm.calls[-2:]
+    assert default["max_tokens"] == JSON_MAX_TOKENS
+    assert default["effort"] == settings.llm_classifier_effort
+    assert explicit["max_tokens"] == 20000 and explicit["effort"] == "low"

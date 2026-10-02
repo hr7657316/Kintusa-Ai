@@ -14,7 +14,7 @@ import logging
 from kintsua.classify.prompts import SYSTEM_PROMPT, build_user_message
 from kintsua.classify.schema import Classification, LLMClassification
 from kintsua.core.events import ChangeEvent
-from kintsua.core.llm import LLM, LLMUsage, get_llm
+from kintsua.core.llm import JSON_MAX_TOKENS, LLM, LLMUsage, get_llm
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +44,8 @@ def classify_with_llm(
     display_name: str | None = None,
     llm: LLM | None = None,
     rules_result: Classification | None = None,
+    max_tokens: int | None = None,
+    effort: str | None = None,
 ) -> tuple[Classification, LLMUsage]:
     """Ask the model for a ``LLMClassification`` and turn it into a ``Classification``.
 
@@ -51,6 +53,10 @@ def classify_with_llm(
     call (no repo names). ``rules_result`` (when the rules already decided) is shown to the
     model as a floor it may confirm or raise. ``rule_hits`` is ``["llm"]`` plus
     ``"llm_low_confidence"`` when the confidence fell below the threshold.
+
+    ``max_tokens`` (default ``JSON_MAX_TOKENS``) and ``effort`` (default
+    ``Settings.llm_classifier_effort``) pass through to ``LLM.complete_json``, so a caller
+    can retry a truncated answer (``LLMTruncated``) with a bigger budget or less thinking.
     """
     llm = llm or get_llm()
     settings = llm.settings
@@ -65,7 +71,8 @@ def classify_with_llm(
         user,
         LLMClassification,
         model=settings.llm_classifier_model,
-        effort=settings.llm_classifier_effort,
+        max_tokens=max_tokens or JSON_MAX_TOKENS,
+        effort=effort or settings.llm_classifier_effort,
     )
     threshold = settings.llm_confidence_threshold
     severity = parsed.severity

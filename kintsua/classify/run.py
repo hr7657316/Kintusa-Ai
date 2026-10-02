@@ -13,7 +13,11 @@ Flow per change event row:
    verdict is kept unless the model *escalates* (``breaking``, or ``degraded`` over
    ``safe``) with confidence at or above ``Settings.llm_confidence_threshold``; the model
    never lowers a rule severity. Both outcomes are recorded in ``rule_hits``
-   (``"llm"``, ``"llm_promoted"``, ``"llm_low_confidence"``).
+   (``"llm"``, ``"llm_promoted"``, ``"llm_low_confidence"``). A model answer cut off at
+   ``max_tokens`` (``LLMTruncated``) is retried once with ``TRUNCATED_RETRY_MAX_TOKENS``
+   at one effort step lower; truncated again, the model's verdict is ``unknown`` with the
+   ``"llm_truncated"`` rule hit (a refusal: ``"llm_refused"``; invalid output:
+   ``"llm_invalid_output"``).
 4. Write the ``classification`` row (``needs_human`` when the final severity is
    ``unknown``), commit, enqueue ``match_event`` with dedupe key ``match_event:<id>``.
 
@@ -45,7 +49,7 @@ from kintsua.classify.rules import classify_by_rules
 from kintsua.classify.schema import Classification
 from kintsua.core.config import get_settings
 from kintsua.core.events import ChangeEvent
-from kintsua.core.llm import LLMRefused, LLMUsage, get_llm
+from kintsua.core.llm import LLMRefused, LLMTruncated, LLMUsage, get_llm
 from kintsua.core.models import CallSite, ChangeEventRow, Dependency, Source
 from kintsua.core.models import Classification as ClassificationRow
 from kintsua.core.queue import (
@@ -62,6 +66,11 @@ log = logging.getLogger(__name__)
 RULE_LLM_PROMOTED = "llm_promoted"
 RULE_LLM_REFUSED = "llm_refused"
 RULE_LLM_INVALID = "llm_invalid_output"
+RULE_LLM_TRUNCATED = "llm_truncated"
+#: the single retry after a truncated answer: a bigger output budget (still small enough
+#: for a plain, non-streaming request) at one effort step lower, so less of it is thinking
+TRUNCATED_RETRY_MAX_TOKENS = 20000
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 RULE_DIFF_TRUNCATED = "diff_truncated"
 SEVERITY_RANK = {"breaking": 0, "degraded": 1, "safe": 2, "unknown": 3}
 MAX_CONSUMER_OPERATIONS = 100
@@ -266,6 +275,13 @@ def _cap_hint(hint: str | None) -> str | None:
     return flat or None
 
 
+def lower_effort(effort: str) -> str:
+    """One step down ``EFFORT_LEVELS`` (``low`` stays ``low``; an unknown value is kept)."""
+    if effort not in EFFORT_LEVELS:
+        return effort
+    return EFFORT_LEVELS[max(0, EFFORT_LEVELS.index(effort) - 1)]
+
+
 def _fallback_unknown(event: ChangeEvent, reason_rule: str, detail: str) -> Classification:
     return Classification(
         severity="unknown",
@@ -323,14 +339,40 @@ def classify_change_event(session: Session, change_event_row: ChangeEventRow) ->
     usage: LLMUsage | None = None
     if should_call_model(event, rules_result):
         consumers = consumer_operations_for(session, row.source_id)
-        try:
-            llm_result, usage = classify_with_llm(
+        llm = get_llm()
+
+        def ask(**budget: Any) -> tuple[Classification, LLMUsage]:
+            return classify_with_llm(
                 event,
                 consumer_operations=consumers,
                 display_name=display_name,
-                llm=get_llm(),
+                llm=llm,
                 rules_result=rules_result,
+                **budget,
             )
+
+        try:
+            try:
+                llm_result, usage = ask()
+            except LLMTruncated as e:
+                # a subclass of LLMRefused: caught first. Thinking ate the budget; retry
+                # once with more room and less thinking before giving up
+                retry_effort = lower_effort(llm.settings.llm_classifier_effort)
+                log.warning(
+                    "change_event %s: model answer truncated (%s); retrying with "
+                    "max_tokens=%s effort=%s",
+                    row.id,
+                    e,
+                    TRUNCATED_RETRY_MAX_TOKENS,
+                    retry_effort,
+                )
+                try:
+                    llm_result, usage = ask(
+                        max_tokens=TRUNCATED_RETRY_MAX_TOKENS, effort=retry_effort
+                    )
+                except LLMTruncated as e2:
+                    log.warning("change_event %s: model answer truncated again: %s", row.id, e2)
+                    llm_result = _fallback_unknown(event, RULE_LLM_TRUNCATED, str(e2))
         except LLMRefused as e:
             log.warning("change_event %s: model refused: %s", row.id, e)
             llm_result = _fallback_unknown(event, RULE_LLM_REFUSED, str(e))

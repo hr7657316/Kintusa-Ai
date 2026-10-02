@@ -29,8 +29,9 @@ SECRET_RE = re.compile(
     r"|basic\s+(?=[a-z]*[\d+/=])[\w+/=]{8,}|github_pat_\w{22,}|xox[abeprs]-[0-9a-z\-]{10,}"
     r"|xapp-[0-9a-z\-]{10,}|AKIA[0-9A-Z]{16}|AIza[\w\-]{35}|sk-ant-[\w\-]{20,}|kts_[\w\-]{20,}"
     r"|sk-(proj|svcacct|admin)-[\w\-]{20,}|sk-[0-9a-z]{20,}|npm_[0-9a-z]{36}|pypi-[\w\-]{50,}"
-    r"|(api[_-]?key|token|secret|password|private[_-]?key|(proxy-)?authorization)[\"']?\s*[:=]\s*"
-    r"[\"']?([a-z]+\s+)?[^\s\"',}]{6,}|eyJ[\w\-]{10,}\.[\w\-]{10,}\.[\w\-]{10,}"
+    r"|(api[_-]?key|token|secret|password|private[_-]?key)[\"']?\s*[:=]\s*[\"']?(bearer\s+)?[\"']?"
+    r"[^\s\"',}]{6,}|(proxy-)?authorization[\"']?\s*[:=]\s*[\"']?([a-z][\w-]*\s+)?[^\s\"',}]{6,}"
+    r"|eyJ[\w\-]{10,}\.[\w\-]{10,}\.[\w\-]{10,}"
     r"|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)",  # URL userinfo (user:password@)
     re.I,
 )
