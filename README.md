@@ -82,8 +82,7 @@ Pick the path that matches what you want to do. Each one is a numbered checklist
        runs-on: ubuntu-latest
        steps:
          - uses: actions/checkout@v4
-         # use @main once the code is merged to a main branch; today the only branch is:
-         - uses: hr7657316/Kintusa-Ai@claude/zen-meitner-9zwba3
+         - uses: hr7657316/Kintusa-Ai@main
            with:
              server: https://mcp.vendor.com/mcp
              fail-on: breaking            # or degraded
@@ -215,7 +214,7 @@ The hosted product is one flag away: `kintsua watch diff --push --repo owner/nam
 As a GitHub Action:
 
 ```yaml
-- uses: hr7657316/Kintusa-Ai@main   # until main exists: @claude/zen-meitner-9zwba3
+- uses: hr7657316/Kintusa-Ai@main
   with:
     server: https://mcp.vendor.com/mcp
     fail-on: breaking
