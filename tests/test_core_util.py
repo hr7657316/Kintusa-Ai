@@ -7,7 +7,7 @@ import pytest
 from kintsua.core.util import redact_secrets
 
 SECRET_SAMPLES = [
-    ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+    (("Authorization: Basic " + "dXNlcjpwYXNzd29yZA=="), "dXNlcjpwYXNzd29yZA=="),
     ("authorization: Token 0123456789abcdef0123456789abcdef", "0123456789abcdef0123456789abcdef"),
     ('{"Proxy-Authorization": "Digest abcdef123456"}', "abcdef123456"),
     (("Authorization: Bearer abcdefghi" + "jklmnopqrstuvwxyz"), "abcdefghijklmnopqrstuvwxyz"),
@@ -27,11 +27,20 @@ SECRET_SAMPLES = [
     ("git clone https://x-access-token:ghs_tok123@github.com/a/b.git", "ghs_tok123"),
     ("postgresql+psycopg://postgres:dev-pass@db:5432/kintsua", "dev-pass"),
     # a Basic credential without its header name; private key spellings
-    ("echo: basic dXNlcjpwYXNzd29yZDEyMw==", "dXNlcjpwYXNzd29yZDEyMw=="),
-    ("upstream said Basic YWxhZGRpbjpvcGVuc2VzYW1l", "YWxhZGRpbjpvcGVuc2VzYW1l"),
-    ("private-key=MIIEvQIBADANBgkqhkiG9w0BAQEFAAS", "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"),
-    ('{"privateKey": "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"}', "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"),
-    ('{"private_key": "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"}', "MIIEvQIBADANBgkqhkiG9w0BAQEFAAS"),
+    (("echo: basic " + "dXNlcjpwYXNzd29yZDEyMw=="), "dXNlcjpwYXNzd29yZDEyMw=="),
+    (("upstream said Basic " + "YWxhZGRpbjpvcGVuc2VzYW1l"), "YWxhZGRpbjpvcGVuc2VzYW1l"),
+    (
+        ("private-key=MII" + "EvQIBADANBgkqhkiG9w0BAQEFAAS"),
+        ("MII" + "EvQIBADANBgkqhkiG9w0BAQEFAAS"),
+    ),
+    (
+        ('{"privateKey": "MII' + 'EvQIBADANBgkqhkiG9w0BAQEFAAS"}'),
+        ("MII" + "EvQIBADANBgkqhkiG9w0BAQEFAAS"),
+    ),
+    (
+        ('{"private_key": "MII' + 'EvQIBADANBgkqhkiG9w0BAQEFAAS"}'),
+        ("MII" + "EvQIBADANBgkqhkiG9w0BAQEFAAS"),
+    ),
     # still covered
     ("ghp_" + "a" * 36, "a" * 36),
     ("sk_live_" + "b" * 24, "b" * 24),
