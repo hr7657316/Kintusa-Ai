@@ -160,7 +160,24 @@ Kintsua never pushes to a protected branch and never force-pushes. Everything it
 
 ## 7. Architecture
 
-One Python monorepo, one Postgres, one FastAPI service, one worker pool. Five components talk through the database and a job queue, never directly to each other, so each can be built and tested alone.
+One Python monorepo, one Postgres, one FastAPI service, one worker pool. Five components talk through the database and a job queue, never directly to each other, so each can be built and tested alone. The diagrams below are Mermaid; GitHub renders them inline.
+
+### Components
+
+Change events flow left to right from the watchers to a GitHub PR. The indexer and the runtime SDK feed the matcher from above and below, and GitHub webhooks trigger re-indexing.
+
+```mermaid
+flowchart LR
+    I["Indexer<br/>maps call sites"]
+    W["Watchers<br/>poll and diff"] -->|change event| C["Classifier<br/>rules, then LLM"]
+    C -->|severity| M["Matcher<br/>joins call sites"]
+    I -->|call sites| M
+    R["Runtime SDK<br/>failed calls, schema drift"] -->|runtime events| M
+    M -->|impact| F["Fixer<br/>sandbox + PR"]
+    F -->|PR + issue| G["GitHub App<br/>issues and PRs"]
+    G -->|install and push webhooks| I
+    M ~~~ DB[("Postgres: snapshots, change events, call sites, impacts, job queue<br/>every arrow above is a job row in this queue")]
+```
 
 | Component | Reads | Writes | Job kinds |
 |---|---|---|---|
@@ -171,11 +188,240 @@ One Python monorepo, one Postgres, one FastAPI service, one worker pool. Five co
 | **Fixer** (`kintsua/fixer`) | impacts, snapshots | PRs, impact status/outcomes | `fix_impact`, `pr_outcome` |
 | **API** (`kintsua/api`) | GitHub webhooks, SDK ingest, sessions | orgs, repos, runtime events, jobs | `billing_tick` |
 
-Stack: Python 3.12, FastAPI, SQLAlchemy 2 + Alembic, Postgres 16 (also the queue, `SELECT ... FOR UPDATE SKIP LOCKED`), httpx, the official `mcp` client (1.x and 2.x), tree-sitter (Python, TypeScript, TSX), PyGithub, Docker sandboxes, the Anthropic or OpenAI SDK behind one `core/llm.py` adapter (structured output for the classifier, a strict-schema tool loop for the fixer), Pydantic for every event schema.
+### Deployment
 
-Data model: twelve tables (`org`, `repo`, `source`, `snapshot`, `change_event`, `classification`, `dependency`, `call_site`, `impact`, `runtime_event`, `job`, plus `subscriber` for the weekly report). Every event is immutable; state lives on `impact` and `job`. See `docs/SPEC.md` for the product spec and `docs/CONTRACTS.md` for the component contracts (job kinds, payloads, dialects, cross-module seams, the impact status machine).
+One image runs as a web process and as worker processes. Postgres holds all state and is also the job queue.
 
-Scheduling: a self-perpetuating `tick` job every 15 minutes enqueues `poll_source` for due sources (MCP 6h, OpenAPI 24h, packages 6h, changelog 24h; 1h for sources a paying customer depends on), with exponential backoff per failing source up to 48 hours; the weekly report runs on Mondays and the billing sync on the 1st.
+```mermaid
+flowchart LR
+    subgraph outside["Outside world"]
+        direction TB
+        GH["GitHub<br/>webhooks, issues, PRs, checks"]
+        AGENT["Customer agents<br/>runtime SDK"]
+        CI["Customer CI<br/>kintsua watch"]
+        STRIPE["Stripe<br/>Checkout + webhooks"]
+        VENDORS["Upstreams<br/>OpenAPI specs, MCP servers,<br/>PyPI, npm, changelog pages"]
+    end
+
+    subgraph deploy["Kintsua deployment: one image, Fly.io or docker compose"]
+        direction TB
+        WEB["web process<br/>python -m kintsua.api<br/>FastAPI, HTMX settings page,<br/>public weekly report"]
+        PG[("Postgres 16<br/>all state + job queue")]
+        WORKER["worker processes x2<br/>python -m kintsua.worker<br/>every job handler"]
+        S3[("S3-compatible storage<br/>snapshots over 256 KB")]
+        SBX["Docker sandbox per fix job<br/>15 min, 4 GB, 2 CPUs,<br/>no network for agent steps"]
+        WEB <--> PG
+        PG <-->|SKIP LOCKED queue| WORKER
+        WORKER --> S3
+        WORKER --> SBX
+    end
+
+    LLMAPI["Anthropic or OpenAI API<br/>via core/llm.py"]
+
+    GH -->|signed webhooks| WEB
+    AGENT -->|POST /v1/ingest| WEB
+    CI -->|POST /v1/watch/push| WEB
+    WORKER -->|poll, network-guarded| VENDORS
+    WORKER -->|issues, PRs, comments| GH
+    WORKER -->|classifier residue, fixer agent| LLMAPI
+    WEB <--> STRIPE
+```
+
+### A breaking change, end to end
+
+What happens when a vendor's MCP server makes a tool input required. This is the path `tests/e2e/test_mcp_to_issue.py` runs against a real local MCP server.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as Vendor MCP server
+    participant W as Watcher
+    participant Q as Postgres queue
+    participant C as Classifier
+    participant M as Matcher
+    participant G as GitHub
+    participant F as Fixer + sandbox
+
+    Note over W,Q: tick every 15 min enqueues poll_source for due sources
+    Q->>W: poll_source
+    W->>V: initialize, tools/list, resources/list, prompts/list
+    V-->>W: tools with inputSchema (v1.1.0)
+    W->>W: canonicalise, hash, diff against the last snapshot
+    W->>Q: snapshot + change_event, enqueue classify_event
+    Q->>C: classify_event
+    C->>C: rule required_added: breaking / required_param
+    C->>Q: classification, enqueue match_event
+    Q->>M: match_event
+    M->>M: join affected paths with this repo's call sites, apply mutes
+    M->>Q: impact (detected), enqueue open_issue
+    Q->>M: open_issue
+    M->>G: issue [Kintsua] ... labels kintsua, severity:breaking
+    M->>Q: fix mode pr and category fixable: enqueue fix_impact
+    Q->>F: fix_impact
+    F->>F: clone, baseline tests, agent loop, validate patch
+    F->>G: branch kintsua/vendor-hash, PR that closes the issue, comment
+    G-->>F: webhook pull_request closed, enqueue pr_outcome
+    F->>Q: impact merged, outcome merged_as_is
+```
+
+### Job graph
+
+Every arrow between components is a row in the `job` table, claimed with `SELECT ... FOR UPDATE SKIP LOCKED`. Jobs that must not pile up carry a dedupe key, for example one queued `index_repo` per repo, which is how the push debounce works.
+
+```mermaid
+flowchart TD
+    tick(["tick"]) -->|"every 15 min"| tick
+    tick -->|"sources due for a poll"| poll_source(["poll_source"])
+    tick -->|"Mondays"| weekly_report(["weekly_report"])
+    tick -->|"1st of the month"| billing_tick(["billing_tick"])
+    poll_source -->|"content hash changed"| classify_event(["classify_event"])
+    push["POST /v1/watch/push"] -->|"pushed snapshot changed"| classify_event
+    classify_event --> match_event(["match_event"])
+    match_event -->|"auto issues on"| open_issue(["open_issue"])
+    review["Settings page: open a draft issue"] -->|"human review"| open_issue
+    open_issue -->|"fix mode pr and rename,<br/>required_param or deprecation"| fix_impact(["fix_impact"])
+    install["webhook: installation"] --> index_repo(["index_repo"])
+    gitpush["webhook: push to default branch"] -->|"5 min debounce"| index_repo
+    index_repo -->|"new sources"| poll_source
+    ingest["POST /v1/ingest"] --> match_runtime(["match_runtime"])
+    match_runtime -->|"3+ schema mismatches in 24 h,<br/>no documented change"| open_issue
+    closed["webhook: pull_request closed"] --> pr_outcome(["pr_outcome"])
+```
+
+### Impact lifecycle
+
+State lives on `impact` and `job`; every event row is immutable.
+
+```mermaid
+stateDiagram-v2
+    [*] --> detected: matcher joined a change to a call site
+    detected --> issued: issue opened, automatically or after review
+    detected --> dismissed: muted, or the call site was removed
+    issued --> fixing: fix_impact started
+    issued --> failed: fixer refused, reason on the issue
+    issued --> dismissed: closed by a human, muted, or call site removed
+    fixing --> pr_open: validated PR opened
+    fixing --> failed: validation failed or the agent needs a human
+    pr_open --> merged: customer merged the PR
+    pr_open --> failed: customer CI failed on the PR
+    pr_open --> dismissed: PR closed without merging
+    merged --> [*]
+    failed --> [*]
+    dismissed --> [*]
+```
+
+### Data model
+
+Twelve tables: the eleven from the spec plus `subscriber` for the weekly report, which is not drawn here. `docs/SPEC.md` is the product spec and `docs/CONTRACTS.md` holds the component contracts: job kinds, payloads, path dialects, cross-module seams and the source trust rules.
+
+```mermaid
+erDiagram
+    ORG ||--o{ REPO : installs
+    ORG |o--o{ SOURCE : "owns pushed"
+    REPO ||--o{ DEPENDENCY : "depends on"
+    SOURCE |o--o{ DEPENDENCY : watches
+    DEPENDENCY ||--o{ CALL_SITE : "called from"
+    SOURCE ||--o{ SNAPSHOT : captures
+    SOURCE ||--o{ CHANGE_EVENT : emits
+    SNAPSHOT |o--o{ CHANGE_EVENT : "from / to"
+    CHANGE_EVENT ||--o| CLASSIFICATION : "classified as"
+    REPO ||--o{ IMPACT : "affected by"
+    CHANGE_EVENT ||--o{ IMPACT : causes
+    CLASSIFICATION |o--o{ IMPACT : explains
+    REPO ||--o{ RUNTIME_EVENT : reports
+
+    ORG {
+        uuid id PK
+        bigint github_installation_id UK
+        string plan "free or pro"
+        string sdk_key_hash "sha256, shown once"
+    }
+    REPO {
+        uuid id PK
+        uuid org_id FK
+        string full_name
+        string default_branch
+        string last_indexed_sha
+        jsonb config "parsed .kintsua.yml"
+    }
+    SOURCE {
+        uuid id PK
+        string kind "openapi, mcp, pypi, npm, changelog"
+        text locator UK "with kind"
+        string origin "seed, customer, push, runtime, observed"
+        int poll_interval_s
+        timestamptz last_polled_at
+    }
+    SNAPSHOT {
+        uuid id PK
+        uuid source_id FK
+        string content_hash
+        jsonb storage_ref "inline or S3"
+    }
+    CHANGE_EVENT {
+        uuid id PK
+        uuid source_id FK
+        jsonb diff "ChangeEvent with ChangeOps"
+        timestamptz detected_at
+    }
+    CLASSIFICATION {
+        uuid id PK
+        uuid change_event_id FK
+        string severity "breaking, degraded, safe, unknown"
+        string category
+        jsonb affected_paths
+        jsonb rule_hits
+        float llm_confidence
+    }
+    DEPENDENCY {
+        uuid id PK
+        uuid repo_id FK
+        uuid source_id FK
+        string kind
+        string name
+        bool discovered_at_runtime
+    }
+    CALL_SITE {
+        uuid id PK
+        uuid dependency_id FK
+        text file_path
+        int line
+        text operation "METHOD /path, tool name or SDK method"
+        jsonb args_shape
+    }
+    IMPACT {
+        uuid id PK
+        uuid repo_id FK
+        uuid change_event_id FK
+        string status
+        int github_issue_number
+        int github_pr_number
+        string pr_outcome
+    }
+    RUNTIME_EVENT {
+        uuid id PK
+        uuid repo_id FK
+        text tool_name
+        string outcome "ok, error, schema_mismatch"
+        string schema_fingerprint
+        timestamptz observed_at
+    }
+    JOB {
+        uuid id PK
+        string kind
+        jsonb payload
+        string status "queued, running, done, failed"
+        int attempts
+        timestamptz run_after
+        string dedupe_key
+    }
+```
+
+### Stack and scheduling
+
+Stack: Python 3.12, FastAPI, SQLAlchemy 2 + Alembic, Postgres 16 (also the queue), httpx, the official `mcp` client (1.x and 2.x), tree-sitter (Python, TypeScript, TSX), PyGithub, Docker sandboxes, the Anthropic or OpenAI SDK behind one `core/llm.py` adapter (structured output for the classifier, a strict-schema tool loop for the fixer), Pydantic for every event schema.
+
+Scheduling: a self-perpetuating `tick` job every 15 minutes enqueues `poll_source` for due sources (MCP 6h, OpenAPI 24h, packages 6h, changelog 24h; 1h for sources a paying customer depends on), with exponential backoff per failing source up to 48 hours. The weekly report runs on Mondays and the billing sync on the 1st.
 
 ## 8. Running it yourself
 
