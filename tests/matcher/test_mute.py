@@ -56,3 +56,20 @@ def test_candidates_include_every_spelling():
     assert "/v1/charges/{id}" in cands
     assert "stripe" in cands
     assert "stripe:post /v1/charges/ch_1Nxyz123456789/" in cands
+
+
+def test_tool_patterns_apply_to_dotted_tool_names_of_mcp_dependencies():
+    assert is_muted(["tool:browser.*"], None, "browser.navigate", tool=True)
+    assert is_muted(["tool:browser.navigate"], "mcp-x", "browser.navigate", tool=True)
+    assert is_muted(["tool:browser.*"], None, "tool:browser.navigate")
+    # an SDK symbol of a package dependency is not an MCP tool
+    assert not is_muted(["tool:*"], "stripe", "stripe.Charge.create")
+    assert not is_muted(["tool:browser.*"], None, "browser.navigate")
+    # an explicit sdk: spelling stays an SDK symbol even on an mcp dependency
+    assert not is_muted(["tool:*"], None, "sdk:browser.navigate", tool=True)
+
+
+def test_package_and_vendor_patterns_mute_a_package():
+    assert is_muted(["stripe"], "stripe", "package:stripe")
+    assert is_muted(["package:stripe"], "stripe", "package:stripe")
+    assert not is_muted(["package:slack-sdk"], "stripe", "package:stripe")

@@ -116,3 +116,16 @@ def test_cli_report_markdown_and_since(tmp_path):
     res = runner.invoke(app, ["watch", "report", "--dir", str(d), "--json"], catch_exceptions=False)
     data = json.loads(res.stdout)
     assert data["stats"]["change_events"] == 2 and data["items"][0]["summary"] == "two hours ago"
+
+
+def test_report_skips_damaged_history_lines(tmp_path):
+    now = datetime.now(UTC)
+    d = tmp_path / ".kintsua"
+    write_history(d, [change(now - timedelta(hours=1), "breaking", summary="kept")])
+    with (d / "history.jsonl").open("a") as f:
+        f.write("<<<<<<< HEAD\n[1, 2]\n")  # a merge conflict marker and a non-object row
+    res = runner.invoke(app, ["watch", "report", "--dir", str(d)], catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    assert "kept" in res.stdout and "| Change events | 1 |" in res.stdout
+    assert "line 2 is not a JSON object; skipped" in res.stderr
+    assert "line 3 is not a JSON object; skipped" in res.stderr

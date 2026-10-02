@@ -17,6 +17,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -135,6 +136,11 @@ def create_checkout_session(
     }
 
 
+def _checkout(session: Session, user: SessionUser, body: CheckoutBody) -> dict[str, Any]:
+    org = pick_org(session, user, body.org_id)
+    return create_checkout_session(session, org, email=body.email)
+
+
 @router.post("/checkout")
 async def checkout(
     request: Request,
@@ -147,8 +153,7 @@ async def checkout(
             detail="billing is not configured (STRIPE_SECRET_KEY / STRIPE_PRICE_ID)",
         )
     body = await read_body(request, CheckoutBody)
-    org = pick_org(session, user, body.org_id)
-    result = create_checkout_session(session, org, email=body.email)
+    result = await run_in_threadpool(_checkout, session, user, body)
     # HTMX follows HX-Redirect; JSON clients read "url".
     return JSONResponse(result, headers={"HX-Redirect": result["url"]})
 
@@ -254,6 +259,12 @@ def handle_stripe_event(session: Session, event: Any) -> dict[str, Any] | None:
     return None
 
 
+def _apply_stripe_event(session: Session, event: Any) -> dict[str, Any] | None:
+    result = handle_stripe_event(session, event)
+    session.commit()
+    return result
+
+
 @router.post("/webhook")
 async def stripe_webhook(request: Request, session: Session = Depends(get_db)) -> Response:
     s = get_settings()
@@ -270,8 +281,7 @@ async def stripe_webhook(request: Request, session: Session = Depends(get_db)) -
         log.warning("Stripe webhook rejected: %s", type(e).__name__)
         raise HTTPException(status_code=400, detail="invalid Stripe signature")
     etype = str(_get(event, "type") or "")
-    result = handle_stripe_event(session, event)
-    session.commit()
+    result = await run_in_threadpool(_apply_stripe_event, session, event)
     if result is None:
         return JSONResponse({"ok": True, "ignored": etype}, status_code=202)
     return JSONResponse({"ok": True, "handled": etype, **result})
@@ -318,10 +328,31 @@ def sync_subscription_quantity(session: Session, org: Org, stripe: Any) -> dict[
     return {"org_id": str(org.id), "quantity": quantity, "previous": current, "changed": changed}
 
 
+def flag_inactive_org(org: Org) -> None:
+    """An uninstalled org's subscription keeps billing until someone cancels it in Stripe:
+    leave its quantity alone and flag it for the operator (a reinstall reuses the org)."""
+    settings = dict(org.settings or {})
+    warning = settings.get("billing_warning")
+    if isinstance(warning, dict) and warning.get("kind") == "org_inactive":
+        return
+    settings["billing_warning"] = {
+        "kind": "org_inactive",
+        "at": utcnow().isoformat(),
+        "subscription": settings.get("stripe_subscription_id"),
+    }
+    org.settings = settings
+    log.warning(
+        "billing_tick: org %s is uninstalled but subscription %s is still active",
+        org.name,
+        settings.get("stripe_subscription_id"),
+    )
+
+
 @job_handler(JOB_BILLING_TICK)
 def billing_tick(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
-    """First of the month: set every pro org's subscription quantity to its watched
-    integration count. Skips (and logs) when Stripe is not configured."""
+    """First of the month: set every active pro org's subscription quantity to its watched
+    integration count (uninstalled orgs are flagged instead). Skips (and logs) when Stripe
+    is not configured."""
     orgs = pro_orgs(session)
     if not stripe_configured():
         log.warning("billing_tick: Stripe is not configured; skipping %d pro org(s)", len(orgs))
@@ -330,7 +361,12 @@ def billing_tick(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
     updated = 0
     errors: list[str] = []
     results: list[dict[str, Any]] = []
+    inactive: list[str] = []
     for org in orgs:
+        if not org.active:
+            flag_inactive_org(org)
+            inactive.append(str(org.id))
+            continue
         try:
             res = sync_subscription_quantity(session, org, stripe)
         except Exception as e:  # noqa: BLE001 - one org's Stripe trouble must not stop the rest
@@ -342,7 +378,13 @@ def billing_tick(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
             updated += 1
     session.commit()
     log.info("billing_tick: %d org(s), %d updated, %d error(s)", len(orgs), updated, len(errors))
-    return {"orgs": len(orgs), "updated": updated, "errors": errors, "results": results}
+    return {
+        "orgs": len(orgs),
+        "updated": updated,
+        "errors": errors,
+        "results": results,
+        "inactive": inactive,
+    }
 
 
 __all__ = [
@@ -351,6 +393,7 @@ __all__ = [
     "PRO_PLAN",
     "billing_tick",
     "create_checkout_session",
+    "flag_inactive_org",
     "handle_stripe_event",
     "pricing_line",
     "pro_orgs",

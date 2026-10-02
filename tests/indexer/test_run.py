@@ -99,7 +99,9 @@ def test_first_index_writes_rows_sources_jobs_and_the_install_issue(session, fak
         allow_network=False,
     )
     assert res.head_sha == SHA1 and res.error is None
-    assert (res.dependencies, res.call_sites, res.watched, res.unwatched) == (5, 6, 5, 0)
+    # the stdio server ``uvx mcp-server-fetch`` is never run by the hosted worker: unwatched
+    # (its package is watched through PyPI instead)
+    assert (res.dependencies, res.call_sites, res.watched, res.unwatched) == (5, 6, 4, 1)
     assert res.files_parsed == 5 and res.parse_errors == 0
     assert res.install_issue_created and res.install_issue_number == 1
     assert (
@@ -139,15 +141,31 @@ def test_first_index_writes_rows_sources_jobs_and_the_install_issue(session, fak
         and repo.last_index_error is None
     )
     assert repo.install_issue_number == 1
-    # one poll_source job per new source, deduped like the tick does it
+    # trust rule 1: sdk_map-derived sources are seed, everything from the repo is customer
+    origins = {(s.kind, s.locator): s.origin for s in session.scalars(select(Source))}
+    assert origins == {
+        ("pypi", "openai-agents"): "seed",
+        ("changelog", "https://github.com/openai/openai-agents-python/releases"): "seed",
+        ("pypi", "stripe"): "seed",
+        ("openapi", "https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json"): (
+            "seed"
+        ),
+        ("pypi", "mcp-server-fetch"): "customer",
+        ("mcp", "uvx mcp-server-fetch"): "customer",
+        ("mcp", "https://mcp.stripe.com"): "customer",
+    }
+    stdio = session.scalar(select(Source).where(Source.locator == "uvx mcp-server-fetch"))
+    assert not stdio.active and "never runs a command line" in stdio.last_error
+    # one poll_source job per new pollable source (never the stdio command), deduped like
+    # the tick does it
     jobs = list(session.scalars(select(Job).where(Job.kind == "poll_source")))
-    assert len(jobs) == res.new_sources == 7
+    assert len(jobs) == res.new_sources == 6
     assert {j.dedupe_key for j in jobs} == {
-        f"poll_source:{s.id}" for s in session.scalars(select(Source))
+        f"poll_source:{s.id}" for s in session.scalars(select(Source)) if s.id != stdio.id
     }
 
     issue = fake_github.repo("acme/billing-agent").issues[1]
-    assert issue.title == "Kintsua is watching 5 of your 5 external dependencies"
+    assert issue.title == "Kintsua is watching 4 of your 5 external dependencies"
     assert [lb.name for lb in issue.labels] == ["kintsua"]
     assert "| `stripe` (Stripe) | Python package | 🟢 watched (pypi + openapi) | 5 |" in issue.body
     assert (
@@ -157,6 +175,10 @@ def test_first_index_writes_rows_sources_jobs_and_the_install_issue(session, fak
     assert (
         "| `openai-agents` (OpenAI Agents SDK) | Python package | 🟢 watched (pypi + changelog) | 1 |"
         in issue.body
+    )
+    assert (
+        "| **fetch** `uvx mcp-server-fetch` | MCP server | ⚪ unwatched — Kintsua does not run "
+        "commands from a repo" in issue.body
     )
     assert f"at `{SHA1[:7]}`" in issue.body and "across 5 files" in issue.body
     assert "`DELETE /v1/repos/{id}/data`" in issue.body

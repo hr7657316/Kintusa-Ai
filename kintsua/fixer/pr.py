@@ -223,8 +223,9 @@ def commit_and_push(
     gh_repo: Any = None,
     base_branch: str | None = None,
 ) -> PushResult:
-    """Commit the sandbox changes on ``branch`` and push it. Refuses protected branches,
-    branches that are not ours, and pushes with nothing to commit."""
+    """Commit the sandbox changes (exactly ``sandbox.changed_files()``, the validated
+    patch) on ``branch`` and push it. Refuses protected branches, branches that are not
+    ours, and pushes with nothing to commit."""
     if not branch.startswith(BRANCH_PREFIX):
         raise PushRefused(f"refusing to push to {branch!r}: not a {BRANCH_PREFIX} branch")
     if base_branch and branch == base_branch:
@@ -235,7 +236,8 @@ def commit_and_push(
         log.info(
             "base branch %s is protected; the PR targets it, nothing is pushed there", base_branch
         )
-    if not sandbox.changed_files():
+    files = sandbox.changed_files()
+    if not files:
         raise PushRefused("nothing to commit")
 
     replaced = False
@@ -246,7 +248,9 @@ def commit_and_push(
         replaced = True
 
     sandbox.git_ok("checkout", "--quiet", "-B", branch)
-    sandbox.git_ok("add", "--all", ".")
+    # only the patch: never ``--all``, which would commit what the install or the test run
+    # left in the tree (lockfiles, *.egg-info, report files)
+    sandbox.git_ok("add", "--all", "--", *files)
     commit = sandbox.git("commit", "--quiet", "--no-verify", "-m", message, timeout_s=120)
     if not commit.ok:
         raise SandboxError(f"git commit failed: {scrub(commit.tail(10), sandbox.secrets)}")

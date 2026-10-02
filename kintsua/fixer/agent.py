@@ -316,9 +316,7 @@ class ToolRunner:
         plan = self.ctx.test_plan
         if plan is None or not plan.command:
             raise SandboxError("this repository has no test command; rely on static checks")
-        from kintsua.fixer.validate import _test_timeout_s
-
-        res = self.sandbox.run(plan.command, timeout_s=_test_timeout_s())
+        res = self.sandbox.run(plan.command, timeout_s=float(self.settings.fix_test_timeout_s))
         self.tests_ran = True
         self.last_test_exit = res.exit_code
         status = "timed out" if res.timed_out else f"exit {res.exit_code}"
@@ -372,7 +370,12 @@ def run_agent(
         return outcome
 
     for _ in range(max_steps):
-        sandbox.deadline.check("agent step")
+        try:
+            sandbox.deadline.check("agent step")
+        except SandboxTimeout as e:
+            # the usual expiry point (a run clamped to the budget returns normally): return
+            # the partial outcome so the job still records the tokens it spent
+            return finish("error", str(e))
         try:
             turn = llm.complete_tools(system, messages, TOOL_SPECS, model=model)
         except LLMRefused as e:

@@ -17,7 +17,9 @@ failing test ids as the baseline, never with new ones.
    credential (``api_key=``, ``token=``, ``Authorization`` ...);
 5. the test command exits 0, or with the same failing test ids as the baseline (pytest
    ``FAILED path::test`` lines, jest/vitest ``✕``/``FAIL`` lines; exit codes when
-   unparsable);
+   unparsable). A red run whose suite did not actually run (pytest collection errors,
+   usage errors, no tests collected) never counts as "the same failures": that is a
+   broken environment, not a verified patch;
 6. static checks pass where present (or, when they already failed on the baseline, do
    not get worse);
 7. for MCP tool changes, a synthetic call built from the patched call site's argument
@@ -49,16 +51,16 @@ from kintsua.fixer.testcmd import TestPlan
 log = logging.getLogger(__name__)
 
 
-def _test_timeout_s() -> float:
-    try:
-        from kintsua.core.config import get_settings
-
-        return float(get_settings().fix_test_timeout_s)
-    except Exception:  # noqa: BLE001
-        return 600.0
-
-
 TEST_TIMEOUT_S = 600.0  # fallback; the live value comes from Settings.fix_test_timeout_s
+
+
+def _test_timeout_s(settings: Settings | None = None) -> float:
+    try:
+        return float((settings or get_settings()).fix_test_timeout_s)
+    except Exception:  # noqa: BLE001
+        return TEST_TIMEOUT_S
+
+
 STATIC_TIMEOUT_S = 300.0
 MAX_GRAPH_FILES = 4000
 PY_EXTS = (".py",)
@@ -94,6 +96,8 @@ class BaselineResult:
     static: dict[str, dict[str, Any]] = field(default_factory=dict)  # command -> result
     plan: dict[str, Any] = field(default_factory=dict)
     cached: bool = False
+    #: why the red run did not actually run the suite (collection errors, ...), else None
+    not_run: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -116,6 +120,7 @@ class BaselineResult:
             static={str(k): dict(v) for k, v in (d.get("static") or {}).items()},
             plan=dict(d.get("plan") or {}),
             cached=True,
+            not_run=d.get("not_run"),
         )
 
     def summary(self) -> str:
@@ -123,6 +128,8 @@ class BaselineResult:
             parts = ["no test command"]
         elif self.timed_out:
             parts = ["tests timed out"]
+        elif self.not_run:
+            parts = [f"exit {self.exit_code}, tests did not run ({self.not_run})"]
         elif self.exit_code == 0:
             parts = [
                 f"exit 0{f', {self.tests_passed} passed' if self.tests_passed is not None else ''}"
@@ -170,13 +177,20 @@ class Verdict:
 # Output parsing
 # --------------------------------------------------------------------------------------
 
-_PYTEST_FAIL_RE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?)(?:\s+-\s.*)?$")
+# the id runs up to the `` - message`` separator; a ``[...]`` parametrize id may contain
+# spaces (and even `` - ``), so it is matched as one bracket group
+_PYTEST_FAIL_RE = re.compile(r"^(?:FAILED|ERROR)\s+((?:[^\s\[]|\[[^\]]*\])+?)(?:\s+-\s.*)?$")
 _PYTEST_PASSED_RE = re.compile(r"(\d+) passed")
 _JS_FAIL_MARK_RE = re.compile(r"^\s*(?:✕|×|✗)\s+(.+?)(?:\s+\(?\d+\s*ms\)?)?\s*$")
 _JS_FAIL_FILE_RE = re.compile(r"^\s*FAIL\s+(\S+(?:\s+>\s+.+)?)\s*$")
 _JEST_PASSED_RE = re.compile(r"Tests:\s+(?:\d+\s+\w+,\s+)*(\d+)\s+passed")
 _VITEST_PASSED_RE = re.compile(r"Tests\s+(?:\d+\s+failed\s+\|\s+)?(\d+)\s+passed")
-_RUFF_VIOLATION_RE = re.compile(r"^\S+:\d+:\d+:\s+\S+")
+# ``path:line:col: CODE msg`` (concise / legacy) or the ``  --> path:line:col`` location
+# line of ruff >= 0.9's default ``full`` format
+_RUFF_VIOLATION_RE = re.compile(r"^(?:\S+:\d+:\d+:\s+\S+|\s*-->\s+\S+:\d+:\d+)")
+_RUFF_FOUND_RE = re.compile(
+    r"^Found (\d+) errors?(?: \((?:\d+ fixed, )?(\d+) remaining\))?", re.MULTILINE
+)
 _TSC_ERROR_RE = re.compile(r"error TS\d+:")
 
 
@@ -206,6 +220,42 @@ def parse_failing_tests(output: str, runner: str | None = None) -> list[str]:
     return sorted(dict.fromkeys(ids))
 
 
+#: pytest exit codes that mean the suite never ran
+PYTEST_NOT_RUN_EXITS: dict[int, str] = {
+    2: "interrupted, e.g. collection errors",
+    3: "internal error",
+    4: "usage error",
+    5: "no tests collected",
+}
+_PYTEST_NOT_RUN_RE = re.compile(
+    r"Interrupted: \d+ errors? during collection|\bno tests ran\b", re.IGNORECASE
+)
+
+
+def suite_not_run_reason(
+    exit_code: int | None,
+    output: str,
+    runner: str | None,
+    failing: list[str],
+    tests_passed: int | None,
+) -> str | None:
+    """Why a red test run did not actually run the suite (None when it passed or ran):
+    a pytest exit code for interrupted/usage/no-tests, pytest's own "Interrupted: N errors
+    during collection" / "no tests ran" lines (also behind ``make test`` or a custom
+    command), or a failure list made only of collection errors (file paths, no
+    ``::test``) with nothing passing."""
+    if exit_code in (None, 0):
+        return None
+    if runner == "pytest" and exit_code in PYTEST_NOT_RUN_EXITS:
+        return f"pytest exit {exit_code}: {PYTEST_NOT_RUN_EXITS[exit_code]}"
+    m = _PYTEST_NOT_RUN_RE.search(output or "")
+    if m:
+        return m.group(0)
+    if failing and not tests_passed and all("::" not in f and f.endswith(".py") for f in failing):
+        return "only collection errors: " + ", ".join(failing[:5])
+    return None
+
+
 def parse_tests_passed(output: str) -> int | None:
     out = output or ""
     for rx in (_PYTEST_PASSED_RE, _JEST_PASSED_RE, _VITEST_PASSED_RE):
@@ -222,6 +272,11 @@ def count_violations(command: str, output: str) -> int:
     low = command.lower()
     lines = (output or "").splitlines()
     if "ruff" in low:
+        # ruff's own summary is authoritative; count finding lines (either output format)
+        # only when it is missing
+        found = _RUFF_FOUND_RE.findall(output or "")
+        if found:
+            return sum(int(remaining or total) for total, remaining in found)
         return sum(1 for ln in lines if _RUFF_VIOLATION_RE.match(ln))
     if "tsc" in low:
         return sum(1 for ln in lines if _TSC_ERROR_RE.search(ln))
@@ -234,11 +289,15 @@ def count_violations(command: str, output: str) -> int:
 
 
 def run_tests(
-    sandbox: Sandbox, plan: TestPlan, *, timeout_s: float = TEST_TIMEOUT_S
+    sandbox: Sandbox, plan: TestPlan, *, timeout_s: float | None = None
 ) -> RunResult | None:
+    """The test command, with ``timeout_s`` defaulting to ``Settings.fix_test_timeout_s``
+    (``Sandbox.run`` still clamps it to the job's wall clock)."""
     if not plan.command:
         return None
-    return sandbox.run(plan.command, timeout_s=timeout_s)
+    return sandbox.run(
+        plan.command, timeout_s=timeout_s if timeout_s is not None else _test_timeout_s()
+    )
 
 
 def run_static_checks(
@@ -246,7 +305,9 @@ def run_static_checks(
 ) -> dict[str, StaticCheckResult]:
     out: dict[str, StaticCheckResult] = {}
     for cmd in plan.static_checks:
-        res = sandbox.run(cmd, timeout_s=timeout_s)
+        # one finding per line, whatever the repo's ruff version defaults to
+        env = {"RUFF_OUTPUT_FORMAT": "concise"} if "ruff" in cmd.lower() else None
+        res = sandbox.run(cmd, timeout_s=timeout_s, env=env)
         out[cmd] = StaticCheckResult(
             command=cmd,
             exit_code=res.exit_code,
@@ -257,8 +318,15 @@ def run_static_checks(
     return out
 
 
+BASELINE_CACHE_VERSION = 2  # bump when BaselineResult gains a field a cached entry lacks
+
+
 def _plan_fingerprint(plan: TestPlan) -> dict[str, Any]:
-    return {"command": plan.command, "static_checks": list(plan.static_checks)}
+    return {
+        "command": plan.command,
+        "static_checks": list(plan.static_checks),
+        "v": BASELINE_CACHE_VERSION,
+    }
 
 
 def baseline_cache_path(settings: Settings, repo_key: str, sha: str) -> Path:
@@ -289,20 +357,27 @@ def run_baseline(
                 return cached
         except (ValueError, OSError) as e:
             log.info("baseline cache unreadable (%s); rerunning", e)
-    res = run_tests(sandbox, plan)
+    res = run_tests(sandbox, plan, timeout_s=_test_timeout_s(settings))
     static = run_static_checks(sandbox, plan)
+    failing = parse_failing_tests(res.output, plan.runner) if res is not None else []
+    passed = parse_tests_passed(res.output) if res is not None else None
     baseline = BaselineResult(
         sha=sha,
         exit_code=None if res is None else res.exit_code,
-        failing_tests=parse_failing_tests(res.output, plan.runner) if res is not None else [],
+        failing_tests=failing,
         output_tail=res.tail(40) if res is not None else "",
-        tests_passed=parse_tests_passed(res.output) if res is not None else None,
+        tests_passed=passed,
         timed_out=bool(res is not None and res.timed_out),
         static={
             cmd: {"exit_code": r.exit_code, "violations": r.violations, "timed_out": r.timed_out}
             for cmd, r in static.items()
         },
         plan=fingerprint,
+        not_run=(
+            suite_not_run_reason(res.exit_code, res.output, plan.runner, failing, passed)
+            if res is not None and not res.timed_out
+            else None
+        ),
     )
     if use_cache and path is not None and not baseline.timed_out:
         try:
@@ -498,16 +573,187 @@ def _dict_keys(node: ast.AST) -> list[str] | None:
     return None
 
 
+#: keywords that carry the tool arguments (``call_tool("x", arguments=...)``)
+_ARGUMENT_KWARGS = ("arguments", "args", "params", "input", "inputs")
+#: keywords that carry the tool name, never an argument
+_TOOL_NAME_KWARGS = ("name", "tool", "tool_name")
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _scope_nodes(scope: ast.AST) -> list[ast.AST]:
+    """Every node of ``scope`` without descending into nested functions or classes."""
+    out: list[ast.AST] = []
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        if not isinstance(node, _SCOPE_NODES):
+            stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _enclosing_scope(tree: ast.Module, target: ast.AST) -> ast.AST:
+    """The innermost function (or the module) whose own body contains ``target``."""
+    scope: ast.AST = tree
+    while True:
+        inner = next(
+            (
+                n
+                for n in _scope_nodes(scope)
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+                and target in set(ast.walk(n))
+            ),
+            None,
+        )
+        if inner is None:
+            return scope
+        scope = inner
+
+
+def _is_name(node: ast.AST | None, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def _const_key(node: ast.AST) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _resolve_dict_name(tree: ast.Module, call: ast.Call, name: str) -> list[str] | None:
+    """Keys of the dict a variable holds at ``call``: the nearest earlier assignment of a
+    dict literal (or ``dict(...)``) in the same function, plus the keys later added with
+    ``name["k"] = ...``, ``name.update({...}/k=...)`` or ``name.setdefault("k", ...)``.
+    None when the value or a change to it cannot be read statically."""
+    scope = _enclosing_scope(tree, call)
+    nodes = _scope_nodes(scope)
+    line = call.lineno
+    assign: ast.Assign | ast.AnnAssign | None = None
+    for node in nodes:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target = node.target
+        else:
+            continue
+        if _is_name(target, name) and node.lineno < line:
+            if assign is None or node.lineno > assign.lineno:
+                assign = node
+    if assign is None or assign.value is None:
+        return None
+    keys = _dict_keys(assign.value)
+    if keys is None:
+        return None
+    keys = list(keys)
+    for node in nodes:
+        ln = getattr(node, "lineno", 0)
+        if not (assign.lineno < ln <= line) or node is assign:
+            continue
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+            targets = [node.target]
+            if isinstance(node, ast.AugAssign) and _is_name(node.target, name):
+                more = _dict_keys(node.value)  # ``params |= {...}``
+                if more is None:
+                    return None
+                keys.extend(more)
+        elif isinstance(node, ast.Delete):
+            for t in node.targets:
+                if isinstance(t, ast.Subscript) and _is_name(t.value, name):
+                    k = _const_key(t.slice)
+                    if k is None:
+                        return None
+                    keys = [x for x in keys if x != k]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if _is_name(node.func.value, name):
+                attr = node.func.attr
+                if attr == "update":
+                    for a in node.args:
+                        more = _dict_keys(a)
+                        if more is None:
+                            return None
+                        keys.extend(more)
+                    for kw in node.keywords:
+                        if kw.arg is None:
+                            return None
+                        keys.append(kw.arg)
+                elif attr in ("setdefault", "pop") and node.args:
+                    k = _const_key(node.args[0])
+                    if k is None:
+                        return None
+                    keys = [*keys, k] if attr == "setdefault" else [x for x in keys if x != k]
+        for t in targets:
+            if isinstance(t, ast.Subscript) and _is_name(t.value, name):
+                k = _const_key(t.slice)
+                if k is None:
+                    return None  # ``params[key] = ...``: unknown key
+                keys.append(k)
+    return list(dict.fromkeys(keys))
+
+
+def _argument_value_keys(tree: ast.Module, call: ast.Call, value: ast.AST) -> list[str] | None:
+    if isinstance(value, ast.Constant) and value.value is None:
+        return []  # ``arguments=None``: the call passes no arguments at all
+    keys = _dict_keys(value)
+    if keys is None and isinstance(value, ast.Name):
+        keys = _resolve_dict_name(tree, call, value.id)
+    return keys
+
+
+def _call_argument_keys(
+    tree: ast.Module, node: ast.Call, literal_kws: list[ast.keyword]
+) -> list[str] | None:
+    """The argument keys one call passes, or None when they cannot be read statically."""
+    literal_pos = next(
+        (
+            i
+            for i, a in enumerate(node.args)
+            if isinstance(a, ast.Constant) and isinstance(a.value, str)
+        ),
+        None,
+    )
+    for a in node.args:
+        keys = _dict_keys(a)
+        if keys is not None:
+            return keys
+    for kw in node.keywords:
+        if kw.arg in _ARGUMENT_KWARGS:
+            return _argument_value_keys(tree, node, kw.value)
+    # ``call_tool("get_weather", params)``: the positional value after the tool name
+    after = node.args[literal_pos + 1 :] if literal_pos is not None else []
+    if after:
+        return _argument_value_keys(tree, node, after[0])
+    # ``tool(city=..., units=...)``: the keyword names are the arguments
+    others = [
+        kw.arg
+        for kw in node.keywords
+        if kw.arg and kw not in literal_kws and kw.arg not in _TOOL_NAME_KWARGS
+    ]
+    return others or None
+
+
 def extract_call_keys_python(
     text: str, tool_name: str, near_line: int | None = None
 ) -> list[str] | None:
     """Argument keys of the call that passes ``tool_name`` as a string literal (closest to
-    ``near_line``): the keys of a dict literal argument, else the call's keyword names."""
+    ``near_line``): the keys of a dict literal argument or of the dict a variable passed
+    as the arguments holds (``arguments=params`` with ``params = {...}`` earlier in the
+    function), else the call's keyword names (``tool(city=..., units=...)``). A call
+    whose arguments cannot be read statically (``arguments=build_args(city)``) gives None
+    rather than a misread or another call's keys."""
+    return _find_call_keys_python(text, tool_name, near_line)[1]
+
+
+def _find_call_keys_python(
+    text: str, tool_name: str, near_line: int | None = None
+) -> tuple[bool, list[str] | None]:
+    """``(found, keys)``: whether a call passing ``tool_name`` exists in ``text`` at all,
+    and its keys as ``extract_call_keys_python`` reads them."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
-        return None
-    best: tuple[int, list[str]] | None = None
+        return False, None
+    best: tuple[int, int, list[str] | None] | None = None
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -521,26 +767,14 @@ def extract_call_keys_python(
         ]
         if not literal_args and not literal_kws:
             continue
-        keys: list[str] | None = None
-        for a in node.args:
-            keys = _dict_keys(a)
-            if keys is not None:
-                break
-        if keys is None:
-            for kw in node.keywords:
-                if kw.arg in ("arguments", "args", "params", "input", "inputs"):
-                    keys = _dict_keys(kw.value)
-                    if keys is not None:
-                        break
-        if keys is None:
-            others = [kw.arg for kw in node.keywords if kw.arg and kw not in literal_kws]
-            keys = others if others else None
-        if keys is None:
-            continue
+        keys = _call_argument_keys(tree, node, literal_kws)
+        if keys is None and near_line is None:
+            continue  # no call site to pin: the first readable call stands for the file
         dist = abs((node.lineno or 0) - (near_line or node.lineno or 0))
-        if best is None or dist < best[0]:
-            best = (dist, keys)
-    return best[1] if best else None
+        rank = (dist, 0 if keys is not None else 1)  # on a tie prefer a readable call
+        if best is None or rank < best[:2]:
+            best = (*rank, keys)
+    return (True, best[2]) if best else (False, None)
 
 
 _TS_KEY_RE = re.compile(r"""(?:^|[{,])\s*(?:["']([A-Za-z_$][\w$-]*)["']|([A-Za-z_$][\w$]*))\s*:""")
@@ -678,7 +912,11 @@ def mcp_schema_check(sandbox: Sandbox, ctx: FixContext) -> tuple[bool, str]:
             text = None
         if text is not None:
             if site.file_path.endswith(PY_EXTS):
-                keys = extract_call_keys_python(text, tool, site.line)
+                found, keys = _find_call_keys_python(text, tool, site.line)
+                if found and keys is None:
+                    # the patched call builds its arguments dynamically: the indexer's
+                    # pre-patch args_shape would describe the old call, not this one
+                    continue
             elif site.file_path.endswith(TS_EXTS):
                 keys = extract_call_keys_ts(text, tool, site.line)
         if keys is None:
@@ -814,18 +1052,36 @@ def validate(
         return verdict  # structural failures: no point running the suite
 
     # 5. tests
-    res = run_tests(sandbox, plan)
+    res = run_tests(sandbox, plan, timeout_s=_test_timeout_s(settings))
     if res is not None:
         verdict.test_exit = res.exit_code
         verdict.test_output_tail = res.tail(40)
         verdict.tests_passed = parse_tests_passed(res.output)
         failing = parse_failing_tests(res.output, plan.runner)
         verdict.failing_tests = failing
+        fewer_passed = (
+            verdict.tests_passed is not None
+            and baseline.tests_passed is not None
+            and verdict.tests_passed < baseline.tests_passed
+        )
         if res.timed_out:
             verdict.reasons.append(f"test command timed out after {res.duration_s:.0f}s")
         elif res.exit_code != 0:
             base_failing = set(baseline.failing_tests)
-            if baseline.exit_code in (0, None):
+            not_run = suite_not_run_reason(
+                res.exit_code, res.output, plan.runner, failing, verdict.tests_passed
+            )
+            if not_run or baseline.not_run:
+                # "same failures as the baseline" means nothing when the suite never ran
+                # (missing dependency, broken collection): the patch is unverified
+                where = [f"after the patch: {not_run}"] if not_run else []
+                if baseline.not_run:
+                    where.append(f"on the baseline: {baseline.not_run}")
+                verdict.reasons.append(
+                    f"tests did not run (exit {res.exit_code}; {'; '.join(where)}), so the "
+                    "patch could not be verified"
+                )
+            elif baseline.exit_code in (0, None):
                 verdict.reasons.append(
                     f"tests fail after the patch (exit {res.exit_code}) but passed on the baseline: "
                     + (", ".join(failing[:10]) or res.tail(5))
@@ -836,10 +1092,21 @@ def validate(
                     verdict.reasons.append(
                         "the patch introduces new test failures: " + ", ".join(new[:10])
                     )
+                elif fewer_passed:
+                    verdict.reasons.append(
+                        f"fewer tests pass after the patch ({verdict.tests_passed} vs "
+                        f"{baseline.tests_passed} on the baseline)"
+                    )
                 else:
                     verdict.preexisting_failures = sorted(base_failing)
             elif res.exit_code == baseline.exit_code:
-                verdict.preexisting_failures = sorted(base_failing)
+                if fewer_passed:
+                    verdict.reasons.append(
+                        f"fewer tests pass after the patch ({verdict.tests_passed} vs "
+                        f"{baseline.tests_passed} on the baseline; failures could not be matched)"
+                    )
+                else:
+                    verdict.preexisting_failures = sorted(base_failing)
             else:
                 verdict.reasons.append(
                     f"tests exit {res.exit_code} after the patch vs {baseline.exit_code} on the baseline "
@@ -913,5 +1180,6 @@ __all__ = [
     "run_static_checks",
     "run_tests",
     "synthesize_call",
+    "suite_not_run_reason",
     "validate",
 ]

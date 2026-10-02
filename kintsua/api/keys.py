@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
@@ -65,6 +66,12 @@ async def create_key(
     session: Session = Depends(get_db),
 ) -> Response:
     body = await read_body(request, CreateKeyBody)
+    return await run_in_threadpool(_create_key, request, user, session, body)
+
+
+def _create_key(
+    request: Request, user: SessionUser, session: Session, body: CreateKeyBody
+) -> Response:
     org = pick_org(session, user, body.org_id)
     rotated = bool(org.sdk_key_hash)
     key = rotate_sdk_key(session, org)

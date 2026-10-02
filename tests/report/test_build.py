@@ -77,6 +77,7 @@ def seed(session):
         locator="https://stripe/spec.json",
         display_name="Stripe API",
         vendor="stripe",
+        origin="seed",
     )
     mcp = Source(
         kind="mcp",
@@ -84,6 +85,7 @@ def seed(session):
         display_name="Weather MCP",
         vendor="weather",
         last_polled_at=now - timedelta(hours=1),
+        origin="seed",
     )
     pypi = Source(
         kind="pypi",
@@ -91,6 +93,7 @@ def seed(session):
         display_name="openai (PyPI)",
         vendor="openai",
         last_polled_at=now - timedelta(days=30),
+        origin="seed",
     )
     dead = Source(
         kind="changelog",
@@ -100,6 +103,7 @@ def seed(session):
         consecutive_failures=12,
         last_error="HTTPStatusError: 404",
         last_polled_at=now - timedelta(days=9),
+        origin="seed",
     )
     off = Source(kind="npm", locator="left-pad", display_name="left-pad", active=False)
     session.add_all([stripe, mcp, pypi, dead, off])
@@ -218,7 +222,8 @@ def test_build_weekly_report_numbers_and_items(session):
     b = by_id[str(ctx["breaking"].id)]
     assert b.severity == "breaking" and b.vendor == "stripe" and b.source_kind == "openapi"
     assert b.from_version == "2026-01" and b.to_version == "2026-02" and b.op_count == 1
-    assert b.url == "https://github.com/acme/agent/pull/12"
+    assert b.url is None  # the public build never links a customer repo's issue / PR
+    assert report.public is True
     assert b.migration_hint == "Use /v1/payment_intents" and b.rule_hits == ["removed_operation"]
     u = by_id[str(ctx["unclassified"].id)]
     assert u.severity == "unknown" and u.category == "unclassified"

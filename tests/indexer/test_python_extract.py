@@ -292,3 +292,34 @@ def test_large_files_and_vendored_dirs_are_skipped(tmp_path: Path):
     r = extract_python(tmp_path)
     assert r.stats.files_seen == 2 and r.stats.skipped_large == 1 and r.stats.files_parsed == 1
     assert len(r.call_sites) == 1
+
+
+def test_dynamic_http_method_is_recorded_as_the_bare_path_and_matches_any_method():
+    from kintsua.matcher.operations import matches_any
+
+    r, s = sites(
+        """
+import httpx, requests
+client = httpx.Client()
+def call(method, path):
+    return client.request(method, "https://api.stripe.com/v1/charges")
+def call2(m):
+    return requests.request(method=m, url="https://api.stripe.com/v1/refunds")
+def fixed():
+    return client.request("POST", "https://api.stripe.com/v1/customers")
+"""
+    )
+    ops = {op for _, _, _, op in s}
+    assert ops == {"/v1/charges", "/v1/refunds", "POST /v1/customers"}
+    assert matches_any("/v1/charges", ["POST /v1/charges"])
+    assert matches_any("/v1/refunds", ["DELETE /v1/refunds"])
+    assert not matches_any("POST /v1/customers", ["GET /v1/customers"])
+
+
+def test_large_and_unreadable_files_are_remembered_as_partial(tmp_path: Path):
+    (tmp_path / "big.py").write_text("import stripe\n" + "x = 1\n" * 300_000)
+    (tmp_path / "bin.py").write_bytes(b"import stripe\x00\n")
+    (tmp_path / "ok.py").write_text("import stripe\nstripe.Charge.create()\n")
+    r = extract_python(tmp_path)
+    assert sorted(r.stats.partial_files) == ["big.py", "bin.py"]
+    assert r.stats.skipped_large == 1 and r.stats.parse_errors == 1

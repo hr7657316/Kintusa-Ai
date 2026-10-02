@@ -105,3 +105,58 @@ def test_mute_patterns_and_base_branch():
     assert mute_patterns({}) == []
     assert fix_base_branch(cfg, "main") == "develop"
     assert fix_base_branch({}, "main") == "main"
+
+
+def test_mcp_source_transport_is_guessed_or_given():
+    cfg = parse_kintsua_yml(
+        """
+sources:
+  - kind: mcp
+    url: https://mcp.vendor.com/sse
+  - kind: mcp
+    url: https://mcp.vendor.com/mcp
+  - kind: mcp
+    url: https://mcp.other.com/events
+    transport: sse
+  - kind: mcp
+    command: npx -y @acme/mcp
+"""
+    )
+    got = [(s.locator, s.mcp_transport) for s in config_sources(cfg)]
+    assert got == [
+        ("https://mcp.vendor.com/sse", "sse"),
+        ("https://mcp.vendor.com/mcp", "http"),
+        ("https://mcp.other.com/events", "sse"),
+        ("npx -y @acme/mcp", "stdio"),
+    ]
+    assert cfg["sources"][2]["transport"] == "sse" and "transport" not in cfg["sources"][0]
+    with pytest.raises(ValueError, match="transport stdio needs a command"):
+        parse_kintsua_yml(
+            "sources:\n  - kind: mcp\n    url: https://x.dev/mcp\n    transport: stdio\n"
+        )
+
+
+def test_api_settings_are_merged_back_into_the_file_values():
+    from kintsua.indexer.config import API_SETTINGS_KEY, merge_api_settings
+
+    api_source = {"kind": "openapi", "url": "https://specs.example/api.json", "hosts": ["api.x.io"]}
+    cfg = parse_kintsua_yml(
+        "sources:\n  - kind: changelog\n    url: https://x.io/changelog\n"
+        "mute:\n  - stripe:/v1/legacy/*\nfix:\n  mode: pr\n  base: release\n"
+    )
+    cfg[API_SETTINGS_KEY] = {
+        "mute": ["slack:*", "stripe:/v1/legacy/*"],
+        "fix": {"mode": "issue_only"},
+        "sources": [api_source, {"kind": "changelog", "url": "https://x.io/changelog"}],
+    }
+    merged = merge_api_settings(cfg)
+    assert mute_patterns(merged) == ["stripe:/v1/legacy/*", "slack:*"]
+    assert effective_fix_mode(merged, {"fix_mode": "pr"}) == "issue_only"
+    assert fix_base_branch(merged, "main") == "release"
+    assert [s.locator for s in config_sources(merged)] == [
+        "https://x.io/changelog",
+        "https://specs.example/api.json",
+    ]
+    # nothing recorded by the API: the file values stand alone
+    plain = parse_kintsua_yml("test_command: make test\n")
+    assert merge_api_settings(dict(plain)) == plain

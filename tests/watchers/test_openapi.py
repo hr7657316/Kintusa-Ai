@@ -299,12 +299,23 @@ def test_detect_renames_pairs_siblings_by_shape_or_distance():
         ChangeOp(
             op="removed",
             path="/components/schemas/B/properties/colour",
-            before={"type": "string", "description": "c"},
+            before={"type": "string", "enum": ["red", "blue"], "description": "c"},
         ),
         ChangeOp(
             op="added",
             path="/components/schemas/B/properties/tint",
-            after={"type": "string", "description": "t"},
+            after={"type": "string", "enum": ["red", "blue"], "description": "t"},
+        ),
+        # an identical but bare scalar shape is not evidence of a rename
+        ChangeOp(
+            op="removed",
+            path="/components/schemas/E/properties/nickname",
+            before={"type": "string", "description": "n"},
+        ),
+        ChangeOp(
+            op="added",
+            path="/components/schemas/E/properties/region",
+            after={"type": "string", "description": "r"},
         ),
         ChangeOp(
             op="removed", path="/components/schemas/C/properties/x", before={"type": "string"}
@@ -318,7 +329,9 @@ def test_detect_renames_pairs_siblings_by_shape_or_distance():
     assert (
         "renamed",
         "/components/schemas/B/properties/colour",
-    ) in k  # identical shape (text ignored)
+    ) in k  # identical distinctive shape (text ignored)
+    assert ("removed", "/components/schemas/E/properties/nickname") in k
+    assert ("added", "/components/schemas/E/properties/region") in k
     assert ("removed", "/components/schemas/C/properties/x") in k and (
         "added",
         "/components/schemas/D/properties/y",

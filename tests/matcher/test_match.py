@@ -444,3 +444,161 @@ def test_open_issue_skips_dismissed_impacts(session, fake_github, stripe_http_wo
 
 def test_spec_source_locator_is_the_curated_one():
     assert STRIPE_SPEC.endswith("spec3.json")
+
+
+# --------------------------------------------------------------------------------------
+# review regressions
+# --------------------------------------------------------------------------------------
+
+
+def _mcp_world(f: Factory, *, config=None, full_name="acme/support-agent"):
+    org = f.org()
+    repo = f.repo(org, full_name=full_name, config=config)
+    browser = f.source(
+        kind="mcp", locator="https://mcp.browser.example/mcp", display_name="Browser", vendor=None
+    )
+    dep = f.dependency(repo, source=browser, kind="mcp", name="https://mcp.browser.example/mcp")
+    site = f.call_site(dep, "browser.navigate", file_path="agent/browse.py", symbol="call_tool")
+    return org, repo, browser, dep, site
+
+
+def test_dotted_mcp_tool_name_matches_its_tool_path_and_tool_mutes(session, f: Factory):
+    _org, repo, browser, _dep, site = _mcp_world(f)
+    event = f.event(
+        browser,
+        [{"op": "removed", "path": "/tools/browser.navigate", "before": {}, "after": None}],
+        from_version=None,
+        to_version=None,
+    )
+    f.classification(
+        event,
+        category="removal",
+        summary="Tool browser.navigate was removed",
+        affected_paths=["tool:browser.navigate"],
+    )
+    session.commit()
+    (imp,) = match_change_event(session, event)
+    assert [s["call_site_id"] for s in imp.matched_call_sites] == [str(site.id)]
+    assert imp.matched_call_sites[0]["dependency_kind"] == "mcp"
+
+    # a repo muting tool:browser.* gets nothing
+    muted = f.repo(imp.repo.org, full_name="acme/muted", config={"mute": ["tool:browser.*"]})
+    dep2 = f.dependency(muted, source=browser, kind="mcp", name="https://mcp.browser.example/mcp")
+    f.call_site(dep2, "browser.navigate")
+    session.commit()
+    assert {i.repo_id for i in match_change_event(session, event)} == {repo.id}
+
+
+def _major_bump_world(f: Factory, *, config=None, with_site=False, **org_settings):
+    org = f.org(**org_settings)
+    repo = f.repo(org, config=config)
+    pypi = f.source(kind="pypi", locator="stripe", display_name="stripe (PyPI)")
+    dep = f.dependency(repo, source=pypi, kind="pypi", name="stripe", meta={"vendor": "stripe"})
+    if with_site:
+        f.call_site(dep, "stripe.Charge.create", file_path="billing.py")
+    event = f.event(
+        pypi,
+        [{"op": "added", "path": "/versions/12.0.0", "before": None, "after": {}}],
+        from_version="11.6.0",
+        to_version="12.0.0",
+    )
+    f.classification(
+        event,
+        severity="degraded",
+        category="deprecation",
+        summary="stripe 11.x -> 12.0.0: major version bump",
+        affected_paths=["package:stripe"],
+        rule_hits=["major_bump"],
+    )
+    return org, repo, event
+
+
+@pytest.mark.parametrize("mute", ["stripe", "package:stripe", "stripe:*"])
+@pytest.mark.parametrize("with_site", [False, True])
+def test_muted_package_major_bump_creates_no_impact(session, f: Factory, mute, with_site):
+    _org, _repo, event = _major_bump_world(
+        f, config={"mute": [mute]}, with_site=with_site, auto_issue=True
+    )
+    session.commit()
+    assert match_change_event(session, event) == []
+    assert f.impacts() == [] and f.jobs("open_issue") == []
+
+
+def test_unmuted_major_bump_still_creates_the_no_call_site_impact(session, f: Factory):
+    _org, _repo, event = _major_bump_world(f, config={"mute": ["package:slack-sdk"]})
+    session.commit()
+    (imp,) = match_change_event(session, event)
+    assert imp.matched_call_sites == []
+
+
+def test_no_fix_job_for_an_impact_without_a_file_located_call_site(session, fake_github, f):
+    _org, _repo, event = _major_bump_world(f, auto_issue=True, fix_mode="pr")
+    session.commit()
+    (imp,) = match_change_event(session, event)
+    assert drain(new_session, ["open_issue"]) == 1
+    assert f.jobs("fix_impact") == []
+    body = fake_github.repo("acme/support-agent").issues[1].body
+    assert "will open a PR" not in body
+    assert "no call sites were found in this repo's files" in body
+
+    # a runtime-only call site is not a file the fixer can patch either
+    session.expire_all()
+    imp = session.get(Impact, imp.id)
+    imp.matched_call_sites = [{"file_path": "<runtime>", "line": 0, "operation": "x"}]
+    session.commit()
+    assert maybe_enqueue_fix(session, imp) is False
+    imp.matched_call_sites = [{"file_path": "billing.py", "line": 3, "operation": "x"}]
+    session.commit()
+    assert maybe_enqueue_fix(session, imp) is True
+
+
+def test_open_issue_jobs_survive_a_long_github_outage(session, stripe_http_world):
+    from kintsua.core.queue import fail
+
+    w = stripe_http_world
+    w["org"].settings = {"auto_issue": True}
+    session.commit()
+    (imp,) = match_change_event(session, w["event"])
+    (job,) = session.scalars(select(Job).where(Job.kind == "open_issue")).all()
+    assert job.max_attempts >= 20
+    for _ in range(5):  # five failed attempts used to be the end of it
+        job.attempts += 1
+        fail(session, job, "GitHub 502")
+    session.refresh(job)
+    assert job.status == "queued"
+
+
+def test_requeue_stalled_issues_requeues_exhausted_jobs_once(session, stripe_http_world):
+    from datetime import timedelta
+
+    from kintsua.core.queue import fail
+    from kintsua.core.util import utcnow
+    from kintsua.matcher.match import requeue_stalled_issues
+
+    w = stripe_http_world
+    w["org"].settings = {"auto_issue": True}
+    session.commit()
+    (imp,) = match_change_event(session, w["event"])
+    (job,) = session.scalars(select(Job).where(Job.kind == "open_issue")).all()
+    job.attempts = job.max_attempts
+    fail(session, job, "GitHub 502")
+    assert job.status == "failed"
+
+    later = utcnow() + timedelta(hours=2)
+    assert requeue_stalled_issues(session, now=utcnow()) == []  # still in the cooldown
+    assert [i.id for i in requeue_stalled_issues(session, now=later)] == [imp.id]
+    assert requeue_stalled_issues(session, now=later) == []  # a queued job exists now
+    queued = session.scalars(
+        select(Job).where(Job.kind == "open_issue", Job.status == "queued")
+    ).all()
+    assert len(queued) == 1 and queued[0].max_attempts >= 20
+
+    # a permanent failure (NonRetryable: attempts left) and a never-queued draft stay put
+    queued[0].attempts = 1
+    fail(session, queued[0], "repo gone", retry=False)
+    assert requeue_stalled_issues(session, now=later + timedelta(hours=2)) == []
+    w["org"].settings = {}
+    session.commit()
+    job.status = "failed"
+    session.commit()
+    assert requeue_stalled_issues(session, now=later + timedelta(hours=2)) == []

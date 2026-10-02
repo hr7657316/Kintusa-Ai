@@ -186,13 +186,22 @@ def _no_tools(wd, cfg):
     return detect_test_command(wd, cfg, tool_available=lambda n: False)
 
 
+def _live_fixing(f: Factory, fake_github, started_s_ago: float = 5.0):
+    """An impact in ``fixing`` whose job started ``started_s_ago`` seconds ago."""
+    other = f.seed_break(
+        load_break("stripe_charge_source_renamed"), fake_github=fake_github, status="fixing"
+    )
+    started = utcnow() - timedelta(seconds=started_s_ago)
+    other["impact"].ci_result = {"fix_started_at": started.isoformat()}
+    f.session.commit()
+    return other
+
+
 def test_concurrency_defers_and_reenqueues(session, f: Factory, ready, monkeypatch):
     monkeypatch.setattr(ready["settings"], "fix_concurrency", 2)
     world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
     for _ in range(2):
-        other = f.seed_break(
-            load_break("stripe_charge_source_renamed"), fake_github=ready["github"], status="fixing"
-        )
+        other = _live_fixing(f, ready["github"])
         assert other["impact"].status == "fixing"
     before = utcnow()
     result = handle_fix_impact(session, {"impact_id": str(world["impact"].id)})
@@ -205,7 +214,7 @@ def test_concurrency_defers_and_reenqueues(session, f: Factory, ready, monkeypat
     assert (
         job is not None
         and job.kind == JOB_FIX_IMPACT
-        and job.payload == {"impact_id": str(impact.id)}
+        and job.payload == {"impact_id": str(impact.id), "deferrals": 1}
     )
     assert job.run_after >= before + timedelta(seconds=55)
     assert ready["llm"].calls == []
@@ -399,3 +408,196 @@ def test_fix_impact_bad_payloads(session):
         handle_fix_impact(session, {"impact_id": "not-a-uuid"})
     with pytest.raises(NonRetryable):
         handle_fix_impact(session, {"impact_id": str(uuid.uuid4())})
+
+
+# --------------------------------------------------------------------------------------
+# review regressions
+# --------------------------------------------------------------------------------------
+
+
+def test_fix_impact_on_the_docker_backend_opens_a_pr(
+    session, f: Factory, ready, monkeypatch, tmp_path: Path, fixture_git_repo: Path
+):
+    """The production backend: the clone lives at ``/work/repo`` inside the container, so
+    the test plan must be read through the sandbox (it used to be read on the worker's
+    filesystem, find nothing and refuse every job with "no test command")."""
+    import socket
+
+    import kintsua.fixer.run as runmod
+    from kintsua.fixer.sandbox import DockerSandbox
+    from tests.fixer.conftest import clone_url_for
+    from tests.fixer.test_sandbox_docker import FakeDockerClient
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.10", 443))],
+    )
+    monkeypatch.delenv("SANDBOX_HTTPS_PROXY", raising=False)
+
+    class FixtureDockerSandbox(DockerSandbox):
+        def _git_clone_args(self, clone_url, branch, dest, sha):  # the fixture, not GitHub
+            return super()._git_clone_args(clone_url_for(fixture_git_repo), branch, dest, sha)
+
+    made: list[DockerSandbox] = []
+
+    def docker_backend(settings, **kw):
+        sb = FixtureDockerSandbox(settings=settings, client=FakeDockerClient(tmp_path / "d"), **kw)
+        made.append(sb)
+        return sb
+
+    monkeypatch.setattr(runmod, "make_sandbox", docker_backend)
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    _script_fix(ready["llm"], RENAME)
+    result = handle_fix_impact(session, {"impact_id": str(world["impact"].id)})
+    impact = session.get(Impact, world["impact"].id)
+    assert result["status"] == "pr_open", impact.fix_reason
+    assert made and made[0].workdir == "/work/repo" and made[0].backend == "docker"
+    pr = ready["github"].repo(world["repo"].full_name).get_pull(impact.github_pr_number)
+    assert "- Test command: `python -m pytest -q` → exit 0 (3 passed)" in pr.body
+    assert "`ruff check .` → pass" in pr.body
+
+
+def test_push_uses_a_freshly_minted_token(session, f: Factory, ready, monkeypatch):
+    """The clone URL minted at job start may hold a token that expires mid-job: the push
+    gets a new one, and both are scrubbed from everything the job logs."""
+    import kintsua.fixer.pr as prmod
+    import kintsua.fixer.run as runmod
+
+    minted: list[str] = []
+
+    def installation_token(installation_id: int) -> str:
+        minted.append(f"ghs_tok{len(minted) + 1}_abcdefghijklmnop")
+        return minted[-1]
+
+    monkeypatch.setattr(ready["github"], "installation_token", installation_token)
+    pushed_urls: list[str] = []
+
+    def push_branch(sandbox, url, branch):
+        pushed_urls.append(url)
+        sandbox.record(f"git push {url} {branch}")  # what a failing push would log
+
+    monkeypatch.setattr(prmod, "push_branch", push_branch)
+    sandboxes = []
+    real = runmod.make_sandbox
+    monkeypatch.setattr(
+        runmod,
+        "make_sandbox",
+        lambda settings, **kw: sandboxes.append(real(settings, **kw)) or sandboxes[-1],
+    )
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    _script_fix(ready["llm"], RENAME)
+    assert handle_fix_impact(session, {"impact_id": str(world["impact"].id)})["status"] == "pr_open"
+    clone_token = minted[0]
+    assert len(pushed_urls) == 1 and clone_token not in pushed_urls[0]
+    push_token = next(t for t in minted if t in pushed_urls[0])
+    assert minted.index(push_token) > 0  # minted after the clone, right before the push
+    log_text = "\n".join(sandboxes[0].log_lines)
+    assert clone_token not in log_text and push_token not in log_text and "git push" in log_text
+
+
+def test_lost_fixing_impacts_free_their_slots(session, f: Factory, ready, monkeypatch):
+    """Workers killed mid-job (deploy, OOM) leave impacts in ``fixing``: they must not hold
+    the concurrency slots forever. Each is re-queued once, then failed honestly."""
+    settings = ready["settings"]
+    monkeypatch.setattr(settings, "fix_concurrency", 3)
+    stale = [
+        _live_fixing(f, ready["github"], started_s_ago=3 * settings.sandbox_wall_clock_s)
+        for _ in range(2)
+    ]
+    legacy = f.seed_break(
+        load_break("stripe_charge_source_renamed"), fake_github=ready["github"], status="fixing"
+    )  # never stamped (started before stamping existed)
+    live = _live_fixing(f, ready["github"])
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    _script_fix(ready["llm"], RENAME)
+    result = handle_fix_impact(session, {"impact_id": str(world["impact"].id)})
+    assert result["status"] == "pr_open", result  # not deferred behind dead jobs
+    for w in [*stale, legacy]:
+        imp = session.get(Impact, w["impact"].id)
+        session.refresh(imp)
+        assert imp.status == "issued" and imp.ci_result["fix_lost"] == 1
+        job = session.scalar(
+            select(Job).where(Job.dedupe_key == f"fix_impact:{imp.id}", Job.status == "queued")
+        )
+        assert job is not None and job.kind == JOB_FIX_IMPACT
+    assert session.get(Impact, live["impact"].id).status == "fixing"  # still running
+
+    # lost a second time: failed with a reason, not re-queued again
+    again = stale[0]["impact"]
+    again.status = "fixing"
+    again.ci_result = {**again.ci_result, "fix_started_at": "2020-01-01T00:00:00+00:00"}
+    session.commit()
+    other = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    _script_fix(ready["llm"], RENAME)
+    handle_fix_impact(session, {"impact_id": str(other["impact"].id)})
+    session.refresh(again)
+    assert again.status == "failed" and "lost twice" in again.fix_reason
+    assert again.resolved_at is not None
+
+
+def test_deferral_is_bounded(session, f: Factory, ready, monkeypatch):
+    import kintsua.fixer.run as runmod
+
+    monkeypatch.setattr(ready["settings"], "fix_concurrency", 1)
+    _live_fixing(f, ready["github"])
+    world = f.seed_break(load_break("stripe_charge_source_renamed"), fake_github=ready["github"])
+    impact_id = str(world["impact"].id)
+    result = handle_fix_impact(
+        session, {"impact_id": impact_id, "deferrals": runmod.MAX_DEFERRALS - 1}
+    )
+    assert result["deferred"] is True
+    job = session.scalar(
+        select(Job).where(Job.dedupe_key == f"fix_impact:{impact_id}", Job.status == "queued")
+    )
+    assert job.payload["deferrals"] == runmod.MAX_DEFERRALS
+    job.status = "done"
+    session.commit()
+    result = handle_fix_impact(
+        session, {"impact_id": impact_id, "deferrals": job.payload["deferrals"]}
+    )
+    impact = session.get(Impact, world["impact"].id)
+    assert result["status"] == "failed" and impact.status == "failed"
+    assert "concurrency limit" in impact.fix_reason
+    assert (
+        session.scalar(
+            select(Job).where(Job.dedupe_key == f"fix_impact:{impact_id}", Job.status == "queued")
+        )
+        is None
+    )
+
+
+def test_record_ci_result_ignores_cancelled_and_action_required(session, f: Factory, fake_github):
+    w = _pr_open_world(f, fake_github)
+    for conclusion in ("cancelled", "action_required", "neutral", "skipped"):
+        impact = record_ci_result(session, w["repo"], w["pr"].number, conclusion, {"name": "ci"})
+        assert impact.status == "pr_open" and impact.fix_reason is None, conclusion
+        assert impact.ci_result["conclusion"] == conclusion
+    assert fake_github.repo(w["repo"].full_name).get_issue(w["issue_number"]).comments == []
+
+
+def test_record_ci_result_recovers_when_the_failed_checks_pass(session, f: Factory, fake_github):
+    w = _pr_open_world(f, fake_github)
+    n = w["pr"].number
+    impact = record_ci_result(session, w["repo"], n, "failure", {"name": "test"})
+    assert impact.status == "failed" and impact.resolved_at is not None
+    # a cancelled re-run does not clear the failure; another check's success does not either
+    impact = record_ci_result(session, w["repo"], n, "cancelled", {"name": "test"})
+    assert impact.status == "failed"
+    impact = record_ci_result(session, w["repo"], n, "timed_out", {"name": "lint"})
+    impact = record_ci_result(session, w["repo"], n, "success", {"name": "test"})
+    assert (
+        impact.status == "failed" and impact.ci_result["checks"]["test"]["conclusion"] == "success"
+    )
+    impact = record_ci_result(session, w["repo"], n, "success", {"name": "lint"})
+    assert impact.status == "pr_open"
+    assert impact.fix_reason is None and impact.resolved_at is None
+    assert impact.ci_result["pushed_sha"] == "a" * 40
+    comments = fake_github.repo(w["repo"].full_name).get_issue(w["issue_number"]).comments
+    assert "could not fix this automatically" in comments[0].body
+    assert "now passes" in comments[-1].body
+    # a PR the customer closed stays closed whatever CI says afterwards
+    record_ci_result(session, w["repo"], n, "failure", {"name": "test"})
+    record_pr_outcome(session, w["repo"], n, False, "closed")
+    impact = record_ci_result(session, w["repo"], n, "success", {"name": "test"})
+    assert impact.status == "failed" and impact.pr_outcome == "closed"

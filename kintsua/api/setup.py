@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from itsdangerous import BadSignature, SignatureExpired
 
@@ -40,7 +41,14 @@ DEFAULT_PERMISSIONS: dict[str, str] = {
 }
 # ``installation`` / ``installation_repositories`` are delivered to every GitHub App and are
 # not subscribable, so they are not listed here (GitHub rejects a manifest that names them).
-DEFAULT_EVENTS: list[str] = ["push", "pull_request", "issues", "check_suite", "check_run"]
+DEFAULT_EVENTS: list[str] = [
+    "push",
+    "pull_request",
+    "issues",
+    "check_suite",
+    "check_run",
+    "repository",
+]
 
 
 class SetupError(Exception):
@@ -181,7 +189,7 @@ async def setup_callback(request: Request) -> Response:
                 message="The setup link is older than an hour or was not issued by this server.",
             )
     try:
-        result = convert_manifest(s, code)
+        result = await run_in_threadpool(convert_manifest, s, code)
     except SetupError as e:
         log.warning("manifest conversion failed: %s", e)
         return render(

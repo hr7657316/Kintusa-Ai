@@ -221,11 +221,19 @@ def test_billing_tick_updates_subscription_quantities(
         stripe_mod.SubscriptionItem, "modify", lambda item_id, **kw: modified.append((item_id, kw))
     )
 
+    # an uninstalled pro org is flagged for the operator, its quantity left alone
+    gone = factory.org("gone", installation_id=4444, plan="pro", stripe_subscription_id="sub_9")
+    gone.active = False
+    factory.commit()
+
     out = billing_tick(session, {})
-    assert out["orgs"] == 1 and out["updated"] == 1 and out["errors"] == []
+    assert out["orgs"] == 2 and out["updated"] == 1 and out["errors"] == []
+    assert out["inactive"] == [str(gone.id)]
     assert modified == [("si_1", {"quantity": 2, "proration_behavior": "none"})]
     session.expire_all()
     assert session.get(Org, org.id).settings["billing_last_quantity"] == 2
+    warning = session.get(Org, gone.id).settings["billing_warning"]
+    assert warning["kind"] == "org_inactive" and warning["subscription"] == "sub_9"
 
     # already at the right quantity: nothing to modify
     monkeypatch.setattr(
@@ -250,4 +258,4 @@ def test_billing_tick_updates_subscription_quantities(
     # not configured: skipped and logged
     monkeypatch.setattr(settings, "stripe_secret_key", None)
     out = billing_tick(session, {})
-    assert out["skipped"] == "stripe not configured" and out["orgs"] == 1
+    assert out["skipped"] == "stripe not configured" and out["orgs"] == 2

@@ -1,6 +1,5 @@
-"""Buffered transport: deque -> daemon thread -> ``POST /v1/ingest``. Never raises or blocks the
-agent: ``record`` is a deque append under a lock, batches go every ``flush_interval_s`` s or at
-``max_batch`` events, a failed POST is retried once after 1 s then dropped. stdlib + httpx only."""
+"""Buffered transport: deque -> daemon thread -> ``POST /v1/ingest``, never raising or blocking:
+batches every ``flush_interval_s`` s or ``max_batch`` events; a failed POST retried once."""
 
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ DEFAULT_URL = "https://api.kintsua.dev"
 _DEFAULTS = {"schema_fingerprint": None, "error_class": None, "latency_ms": 0, "sample": None}
 _OPTS = {"sample": False, "flush_interval_s": 5.0, "max_batch": 100, "enabled": True}
 _UA = {"User-Agent": "kintsua-sdk/" + SDK_VERSION}
+Opt = str | None
 
 
 class Reporter:
@@ -28,11 +28,14 @@ class Reporter:
 
     retry_delay_s, timeout_s, max_queue = 1.0, 5.0, 10_000
 
-    def __init__(self, key: str | None, repo: str | None, url: str | None = None, **opts: Any):
+    def __init__(self, key: Opt, repo: Opt, url: Opt = None, **opts: Any):
         self.key, self.repo, self.url = key or "", repo or "", (url or DEFAULT_URL).rstrip("/")
         self.opts = {**_OPTS, **opts}
         self.sample, self.flush_interval_s = self.opts["sample"], self.opts["flush_interval_s"]
         self.max_batch, self.enabled = self.opts["max_batch"], bool(self.opts["enabled"] and key)
+        self._new()
+
+    def _new(self) -> None:  # also in a forked child: its own queue, lock, flusher and client
         self.sent = self.dropped = 0
         self._q: deque[dict[str, Any]] = deque(maxlen=self.max_queue)
         self._lock, self._wake, self._stop = threading.Lock(), threading.Event(), threading.Event()
@@ -92,10 +95,10 @@ class Reporter:
             t = min(max(deadline - time.monotonic(), 0.1) if deadline else 99, self.timeout_s)
             try:
                 r = self._client.post(url, json=body, headers=headers, timeout=t)
-                if r.status_code < 400:
+                if 200 <= r.status_code < 300:  # a redirect (3xx) delivered nothing
                     self.sent += len(batch)
                     return True
-                self._debug_once(f"http_{r.status_code}", r.text[:200])
+                self._debug_once(f"http_{r.status_code}", r.headers.get("location") or r.text[:200])
             except Exception as e:  # noqa: BLE001
                 self._debug_once(type(e).__name__, e)
             if attempt == 1:  # retry once after a pause, then drop the batch
@@ -117,6 +120,8 @@ class Reporter:
 
 _default: Reporter | None = None
 _pool: dict[tuple[str, str], Reporter] = {}
+if hasattr(os, "register_at_fork"):  # the parent's thread is dead in a child: start afresh
+    os.register_at_fork(after_in_child=lambda: [r._new() for r in (_default, *_pool.values()) if r])
 
 
 def configure(

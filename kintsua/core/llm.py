@@ -40,6 +40,7 @@ class LLMUsage:
     output_tokens: int = 0
     latency_ms: int = 0
     request_id: str | None = None
+    stop_reason: str | None = None  # provider stop reason, for the log line
 
     @property
     def total_tokens(self) -> int:
@@ -151,6 +152,11 @@ class AnthropicProvider(Provider):
             raise LLMRefused(
                 getattr(getattr(resp, "stop_details", None), "explanation", None) or "refused"
             )
+        if resp.stop_reason == "max_tokens":
+            # thinking counts toward max_tokens: the JSON answer is cut short or missing
+            raise LLMTruncated(
+                f"model output hit max_tokens={max_tokens} before the JSON answer was complete"
+            )
         text = next((b.text for b in resp.content if getattr(b, "type", "") == "text"), "")
         parsed = schema.model_validate_json(text)
         usage = LLMUsage(
@@ -160,6 +166,7 @@ class AnthropicProvider(Provider):
             output_tokens=getattr(resp.usage, "output_tokens", 0) or 0,
             latency_ms=int((time.monotonic() - t0) * 1000),
             request_id=getattr(resp, "_request_id", None),
+            stop_reason=resp.stop_reason,
         )
         return parsed, usage
 
@@ -267,7 +274,12 @@ class OpenAIProvider(Provider):
                 },
             },
         )
-        text = resp.choices[0].message.content or "{}"
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            raise LLMTruncated(
+                f"model output hit max_tokens={max_tokens} before the JSON answer was complete"
+            )
+        text = choice.message.content or "{}"
         parsed = schema.model_validate_json(text)
         u = resp.usage
         usage = LLMUsage(
@@ -276,6 +288,7 @@ class OpenAIProvider(Provider):
             input_tokens=getattr(u, "prompt_tokens", 0) or 0,
             output_tokens=getattr(u, "completion_tokens", 0) or 0,
             latency_ms=int((time.monotonic() - t0) * 1000),
+            stop_reason=choice.finish_reason,
         )
         return parsed, usage
 
@@ -353,7 +366,8 @@ class OpenAIProvider(Provider):
 class FakeLLM(Provider):
     """Scripted provider for tests.
 
-    ``queue_json(obj_or_model)`` queues the next ``complete_json`` answer;
+    ``queue_json(obj_or_model)`` queues the next ``complete_json`` answer (queue an
+    exception instance, e.g. ``LLMTruncated(...)``, to have that call raise it);
     ``queue_turn(text=..., tool_calls=[...])`` queues the next ``complete_tools`` answer.
     Every call is recorded in ``calls``.
     """
@@ -395,6 +409,8 @@ class FakeLLM(Provider):
                 "user": user,
                 "schema": schema.__name__,
                 "model": model,
+                "max_tokens": max_tokens,
+                "effort": effort,
             }
         )
         if self.json_responses:
@@ -403,6 +419,8 @@ class FakeLLM(Provider):
             obj = self.default_json
         else:
             raise RuntimeError("FakeLLM: no queued JSON response")
+        if isinstance(obj, BaseException):
+            raise obj
         parsed = obj if isinstance(obj, schema) else schema.model_validate(obj)
         return parsed, LLMUsage(
             model="fake", prompt_hash=prompt_hash(system, user), input_tokens=10, output_tokens=5
@@ -428,7 +446,19 @@ class FakeLLM(Provider):
 
 
 class LLMRefused(Exception):
-    pass
+    """The model gave no usable answer (a safety refusal)."""
+
+
+class LLMTruncated(LLMRefused):
+    """The output hit ``max_tokens`` before the structured answer was complete (adaptive
+    thinking counts toward the cap). A subclass of ``LLMRefused`` so callers that treat
+    "no usable answer" alike keep working; catch it first to tell the two apart (and,
+    say, retry with a larger ``max_tokens``)."""
+
+
+# Default output budget for ``complete_json``: thinking plus the JSON answer. ~16k is the
+# largest budget that stays a plain (non-streaming) request on the Anthropic SDK.
+JSON_MAX_TOKENS = 16000
 
 
 # --------------------------------------------------------------------------------------
@@ -454,17 +484,27 @@ class LLM:
         schema: type[T],
         *,
         model: str | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int = JSON_MAX_TOKENS,
         effort: str | None = None,
     ) -> tuple[T, LLMUsage]:
         model = model or self.settings.llm_classifier_model
         effort = effort or self.settings.llm_classifier_effort
-        parsed, usage = self.provider.complete_json(
-            system, user, schema, model=model, max_tokens=max_tokens, effort=effort
-        )
+        try:
+            parsed, usage = self.provider.complete_json(
+                system, user, schema, model=model, max_tokens=max_tokens, effort=effort
+            )
+        except LLMTruncated:
+            log.warning(
+                "llm json model=%s stop=max_tokens max_tokens=%s effort=%s: answer truncated",
+                model,
+                max_tokens,
+                effort,
+            )
+            raise
         log.info(
-            "llm json model=%s prompt_hash=%s in=%s out=%s latency_ms=%s",
+            "llm json model=%s stop=%s prompt_hash=%s in=%s out=%s latency_ms=%s",
             usage.model,
+            usage.stop_reason or "-",
             usage.prompt_hash[:12],
             usage.input_tokens,
             usage.output_tokens,

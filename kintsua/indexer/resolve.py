@@ -11,6 +11,15 @@
 * ``.kintsua.yml`` ``sources[]`` -> created and attached to the repo as dependencies of
   kind ``openapi`` / ``changelog`` / ``mcp`` (name = locator) so they show in the map.
 
+Trust (docs/CONTRACTS.md, "Source trust"): sources derived from the curated ``sdk_map``
+(registry sources of curated packages, curated spec / changelog URLs) are created with
+``origin="seed"``; everything taken from the repo (MCP configs and registrations,
+``.kintsua.yml`` sources, raw HTTP hosts, non-curated packages) with ``origin="customer"``.
+An existing row keeps its origin. A customer ``mcp`` source that is a command line rather
+than an http(s) URL is never run by the hosted worker: it is created inactive with a
+``last_error`` saying why, and no poll is queued for it (an operator-seeded row with the
+same locator is attached unchanged).
+
 Sources are created through ``kintsua.watchers.run.find_or_create_source`` when that module
 exists, with a local upsert of identical semantics as the fallback.
 """
@@ -28,6 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from kintsua.core.models import Source
+from kintsua.core.netguard import is_http_locator
 from kintsua.indexer import sdk_map
 from kintsua.indexer.config import ConfigSource, config_sources
 from kintsua.indexer.mcp_config import vendor_for_locator
@@ -43,6 +53,19 @@ DEFAULT_POLL_S = {
     "changelog": 24 * 3600,
 }
 PACKAGE_DISPLAY = {"pypi": "PyPI", "npm": "npm"}
+SEED = "seed"  # derived from the curated sdk_map
+CUSTOMER = "customer"  # taken from the customer's repo
+MAX_DISPLAY_NAME = 255
+STDIO_NOT_RUN = (
+    "not polled: the hosted watcher never runs a command line from a repo; watch this server "
+    "through its http(s) URL or with `kintsua watch --push` from CI"
+)
+
+
+def short_display(text: str, limit: int = MAX_DISPLAY_NAME) -> str:
+    """A display name of at most ``limit`` characters (long command lines are cut)."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 @dataclass
@@ -65,11 +88,16 @@ def _local_find_or_create_source(
     vendor: str | None = None,
     meta: dict[str, Any] | None = None,
     poll_interval_s: int | None = None,
+    origin: str = CUSTOMER,
+    owner_org_id: Any = None,
 ) -> Source:
     """Same semantics as ``kintsua.watchers.run.find_or_create_source`` (fallback)."""
     locator = locator.strip()
+    meta = {k: v for k, v in (meta or {}).items() if not str(k).startswith("_")}
     row = session.scalar(select(Source).where(Source.kind == kind, Source.locator == locator))
     if row is not None:
+        if row.trusted and origin != SEED:
+            return row
         if display_name and (not row.display_name or row.display_name == row.locator):
             row.display_name = display_name
         if vendor and not row.vendor:
@@ -86,6 +114,8 @@ def _local_find_or_create_source(
         vendor=vendor,
         meta=dict(meta or {}),
         poll_interval_s=poll_interval_s or DEFAULT_POLL_S.get(kind, 6 * 3600),
+        origin=origin,
+        owner_org_id=owner_org_id,
     )
     try:
         with session.begin_nested():
@@ -111,7 +141,10 @@ def _find_or_create_source_fn():  # type: ignore[no-untyped-def]
 
 
 class SourceCache:
-    """Find-or-create with a per-run cache and a record of which rows are new."""
+    """Find-or-create with a per-run cache and a record of which rows are new.
+
+    ``new_ids`` lists the new rows that should be polled now; a new customer ``mcp`` row
+    with a command-line locator is created inactive and left out (rule 2)."""
 
     def __init__(self, session: Session):
         self.session = session
@@ -128,6 +161,7 @@ class SourceCache:
         display_name: str | None = None,
         vendor: str | None = None,
         meta: dict[str, Any] | None = None,
+        origin: str = CUSTOMER,
     ) -> Source:
         locator = locator.strip()
         key = (kind, locator)
@@ -140,13 +174,30 @@ class SourceCache:
             is not None
         )
         row = self._fn(
-            self.session, kind, locator, display_name=display_name, vendor=vendor, meta=meta
+            self.session,
+            kind,
+            locator,
+            display_name=short_display(display_name) if display_name else None,
+            vendor=vendor,
+            meta=meta,
+            origin=origin,
         )
-        if not existed:
+        if never_run_here(row):
+            # rule 2: the worker never spawns a command a repo supplied, so never poll it
+            if row.active or not row.last_error:
+                row.active = False
+                row.last_error = STDIO_NOT_RUN
+        elif not existed:
             self.new_ids.append(row.id)
         self.cache[key] = row
         self.sources[row.id] = row
         return row
+
+
+def never_run_here(source: Source) -> bool:
+    """An ``mcp`` source the hosted worker must not spawn: a command line (not an http(s)
+    URL) whose row is not operator-seeded."""
+    return source.kind == "mcp" and not is_http_locator(source.locator) and not source.trusted
 
 
 def _host_of_url(url: str) -> str | None:
@@ -168,7 +219,7 @@ def _config_source_rows(
             continue
         meta: dict[str, Any] = {"configured_by": ".kintsua.yml"}
         if cs.kind == "mcp":
-            meta["transport"] = "http" if cs.url else "stdio"
+            meta["transport"] = cs.mcp_transport
             if not cs.url:
                 meta["quiet"] = True
         host_vendor = sdk_map.vendor_for_host(_host_of_url(locator) or "") if cs.url else None
@@ -177,12 +228,13 @@ def _config_source_rows(
             e = sdk_map.vendor_for_host(h)
             if e is not None:
                 vendor = vendor or e.vendor
-        row = cache.get(cs.kind, locator, display_name=cs.name or locator, vendor=vendor, meta=meta)
+        display = short_display(cs.name or locator)
+        row = cache.get(cs.kind, locator, display_name=display, vendor=vendor, meta=meta)
         dep = DependencyInfo(
             kind=cs.kind,
             name=locator,
             vendor=row.vendor,
-            display_name=cs.name or locator,
+            display_name=display,
             meta={"config_file": ".kintsua.yml", "configured": True, "hosts": list(cs.hosts)},
             source_id=row.id,
         )
@@ -208,8 +260,13 @@ def _resolve_package(dep: DependencyInfo, cache: SourceCache) -> None:
         dep.vendor = dep.vendor or entry.vendor
         dep.display_name = dep.display_name or entry.display_name
         dep.meta.setdefault("sdk_kind", entry.kind)
+        # a curated package: its registry entry and the vendor URLs come from sdk_map
         row = cache.get(
-            dep.kind, dep.name, display_name=f"{dep.name} ({label})", vendor=entry.vendor
+            dep.kind,
+            dep.name,
+            display_name=f"{dep.name} ({label})",
+            vendor=entry.vendor,
+            origin=SEED,
         )
         dep.source_id = row.id
         if entry.openapi_url:
@@ -220,6 +277,7 @@ def _resolve_package(dep: DependencyInfo, cache: SourceCache) -> None:
                 display_name=f"{entry.display_name} API",
                 vendor=entry.vendor,
                 meta=meta,
+                origin=SEED,
             )
             dep.meta["openapi_source_id"] = str(spec.id)
         elif entry.changelog_url:
@@ -228,12 +286,14 @@ def _resolve_package(dep: DependencyInfo, cache: SourceCache) -> None:
                 entry.changelog_url,
                 display_name=f"{entry.display_name} changelog",
                 vendor=entry.vendor,
+                origin=SEED,
             )
             dep.meta["changelog_source_id"] = str(cl.id)
         return
     if dep.meta.get("mcp_server_package") and not dep.meta.get("inferred"):
-        # an MCP server distributed as a package: a new version is a new tool surface
-        row = cache.get(dep.kind, dep.name, display_name=f"{dep.name} ({label})")
+        # an MCP server distributed as a package: a new version is a new tool surface. The
+        # name came from the repo, so the registry row is a customer one.
+        row = cache.get(dep.kind, dep.name, display_name=f"{dep.name} ({label})", origin=CUSTOMER)
         dep.source_id = row.id
         dep.meta.setdefault("sdk_kind", "mcp-server")
 
@@ -254,6 +314,7 @@ def _resolve_http(dep: DependencyInfo, cache: SourceCache, by_host: dict[str, So
             display_name=f"{spec_entry.display_name} API",
             vendor=spec_entry.vendor,
             meta=meta,
+            origin=SEED,
         )
         dep.source_id = row.id
         dep.meta["resolved_via"] = "sdk_map"
@@ -274,6 +335,7 @@ def _resolve_http(dep: DependencyInfo, cache: SourceCache, by_host: dict[str, So
             entry.changelog_url,
             display_name=f"{entry.display_name} changelog",
             vendor=entry.vendor,
+            origin=SEED,
         )
         dep.source_id = row.id
         dep.meta["resolved_via"] = "changelog"
@@ -293,9 +355,12 @@ def _resolve_mcp(dep: DependencyInfo, cache: SourceCache) -> None:
     for k in ("env_keys", "header_keys"):
         if dep.meta.get(k):
             meta[k] = list(dep.meta[k])
-    display = dep.display_name or dep.meta.get("server_name") or dep.name
+    display = short_display(str(dep.display_name or dep.meta.get("server_name") or dep.name))
     dep.vendor = dep.vendor or vendor_for_locator(dep.name)
-    row = cache.get("mcp", dep.name, display_name=str(display), vendor=dep.vendor, meta=meta)
+    # an MCP server from the repo's config or code: a customer source, whatever its host
+    row = cache.get(
+        "mcp", dep.name, display_name=display, vendor=dep.vendor, meta=meta, origin=CUSTOMER
+    )
     dep.source_id = row.id
     dep.vendor = dep.vendor or row.vendor
 
@@ -333,4 +398,11 @@ def resolve_dependencies(
     )
 
 
-__all__ = ["ResolveResult", "SourceCache", "resolve_dependencies"]
+__all__ = [
+    "STDIO_NOT_RUN",
+    "ResolveResult",
+    "SourceCache",
+    "never_run_here",
+    "resolve_dependencies",
+    "short_display",
+]

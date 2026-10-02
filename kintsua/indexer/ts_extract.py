@@ -552,17 +552,22 @@ def _args_shape(call: Node, src: bytes) -> dict[str, Any]:
 
 def _http_call(
     symbol: str, call: Node, src: bytes, scope: _Scope, chain_root: str | None
-) -> tuple[str, str | None, Node | None] | None:
-    """(METHOD, url_template, options_object) for fetch / axios / got / ky / undici calls."""
+) -> tuple[str | None, str | None, Node | None] | None:
+    """(METHOD, url_template, options_object) for fetch / axios / got / ky / undici calls.
+
+    METHOD is None when the options name a ``method`` that is not a literal (``{method}``,
+    ``{method: m}``): the call site is then recorded as the bare path (any method)."""
     pos = _positional_args(call)
     pkg = _package_of(symbol)
     tail = symbol[len(pkg) :].lstrip(".")
     segs = tail.split(".") if tail else []
     opts = next((a for a in pos if a.type == "object"), None)
 
-    def method_from(opts_node: Node | None, default: str) -> str:
+    def method_from(opts_node: Node | None, default: str) -> str | None:
+        if "method" not in _object_keys(opts_node, src):
+            return default
         m = _string_literal(_object_value(opts_node, "method", src), src)
-        return m.upper() if m else default
+        return m.upper() if m else None
 
     if symbol == "fetch" or pkg in FETCH_PACKAGES and segs in ([], ["default"], ["fetch"]):
         url = _template(pos[0], src, scope) if pos else None
@@ -637,7 +642,7 @@ def _record_http(
             file_path=ctx.rel,
             line=line_of(call),
             symbol=symbol,
-            operation=f"{method} {path}",
+            operation=f"{method} {path}" if method else path,
             args_shape=shape,
             in_tests=ctx.in_tests,
         )
@@ -783,7 +788,7 @@ def extract_ts(root: str | Path, *, deadline: float | None = None) -> ExtractRes
             continue
         result.stats.files_seen += 1
         if too_large:
-            result.stats.skipped_large += 1
+            result.stats.record_skipped(rel)
             continue
         text = read_text(path)
         if text is None:

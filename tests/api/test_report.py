@@ -17,17 +17,26 @@ def test_weekly_report_formats_built_on_the_fly_and_cached(
 ):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     src = factory.source()
+    src.origin = "seed"  # only operator-seeded sources are public (CONTRACTS rule 5)
+    factory.commit()
     event = factory.change_event(src)
     factory.classification(event)
+    # a customer's private source never reaches the public page
+    private = factory.source(
+        kind="openapi", locator="https://internal.acme.example/openapi.json", vendor="acmecorp"
+    )
+    factory.classification(factory.change_event(private), summary="Private acme change")
 
     r = client.get("/report/weekly?format=md")
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/markdown")
     assert r.text.startswith("# Kintsua weekly drift report") and "currency" in r.text
 
+    assert "Private acme change" not in r.text and "internal.acme.example" not in r.text
+
     r = client.get("/report/weekly?format=json")
     assert r.status_code == 200
     data = r.json()
-    assert data["stats"]["change_events"] == 1 and data["items"][0]["severity"] == "breaking"
+    assert len(data["items"]) == 1 and data["items"][0]["severity"] == "breaking"
     assert data["items"][0]["vendor"] == "stripe"
 
     r = client.get("/report/weekly?format=rss")
@@ -43,9 +52,9 @@ def test_weekly_report_formats_built_on_the_fly_and_cached(
 
     # cached for ten minutes: a new event is not visible until the cache is dropped
     factory.change_event(src, to_version="2026-10-15")
-    assert client.get("/report/weekly?format=json").json()["stats"]["change_events"] == 1
+    assert len(client.get("/report/weekly?format=json").json()["items"]) == 1
     invalidate_cache()
-    assert client.get("/report/weekly?format=json").json()["stats"]["change_events"] == 2
+    assert len(client.get("/report/weekly?format=json").json()["items"]) == 2
 
     assert client.get("/report/weekly?format=pdf").status_code == 400
     # Accept negotiation
@@ -63,6 +72,8 @@ def test_weekly_report_serves_the_published_files(
 
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     src = factory.source()
+    src.origin = "seed"
+    factory.commit()
     event = factory.change_event(src)
     factory.classification(event, summary="Published summary line")
     until = utcnow()

@@ -44,21 +44,34 @@ def parse_duration(s: str) -> timedelta:
 SECRET_PATTERNS = [
     re.compile(r"(?i)(sk|rk|pk)_(live|test)_[0-9a-zA-Z]{8,}"),
     re.compile(r"(?i)bearer\s+[a-z0-9\-_\.=]{12,}"),
+    # an Authorization / Proxy-Authorization header with any scheme (Basic, Token, ...)
+    re.compile(
+        r"(?i)\b(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?[a-z][a-z0-9_\-]*\s+[^\s\"',}]{6,}"
+    ),
     re.compile(r"(?i)gh[pousr]_[0-9a-zA-Z]{20,}"),
-    re.compile(r"(?i)xox[baprs]-[0-9a-zA-Z\-]{10,}"),
+    re.compile(r"github_pat_[0-9A-Za-z_]{22,}"),
+    re.compile(r"(?i)xox[abeprs]-[0-9a-zA-Z\-]{10,}"),
+    re.compile(r"(?i)xapp-[0-9a-zA-Z\-]{10,}"),
     re.compile(r"(?i)AKIA[0-9A-Z]{16}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
     re.compile(r"(?i)sk-ant-[0-9a-zA-Z\-_]{20,}"),
+    re.compile(r"(?i)sk-(?:proj|svcacct|admin)-[0-9a-zA-Z\-_]{20,}"),
     re.compile(r"(?i)sk-[0-9a-zA-Z]{20,}"),
+    re.compile(r"kts_[0-9A-Za-z_\-]{20,}"),  # Kintsua SDK keys
+    re.compile(r"npm_[0-9A-Za-z]{36}"),
+    re.compile(r"pypi-[0-9A-Za-z_\-]{50,}"),
     re.compile(
         r"(?i)(api[_-]?key|token|secret|password|authorization|client_secret|private_key)"
         r"[\"']?\s*[:=]\s*(bearer\s+)?[\"']?[^\s\"',}]{6,}"
     ),
     re.compile(r"eyJ[0-9a-zA-Z_\-]{10,}\.[0-9a-zA-Z_\-]{10,}\.[0-9a-zA-Z_\-]{10,}"),
 ]
+# credentials in a URL's userinfo (https://user:password@host/...); the scheme and host stay
+URL_USERINFO_PATTERN = re.compile(r"(?i)(?<=://)[^/\s:@]+:[^/\s@]+@")
 
 
 def redact_secrets(text: str) -> str:
-    out = text
+    out = URL_USERINFO_PATTERN.sub("[REDACTED]@", text)
     for pat in SECRET_PATTERNS:
         out = pat.sub("[REDACTED]", out)
     return out

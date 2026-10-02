@@ -238,6 +238,11 @@ def _status_cell(e: DependencyEntry) -> str:
         prefix = "⚪"
         if e.kind == "http":
             text += " — no spec or changelog known for this host"
+        elif e.kind == "mcp" and e.transport == "stdio" and e.source_id:
+            text += (
+                " — Kintsua does not run commands from a repo; use the server's http(s) URL "
+                "or `kintsua watch --push` in CI"
+            )
         elif e.kind == "mcp":
             text += " — disabled in config" if e.transport is None else ""
     if e.discovered_at_runtime:

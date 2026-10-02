@@ -352,7 +352,10 @@ def test_package_event_runs_rules_and_model_and_keeps_rule_severity(session, fak
     row = make_event(
         session,
         source,
-        [{"op": "deprecated", "path": "/latest", "before": "1.17.5", "after": "2.0.0"}],
+        [  # the package watcher's shape: full versions, then the bare majors
+            {"op": "text_changed", "path": "/latest", "before": "1.17.5", "after": "2.0.0"},
+            {"op": "deprecated", "path": "/latest", "before": "1", "after": "2"},
+        ],
         from_version="1.17.5",
         to_version="2.0.0",
         text="## 2.0.0\n- internal refactor, no API changes",
@@ -371,7 +374,7 @@ def test_package_event_runs_rules_and_model_and_keeps_rule_severity(session, fak
     out = classify_change_event(session, row)
     assert out.severity == "degraded" and out.category == "deprecation"
     assert out.summary == "@modelcontextprotocol/sdk 1.x -> 2.0.0: major version bump"
-    assert out.rule_hits == ["deprecated", "major_bump", "llm"]
+    assert out.rule_hits == ["major_bump", "llm"]
     assert out.llm_confidence == 0.9 and out.llm_model == "fake"
     assert out.needs_human is False
     assert "<rules_result>" in fake_llm.calls[-1]["user"]

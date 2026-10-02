@@ -4,7 +4,9 @@ The fake implements the slice of the SDK the backend uses (volumes.create,
 containers.create, start/wait/logs/remove, exec_run, get_archive/put_archive) and runs
 every command on this machine with ``/work`` mapped to a temp directory, so the real
 code path (networked clone helper, no-network main container, tar-based file access,
-``timeout``-wrapped execs, cleanup) is exercised without a daemon.
+``timeout``-wrapped execs, cleanup) is exercised without a daemon. ``/opt/venv`` (the
+image venv) maps to a per-volume directory when a volume is mounted there and to the
+container's own throwaway layer otherwise, like Docker.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,7 @@ from typing import Any
 import pytest
 
 from kintsua.fixer.sandbox import DockerSandbox, SandboxError
+from kintsua.fixer.testcmd import PYTEST_COMMAND, RUFF_COMMAND, detect_test_command
 from tests.fixer.conftest import clone_url_for
 
 
@@ -47,13 +51,27 @@ class FakeContainer:
         self.started = False
 
     # ---- host mapping -----------------------------------------------------------------
+    def _venv_dir(self) -> Path:
+        """``/opt/venv``: the mounted volume's directory, else this container's own layer
+        (gone with the container, as in Docker)."""
+        for name, spec in (self.kwargs.get("volumes") or {}).items():
+            if spec.get("bind") == "/opt/venv":
+                d = self.client.root / "volumes" / name
+                break
+        else:
+            d = self.client.root / "layers" / f"c{id(self)}" / "opt-venv"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def _map(self, s: str) -> str:
-        return s.replace("/work", str(self.client.work))
+        return s.replace("/work", str(self.client.work)).replace("/opt/venv", str(self._venv_dir()))
 
     def _env(self, env: dict[str, str] | None) -> dict[str, str]:
         merged = dict(os.environ)
         merged.update({k: str(v) for k, v in (env or {}).items()})
         merged["HOME"] = str(self.client.home)
+        # the image puts its tooling first on PATH; here that is this venv (pytest, ruff)
+        merged["PATH"] = str(Path(sys.executable).parent) + os.pathsep + merged.get("PATH", "")
         return merged
 
     def _run(self, argv: list[str], workdir: str | None, env: dict[str, str] | None):
@@ -130,6 +148,7 @@ class _Containers:
 
 class FakeDockerClient:
     def __init__(self, root: Path):
+        self.root = root
         self.work = root / "work"
         self.home = root / "home"
         self.work.mkdir(parents=True)
@@ -158,7 +177,7 @@ def docker_sandbox(settings, tmp_path: Path, fixture_git_repo: Path, monkeypatch
 
 def test_prepare_uses_a_networked_helper_then_a_no_network_container(docker_sandbox):
     sb, client = docker_sandbox
-    assert client.volumes_created[0].name == "kintsua-fix-job1"
+    assert [v.name for v in client.volumes_created] == ["kintsua-fix-job1", "kintsua-venv-job1"]
     helpers = [c for c in client.containers_created if c.command != ["sleep", "infinity"]]
     main = [c for c in client.containers_created if c.command == ["sleep", "infinity"]]
     assert helpers and main and len(main) == 1
@@ -228,7 +247,7 @@ def test_networked_run_and_cleanup(docker_sandbox):
     assert helper.kwargs["network_mode"] == "bridge" and helper.removed
     main = next(c for c in client.containers_created if c.command == ["sleep", "infinity"])
     sb.cleanup()
-    assert main.removed and client.volumes_created[0].removed
+    assert main.removed and all(v.removed for v in client.volumes_created)
     sb.cleanup()  # idempotent
 
 
@@ -246,3 +265,42 @@ def test_proxy_replaces_the_allowlist(settings, tmp_path: Path, monkeypatch):
         env["HTTPS_PROXY"] == "http://egress.internal:3128"
         and env["HTTP_PROXY"] == env["HTTPS_PROXY"]
     )
+
+
+def test_test_plan_is_detected_inside_the_container(docker_sandbox):
+    """``workdir`` is ``/work/repo`` inside the container: reading it on the worker finds
+    nothing, reading through the sandbox finds the real plan."""
+    sb, client = docker_sandbox
+    assert sb.workdir == "/work/repo"
+    plan = detect_test_command(sb, {})
+    assert plan.command == PYTEST_COMMAND and plan.runner == "pytest"
+    assert RUFF_COMMAND in plan.static_checks and plan.language == "python"
+    assert plan.install == ["python -m pip install -e ."]
+    # the host path is empty on the worker: the old behaviour refused every Docker job
+    assert detect_test_command(sb.workdir, {}, tool_available=lambda n: False).command is None
+    # without a ruff config, ruff's availability is probed inside the container
+    pyproject = sb.read_file("pyproject.toml")
+    sb.write_file("pyproject.toml", pyproject.split("[tool.ruff]")[0])
+    before = len(client.execs)
+    assert detect_test_command(sb, {}).static_checks == [RUFF_COMMAND]
+    assert any("command -v ruff" in " ".join(e["argv"]) for e in client.execs[before:])
+
+
+def test_installs_reach_the_no_network_container(docker_sandbox):
+    """``pip install`` runs in the networked helper and writes to the image venv; the
+    test container must see it (a per-job volume over /opt/venv in both containers)."""
+    sb, client = docker_sandbox
+    helpers = [c for c in client.containers_created if c.command != ["sleep", "infinity"]]
+    main = next(c for c in client.containers_created if c.command == ["sleep", "infinity"])
+    for c in [*helpers, main]:
+        binds = {spec["bind"]: name for name, spec in c.kwargs["volumes"].items()}
+        assert binds == {"/work": "kintsua-fix-job1", "/opt/venv": "kintsua-venv-job1"}
+        assert c.kwargs["environment"]["POETRY_VIRTUALENVS_IN_PROJECT"] == "true"
+    res = sb.run(
+        "mkdir -p /opt/venv/lib && echo installed > /opt/venv/lib/stripe.marker",
+        timeout_s=30,
+        network=True,
+    )
+    assert res.ok, res.output
+    seen = sb.run(["cat", "/opt/venv/lib/stripe.marker"], timeout_s=30)
+    assert seen.ok and seen.stdout.strip() == "installed"

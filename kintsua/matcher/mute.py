@@ -13,6 +13,10 @@
 operation has: as recorded (``POST /v1/legacy/foo``), canonical (``tool:get_weather``), the
 HTTP path alone (``/v1/legacy/foo``), the bare tool name, and, for SDK symbols, the HTTP
 operations they stand for. Matching is case-insensitive so ``POST`` and ``post`` agree.
+
+A bare dotted name such as ``browser.navigate`` parses as an SDK symbol, but on an MCP
+dependency it is a tool name; callers that know the call site belongs to an ``mcp``
+dependency pass ``tool=True`` so ``tool:`` patterns apply to it too.
 """
 
 from __future__ import annotations
@@ -30,8 +34,9 @@ def clean_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:
     return out
 
 
-def mute_candidates(vendor: str | None, operation: str | None) -> list[str]:
-    """Every string a mute pattern may be written against for this operation."""
+def mute_candidates(vendor: str | None, operation: str | None, *, tool: bool = False) -> list[str]:
+    """Every string a mute pattern may be written against for this operation (``tool``:
+    the operation is a call site of an MCP dependency, so it is also a tool name)."""
     raw = (operation or "").strip()
     if not raw:
         return []
@@ -46,6 +51,8 @@ def mute_candidates(vendor: str | None, operation: str | None) -> list[str]:
             bare.append(f"{op.method} {op.path}")
     elif op.kind in ("tool", "resource", "prompt", "schema", "package", "sdk"):
         bare.append(op.name)
+        if op.kind == "sdk" and tool and not raw.lower().startswith("sdk:"):
+            bare.append(f"tool:{op.name}")
         if op.kind == "sdk":
             for h in sdk_http_operations(op.name):
                 bare.append(h.canonical())
@@ -63,12 +70,16 @@ def mute_candidates(vendor: str | None, operation: str | None) -> list[str]:
 
 
 def is_muted(
-    patterns: list[str] | tuple[str, ...] | None, vendor: str | None, operation: str | None
+    patterns: list[str] | tuple[str, ...] | None,
+    vendor: str | None,
+    operation: str | None,
+    *,
+    tool: bool = False,
 ) -> bool:
     pats = clean_patterns(patterns)
     if not pats:
         return False
-    cands = [c.lower() for c in mute_candidates(vendor, operation)]
+    cands = [c.lower() for c in mute_candidates(vendor, operation, tool=tool)]
     if not cands:
         return False
     for p in pats:

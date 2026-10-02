@@ -53,6 +53,8 @@ LABEL_COLOURS: dict[str, tuple[str, str]] = {
 
 _MD_ESCAPE_RE = re.compile(r"([\\`*_\[\]#|~])")
 _LINE_START_RE = re.compile(r"^(\s*)([-+]|\d+\.)(\s)")
+_ZWSP = "\u200b"  # zero-width space: breaks GitHub @mentions and autolinks, invisible
+_WWW_RE = re.compile(r"\b(www)\.", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------------------
@@ -62,7 +64,8 @@ _LINE_START_RE = re.compile(r"^(\s*)([-+]|\d+\.)(\s)")
 
 def plain(text: Any, *, max_len: int | None = None) -> str:
     """Render untrusted text as inert Markdown on one line: no HTML, no emphasis, no
-    links, no headings, no list items."""
+    links (bare URLs and ``www.`` are not autolinked), no ``@mentions`` (vendor release
+    notes are full of ``by @user in <url>``), no headings, no list items."""
     s = "" if text is None else str(text)
     s = s.replace("\r", "").replace("\n", " ").replace("\t", " ")
     s = re.sub(r"\s{2,}", " ", s).strip()
@@ -71,6 +74,8 @@ def plain(text: Any, *, max_len: int | None = None) -> str:
     s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     s = _MD_ESCAPE_RE.sub(r"\\\1", s)
     s = _LINE_START_RE.sub(r"\1\\\2\3", s)
+    s = s.replace("@", "@" + _ZWSP).replace("://", ":" + _ZWSP + "//")
+    s = _WWW_RE.sub(r"\1" + _ZWSP + ".", s)
     return s
 
 
@@ -123,6 +128,16 @@ def is_fixable(classification: Classification | None) -> bool:
         classification is not None
         and classification.category in FIXABLE_CATEGORIES
         and classification.severity in ACTIONABLE_SEVERITIES
+    )
+
+
+def has_file_located_site(sites: Any) -> bool:
+    """Does any matched call-site record point at a file in the repo? Runtime-observed
+    (``<runtime>``) sites and package impacts without call sites give the fixer nothing to
+    patch."""
+    return any(
+        isinstance(s, dict) and s.get("file_path") and s["file_path"] != RUNTIME_FILE_PATH
+        for s in sites or []
     )
 
 
@@ -302,8 +317,13 @@ def build_issue_body(
     lines.append("## Status")
     lines.append("")
     mode = effective_fix_mode(repo.config, org.settings if org is not None else None)
-    if mode == "pr" and is_fixable(classification):
+    if mode == "pr" and is_fixable(classification) and has_file_located_site(sites):
         lines.append("Kintsua will open a PR within an hour.")
+    elif mode == "pr" and is_fixable(classification):
+        lines.append(
+            "Fix mode is pr, but no call sites were found in this repo's files; "
+            "this stays an issue."
+        )
     elif mode == "pr":
         lines.append(
             f"Fix mode is pr, but {plain(classification.category)} changes are not auto-fixed in v0; "
@@ -520,6 +540,7 @@ __all__ = [
     "effective_fix_mode",
     "ensure_labels",
     "find_issue_with_marker",
+    "has_file_located_site",
     "is_fixable",
     "plain",
     "relevant_ops",

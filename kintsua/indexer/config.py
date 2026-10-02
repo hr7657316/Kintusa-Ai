@@ -16,8 +16,15 @@ Spec shape::
 Extras accepted (optional): ``test_command`` (string, overrides test detection in the
 fixer), ``fix.radius`` (import-hop radius the validator allows), ``sources[].host`` /
 ``sources[].hosts`` (API hosts a spec or changelog covers, so raw HTTP calls to that host
-resolve to it) and ``sources[].kind: mcp`` with ``url`` or ``command``. Unknown keys are
-ignored; bad values raise ``ValueError`` with a readable message.
+resolve to it) and ``sources[].kind: mcp`` with ``url`` or ``command`` (optional
+``transport: http | sse | stdio``; a URL ending in ``/sse`` is guessed as SSE). Unknown keys
+are ignored; bad values raise ``ValueError`` with a readable message.
+
+``Repo.config`` holds the file's values under the spec keys merged with what the settings
+API set, which the API also records under ``Repo.config["settings"]``
+(``API_SETTINGS_KEY``: ``{"mute": [...], "sources": [...], "fix": {"mode": ...}}``). A
+re-index re-parses the file and merges those back (``merge_api_settings``): mutes and
+sources are the union, an API-set fix mode wins over the file's.
 """
 
 from __future__ import annotations
@@ -31,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 FixMode = Literal["pr", "issue_only"]
 DEFAULT_FIX_MODE: FixMode = "issue_only"
+API_SETTINGS_KEY = "settings"  # Repo.config[API_SETTINGS_KEY]: values set via the settings API
 
 
 class ConfigSource(BaseModel):
@@ -42,6 +50,17 @@ class ConfigSource(BaseModel):
     name: str | None = None
     host: str | None = None
     hosts: list[str] = Field(default_factory=list)
+    # mcp only; guessed from the locator when absent (see ``mcp_transport``)
+    transport: Literal["http", "sse", "stdio"] | None = None
+
+    @field_validator("transport", mode="before")
+    @classmethod
+    def _transport_norm(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v = v.strip().lower().replace("_", "-")
+            if v in ("streamable-http", "streamablehttp"):
+                return "http"
+        return v
 
     @field_validator("url")
     @classmethod
@@ -70,8 +89,14 @@ class ConfigSource(BaseModel):
                 raise ValueError("an mcp source needs a url or a command")
             if self.command is not None and not shlex.split(self.command):
                 raise ValueError("mcp command must not be empty")
-        elif not self.url:
-            raise ValueError(f"a {self.kind} source needs a url")
+            if self.transport == "stdio" and self.url:
+                raise ValueError("transport stdio needs a command, not a url")
+            if self.transport in ("http", "sse") and not self.url:
+                raise ValueError(f"transport {self.transport} needs a url")
+        else:
+            if not self.url:
+                raise ValueError(f"a {self.kind} source needs a url")
+            self.transport = None
         self.hosts = [h.lower().strip() for h in ([self.host] if self.host else []) + self.hosts]
         self.hosts = [h for h in dict.fromkeys(self.hosts) if h]
         self.host = self.hosts[0] if self.hosts else None
@@ -82,6 +107,19 @@ class ConfigSource(BaseModel):
         if self.kind == "mcp" and not self.url:
             return shlex.join(shlex.split(self.command or ""))
         return self.url or ""
+
+    @property
+    def mcp_transport(self) -> str | None:
+        """``transport`` if given, else ``sse`` for a URL whose path ends in ``/sse`` (the
+        same guess as the MCP config extractor), ``http`` for other URLs, ``stdio`` for a
+        command."""
+        if self.kind != "mcp":
+            return None
+        if self.transport:
+            return self.transport
+        if not self.url:
+            return "stdio"
+        return "sse" if urlsplit(self.url).path.rstrip("/").endswith("/sse") else "http"
 
 
 class FixConfig(BaseModel):
@@ -249,3 +287,44 @@ def config_sources(config: dict[str, Any] | None) -> list[ConfigSource]:
 def test_command(config: dict[str, Any] | None) -> str | None:
     v = (config or {}).get("test_command")
     return str(v) if v else None
+
+
+def _raw_source_locator(raw: dict[str, Any]) -> str | None:
+    try:
+        return ConfigSource.model_validate(raw).locator or None
+    except ValidationError:
+        v = raw.get("url") or raw.get("command") or raw.get("locator")
+        return str(v).strip() if v else None
+
+
+def merge_api_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Fold the values the settings API recorded under ``config[API_SETTINGS_KEY]`` into the
+    spec keys of a freshly parsed ``.kintsua.yml`` (``config`` is modified and returned):
+    mutes and sources are the union (file entries first, deduped by pattern / locator) and
+    an API-set ``fix.mode`` / ``fix.base`` wins over the file's."""
+    saved = config.get(API_SETTINGS_KEY)
+    if not isinstance(saved, dict):
+        return config
+    mutes = [m for m in config.get("mute") or [] if isinstance(m, str)]
+    for m in saved.get("mute") or []:
+        if isinstance(m, str) and m.strip() and m.strip() not in mutes:
+            mutes.append(m.strip())
+    config["mute"] = mutes
+    sources = [s for s in config.get("sources") or [] if isinstance(s, dict)]
+    have = {_raw_source_locator(s) for s in sources}
+    for s in saved.get("sources") or []:
+        if not isinstance(s, dict):
+            continue
+        loc = _raw_source_locator(s)
+        if loc and loc not in have:
+            sources.append(dict(s))
+            have.add(loc)
+    config["sources"] = sources
+    saved_fix = saved.get("fix")
+    if isinstance(saved_fix, dict):
+        fix = dict(config.get("fix") or {}) if isinstance(config.get("fix"), dict) else {}
+        for k in ("mode", "base"):
+            if saved_fix.get(k):
+                fix[k] = saved_fix[k]
+        config["fix"] = fix
+    return config

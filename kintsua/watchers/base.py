@@ -232,19 +232,41 @@ class FileSnapshotStore:
     def __init__(self, directory: str | Path = ".kintsua"):
         self.dir = Path(directory)
 
+    @staticmethod
+    def _owner(path: Path) -> str | None:
+        """The ``source_id`` recorded in a lockfile (None if missing or unreadable)."""
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+        sid = data.get("source_id") if isinstance(data, dict) else None
+        return str(sid) if sid else None
+
     def path_for(self, source: SourceRef | UUID, name: str | None = None) -> Path:
+        """``<dir>/<name>.lock.json``. With the default name (``lockfile_name``), a server
+        whose host already has a lockfile belonging to another server gets the path-qualified
+        name instead, so two servers on one host never overwrite each other's lockfile."""
         if isinstance(source, SourceRef):
-            name = name or lockfile_name(source)
+            default = lockfile_name(source)
+            if name is None or name == default:
+                p = self.dir / f"{default}.lock.json"
+                if p.exists() and self._owner(p) not in (None, str(source.id)):
+                    return self.dir / f"{lockfile_name(source, qualified=True)}.lock.json"
+                return p
         else:
             name = name or str(source)
         return self.dir / f"{name}.lock.json"
 
     def latest(self, source_id: UUID, name: str | None = None) -> SnapshotRecord | None:
+        """The lockfile of ``source_id``: ``<name>.lock.json`` when it belongs to that source,
+        else any lockfile in the directory recorded for it (the path-qualified one written
+        when two servers share a host); None when there is none."""
         p = self.dir / f"{name}.lock.json" if name else None
+        if p is not None and p.exists() and self._owner(p) not in (None, str(source_id)):
+            p = None  # another server's lockfile (same host): look for this server's own
         if p is None:
-            for cand in self.dir.glob("*.lock.json"):
-                data = json.loads(cand.read_text("utf-8"))
-                if data.get("source_id") == str(source_id):
+            for cand in sorted(self.dir.glob("*.lock.json")):
+                if self._owner(cand) == str(source_id):
                     p = cand
                     break
         if p is None or not p.exists():
@@ -298,15 +320,34 @@ class FileSnapshotStore:
         return [json.loads(line) for line in p.read_text("utf-8").splitlines() if line.strip()]
 
 
-def lockfile_name(source: SourceRef) -> str:
-    """``https://mcp.vendor.com/mcp`` -> ``mcp.vendor.com``; ``npx -y foo`` -> ``npx-y-foo``."""
+def lockfile_name(source: SourceRef, *, qualified: bool = False) -> str:
+    """``https://mcp.vendor.com/mcp`` -> ``mcp.vendor.com``; ``npx -y foo`` -> ``npx-y-foo``.
+
+    ``qualified=True`` adds the URL path (``api.githubcopilot.com-mcp-x-issues``) and, when
+    the slug had to be truncated, a short hash of the whole locator: the name used for a
+    second server on a host that already has a lockfile (see ``FileSnapshotStore.path_for``).
+    """
+    import hashlib
     import re
 
     loc = source.locator
     if "://" in loc:
-        host = loc.split("://", 1)[1].split("/", 1)[0]
-        return re.sub(r"[^A-Za-z0-9.-]+", "-", host) or "server"
-    return re.sub(r"[^A-Za-z0-9.-]+", "-", loc).strip("-")[:80] or "server"
+        rest = loc.split("://", 1)[1]
+        host = rest.split("/", 1)[0]
+        name = re.sub(r"[^A-Za-z0-9.-]+", "-", host) or "server"
+        if not qualified:
+            return name
+        slug = re.sub(r"[^A-Za-z0-9.-]+", "-", rest[len(host) :]).strip("-")
+        full = f"{name}-{slug}" if slug else name
+    else:
+        full = re.sub(r"[^A-Za-z0-9.-]+", "-", loc).strip("-") or "server"
+        if not qualified:
+            return full[:80]
+    if len(full) > 80 or "://" not in loc or full == lockfile_name(source):
+        # truncated, a command line, or no path to tell it apart: make it unique
+        digest = hashlib.sha256(loc.encode("utf-8")).hexdigest()[:8]
+        return f"{full[:71].rstrip('-')}-{digest}"
+    return full
 
 
 # --------------------------------------------------------------------------------------
@@ -323,15 +364,17 @@ def compare(
     raw_diff_ref: str = "inline",
     text: str | None = None,
 ) -> ChangeEvent | None:
-    """Return a ``ChangeEvent`` if ``doc`` differs from ``previous`` (None on first sight
-    or when the content hash is unchanged)."""
+    """Return a ``ChangeEvent`` if ``doc`` differs from ``previous`` (None on first sight,
+    when the content hash is unchanged, or when the diff has no ops: a version string bump
+    alone, e.g. ``info.version`` on every publish, is not a change event; the caller still
+    stores the snapshot so the next event's ``from_version`` moves on)."""
     new_hash = doc.content_hash()
     if previous is None:
         return None
     if previous.content_hash == new_hash:
         return None
     ops = watcher.diff(previous.as_doc(), doc)
-    if not ops and (previous.version == doc.version):
+    if not ops:
         return None
     return ChangeEvent(
         source_id=source.id,

@@ -19,6 +19,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -381,6 +382,10 @@ def subscribe_email(session: Session, email: str) -> bool:
 @router.post("/report/subscribe")
 async def subscribe(request: Request, session: Session = Depends(get_db)) -> Response:
     body = await read_body(request, SubscribeBody)
+    return await run_in_threadpool(_subscribe, request, session, body)
+
+
+def _subscribe(request: Request, session: Session, body: SubscribeBody) -> Response:
     created = subscribe_email(session, body.email)
     session.commit()
     log.info("subscriber %s %s", body.email, "added" if created else "already present")

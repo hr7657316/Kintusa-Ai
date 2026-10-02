@@ -21,6 +21,14 @@ log = logging.getLogger(__name__)
 RULE_LLM = "llm"
 RULE_LLM_LOW_CONFIDENCE = "llm_low_confidence"
 MAX_AFFECTED_PATHS = 100
+MAX_SUMMARY_CHARS = 500
+MAX_HINT_CHARS = 1000
+
+
+def _flatten(text: str, limit: int) -> str:
+    """Collapse whitespace (newlines included) to single spaces and cap the length."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
 def needs_human_review(classification: Classification) -> bool:
@@ -67,8 +75,9 @@ def classify_with_llm(
         rule_hits.append(RULE_LLM_LOW_CONFIDENCE)
     affected = [p.strip() for p in parsed.affected_paths if isinstance(p, str) and p.strip()]
     affected = list(dict.fromkeys(affected))[:MAX_AFFECTED_PATHS]
-    hint = (parsed.migration_hint or "").strip() or None
-    summary = " ".join(parsed.summary.split()) or "Upstream change needs review"
+    # one line each, bounded: both end up in issue titles/bodies and the weekly report
+    hint = _flatten(parsed.migration_hint or "", MAX_HINT_CHARS) or None
+    summary = _flatten(parsed.summary, MAX_SUMMARY_CHARS) or "Upstream change needs review"
     result = Classification(
         severity=severity,
         category=parsed.category,

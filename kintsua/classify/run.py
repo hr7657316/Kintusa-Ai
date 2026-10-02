@@ -3,6 +3,10 @@
 Flow per change event row:
 
 1. Build the ``ChangeEvent`` from ``row.diff`` (plus the text that travelled with it).
+   A large diff is stored truncated (``ops_truncated``) with the full document behind
+   ``storage_ref`` / ``raw_diff_ref``; the full ops are loaded first. When that document
+   is gone for good the preview is classified, and anything short of ``breaking`` is
+   forced to ``unknown`` with the ``diff_truncated`` rule hit (a human looks).
 2. Rules first (``classify_by_rules``).
 3. The model runs when the rules could not decide, for every ``changelog`` event, and
    for ``pypi``/``npm`` events that carry release notes. When both ran, the rules'
@@ -14,7 +18,9 @@ Flow per change event row:
    ``unknown``), commit, enqueue ``match_event`` with dedupe key ``match_event:<id>``.
 
 Consumer operations shown to the model are the distinct ``call_site.operation`` values
-of dependencies on the same source: operation / tool names only, never repo names.
+of dependencies on the same source (directly, or through ``meta.openapi_source_id`` /
+``meta.changelog_source_id`` like the matcher's join): operation / tool names only,
+never repo names.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -56,8 +62,11 @@ log = logging.getLogger(__name__)
 RULE_LLM_PROMOTED = "llm_promoted"
 RULE_LLM_REFUSED = "llm_refused"
 RULE_LLM_INVALID = "llm_invalid_output"
+RULE_DIFF_TRUNCATED = "diff_truncated"
 SEVERITY_RANK = {"breaking": 0, "degraded": 1, "safe": 2, "unknown": 3}
 MAX_CONSUMER_OPERATIONS = 100
+MAX_SUMMARY_CHARS = 1000
+MAX_HINT_CHARS = 1000
 
 
 # --------------------------------------------------------------------------------------
@@ -65,24 +74,78 @@ MAX_CONSUMER_OPERATIONS = 100
 # --------------------------------------------------------------------------------------
 
 
-def build_change_event(row: ChangeEventRow, source: Source | None = None) -> ChangeEvent:
+class StoredDiffUnavailable(RuntimeError):
+    """The full diff behind a truncated ``change_event`` row is gone for good (missing
+    file or object, unreadable document). Transient storage errors are not this: they
+    propagate so the ``classify_event`` job retries."""
+
+
+def stored_diff_ref(diff: dict[str, Any]) -> dict[str, Any] | None:
+    """Where the full diff of a large change event lives. The watcher writes
+    ``storage_ref`` (a storage_ref dict) next to ``raw_diff_ref`` (its string form,
+    ``file://<path>`` or ``s3://<bucket>/<key>``); older rows carry only the string."""
+    ref = diff.get("storage_ref")
+    if isinstance(ref, dict) and ref.get("kind") in ("inline", "file", "s3"):
+        return ref
+    raw = diff.get("raw_diff_ref")
+    if isinstance(raw, str):
+        if raw.startswith("file://") and len(raw) > len("file://"):
+            return {"kind": "file", "path": raw[len("file://") :]}
+        if raw.startswith("s3://"):
+            bucket, _, key = raw[len("s3://") :].partition("/")
+            if bucket and key:
+                return {"kind": "s3", "bucket": bucket, "key": key}
+    return None
+
+
+def _storage_error_is_permanent(e: Exception) -> bool:
+    if isinstance(e, FileNotFoundError | NotADirectoryError | IsADirectoryError):
+        return True
+    if isinstance(e, ValueError | KeyError | TypeError):  # bad JSON, bad ref, bad shape
+        return True
+    resp = getattr(e, "response", None)  # botocore ClientError
+    error = resp.get("Error") if isinstance(resp, dict) else None
+    code = str(error.get("Code", "")) if isinstance(error, dict) else ""
+    return code in ("NoSuchKey", "NoSuchBucket", "404")
+
+
+def _load_stored_ops(row: ChangeEventRow, data: dict[str, Any]) -> None:
+    """Replace the 200-op preview of a truncated row with the full stored diff."""
+    ref = stored_diff_ref(data)
+    if ref is None:
+        raise StoredDiffUnavailable(f"change_event {row.id}: truncated diff without a storage ref")
+    try:
+        stored = get_document(ref)
+    except Exception as e:
+        if not _storage_error_is_permanent(e):
+            raise  # transient (S3 outage, I/O error): the job retries
+        raise StoredDiffUnavailable(f"change_event {row.id}: stored diff unreadable: {e}") from e
+    if not isinstance(stored, dict) or not isinstance(stored.get("ops"), list):
+        raise StoredDiffUnavailable(f"change_event {row.id}: stored diff has no ops list")
+    data["ops"] = stored["ops"]
+    if not data.get("text") and stored.get("text"):
+        data["text"] = stored["text"]
+
+
+def build_change_event(
+    row: ChangeEventRow, source: Source | None = None, *, load_stored: bool = True
+) -> ChangeEvent:
     """``row.diff`` is the dumped ``ChangeEvent``; tolerate a missing ``source_id`` /
-    ``source_kind`` and a diff whose ops live behind a storage ref."""
+    ``source_kind``. A large diff is stored as a preview (``ops_truncated``, the first
+    ``DIFF_OPS_PREVIEW`` ops) plus the full document behind ``storage_ref`` /
+    ``raw_diff_ref``: the full ops are loaded so no rule runs on a partial diff. Raises
+    ``StoredDiffUnavailable`` when the full diff is gone for good (``load_stored=False``
+    builds the event from the preview instead)."""
     data: dict[str, Any] = dict(row.diff or {})
     data["source_id"] = row.source_id
     if not data.get("source_kind") and source is not None:
         data["source_kind"] = source.kind
-    ops = data.get("ops")
-    if not ops and isinstance(data.get("storage_ref"), dict):
-        try:
-            stored = get_document(data["storage_ref"])
-        except Exception as e:  # noqa: BLE001
-            log.warning("change_event %s: could not load stored diff: %s", row.id, e)
-            stored = None
-        if isinstance(stored, dict) and isinstance(stored.get("ops"), list):
-            data["ops"] = stored["ops"]
-            data.setdefault("text", stored.get("text"))
-    data.pop("storage_ref", None)
+    truncated = bool(data.get("ops_truncated"))
+    has_dict_ref = isinstance(data.get("storage_ref"), dict)
+    if load_stored and (truncated or (not data.get("ops") and has_dict_ref)):
+        _load_stored_ops(row, data)
+    for k in ("storage_ref", "ops_truncated", "ops_total"):
+        data.pop(k, None)
     if data.get("ops") is None:
         data["ops"] = []
     return ChangeEvent.model_validate(data)
@@ -100,10 +163,19 @@ def consumer_operations_for(
     session: Session, source_id: UUID, limit: int = MAX_CONSUMER_OPERATIONS
 ) -> list[str]:
     """Distinct operations consumers call on this source, anonymised (no repo names)."""
+    sid = str(source_id)
     rows = session.execute(
         select(CallSite.operation)
         .join(Dependency, Dependency.id == CallSite.dependency_id)
-        .where(Dependency.source_id == source_id)
+        .where(
+            # same join as the matcher: SDK packages reach their vendor spec / changelog
+            # through dep.meta (the primary source_id stays the package registry)
+            or_(
+                Dependency.source_id == source_id,
+                Dependency.meta["openapi_source_id"].astext == sid,
+                Dependency.meta["changelog_source_id"].astext == sid,
+            )
+        )
         .distinct()
         .order_by(CallSite.operation)
         .limit(limit)
@@ -167,6 +239,33 @@ def merge_rules_and_model(
     )
 
 
+def flag_partial_diff(c: Classification) -> Classification:
+    """The full diff could not be read: a breaking verdict from the preview stands (a
+    breaking op is breaking whatever else changed); anything milder may be hiding a
+    removal past the preview, so it becomes ``unknown`` (a human looks) instead."""
+    rule_hits = list(c.rule_hits)
+    if RULE_DIFF_TRUNCATED not in rule_hits:
+        rule_hits.append(RULE_DIFF_TRUNCATED)
+    if c.severity == "breaking":
+        return c.model_copy(update={"rule_hits": rule_hits})
+    return c.model_copy(
+        update={
+            "severity": "unknown",
+            "summary": f"{c.summary} (full diff unavailable; needs review)",
+            "rule_hits": rule_hits,
+        }
+    )
+
+
+def _cap_hint(hint: str | None) -> str | None:
+    if not hint:
+        return None
+    flat = " ".join(hint.split())
+    if len(flat) > MAX_HINT_CHARS:
+        flat = flat[: MAX_HINT_CHARS - 1] + "…"
+    return flat or None
+
+
 def _fallback_unknown(event: ChangeEvent, reason_rule: str, detail: str) -> Classification:
     return Classification(
         severity="unknown",
@@ -207,7 +306,15 @@ def classify_change_event(session: Session, change_event_row: ChangeEventRow) ->
         return existing
 
     source = session.get(Source, row.source_id)
-    event = build_change_event(row, source)
+    complete = True
+    try:
+        event = build_change_event(row, source)
+    except StoredDiffUnavailable as e:
+        # a breaking op in the preview is breaking whatever else changed; anything
+        # milder could hide a removal past the preview (see flag_partial_diff)
+        log.warning("change_event %s: classifying the truncated preview only: %s", row.id, e)
+        event = build_change_event(row, source, load_stored=False)
+        complete = False
     display_name = display_name_for(source)
     settings = get_settings()
 
@@ -235,6 +342,8 @@ def classify_change_event(session: Session, change_event_row: ChangeEventRow) ->
     final = merge_rules_and_model(
         rules_result, llm_result, threshold=settings.llm_confidence_threshold
     )
+    if not complete:
+        final = flag_partial_diff(final)
     needs_human = needs_human_review(final)
     if needs_human and RULE_LLM_LOW_CONFIDENCE not in final.rule_hits and llm_result is None:
         # rules and model both silent (should not happen: the model always answers)
@@ -244,9 +353,9 @@ def classify_change_event(session: Session, change_event_row: ChangeEventRow) ->
         change_event_id=row.id,
         severity=final.severity,
         category=final.category,
-        summary=final.summary[:1000],
+        summary=final.summary[:MAX_SUMMARY_CHARS],
         affected_paths=list(final.affected_paths),
-        migration_hint=final.migration_hint,
+        migration_hint=_cap_hint(final.migration_hint),
         rule_hits=list(final.rule_hits),
         llm_model=usage.model if usage else None,
         llm_confidence=final.llm_confidence,

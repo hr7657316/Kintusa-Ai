@@ -1,9 +1,14 @@
 """Fill a ``WeeklyReport`` from Postgres: every change event in the window by severity, the
 "needs a human look" residue, sources failing for 7+ days and the headline numbers.
 
-``build_weekly_report(session, since, until) -> WeeklyReport`` is the seam used by the
-``weekly_report`` job, the public ``/report/weekly`` page and ``python -m kintsua.watchers.run
---report``.
+``build_weekly_report(session, since, until, *, public_only=True) -> WeeklyReport`` is the
+seam used by the ``weekly_report`` job, the public ``/report/weekly`` page and
+``python -m kintsua.watchers.run --report``.
+
+The default build is the public one (docs/CONTRACTS.md, "Source trust", rule 5): items and
+failing sources only for ``Source.public`` (operator-seeded) sources, no link to a customer
+repo's issue or PR, every error string through ``redact_secrets``. The headline numbers stay
+aggregate counts. Operator CLIs may pass ``public_only=False`` for the unfiltered view.
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from kintsua.core.models import (
     RuntimeEvent,
     Source,
 )
-from kintsua.core.util import utcnow
+from kintsua.core.util import redact_secrets, utcnow
 from kintsua.report.markdown import ReportItem, ReportStats, WeeklyReport
 from kintsua.watchers.run import failing_sources
 
@@ -112,9 +117,14 @@ def _item_for(
     )
 
 
-def build_weekly_report(session: Session, since: datetime, until: datetime) -> WeeklyReport:
+def build_weekly_report(
+    session: Session, since: datetime, until: datetime, *, public_only: bool = True
+) -> WeeklyReport:
     """One ``ReportItem`` per change event detected in ``[since, until)`` (unclassified ones
-    as severity ``unknown``), stats from the tables, and the sources failing for 7+ days."""
+    as severity ``unknown``), stats from the tables, and the sources failing for 7+ days.
+
+    ``public_only`` (default) restricts items and failing sources to ``Source.public``
+    sources and drops issue/PR links (they name customer repos)."""
     stats = ReportStats()
 
     # --- sources ----------------------------------------------------------------------
@@ -150,7 +160,11 @@ def build_weekly_report(session: Session, since: datetime, until: datetime) -> W
     items: list[ReportItem] = []
     unclassified = 0
     for row, source, cls in rows:
+        if public_only and (source is None or not source.public):
+            continue
         impact, repo_name = impacts_by_event.get(row.id, (None, None))
+        if public_only:
+            impact, repo_name = None, None  # never link a customer repo's issue / PR
         item = _item_for(row, source, cls, impact, repo_name)
         items.append(item)
         stats.change_events += 1
@@ -250,7 +264,7 @@ def build_weekly_report(session: Session, since: datetime, until: datetime) -> W
             f"{unclassified} change event{'s' if unclassified != 1 else ''} not yet classified "
             "(listed under ⚪ Unknown)."
         )
-    failing = failing_sources(session)
+    failing = failing_sources(session, public_only=public_only)
     if failing:
         notes.append(
             f"{len(failing)} source{'s' if len(failing) != 1 else ''} failing for 7+ days."
@@ -264,5 +278,6 @@ def build_weekly_report(session: Session, since: datetime, until: datetime) -> W
         items=items,
         failing_sources=failing,
         stats=stats,
-        notes=notes,
+        notes=[redact_secrets(n) for n in notes],
+        public=public_only,
     )

@@ -14,8 +14,11 @@ Public pieces:
   ``meta["transport"] == "sse"``) or a stdio command line (``npx -y pkg ...``,
   ``uvx pkg``, ``python -m x``). Honours ``meta["headers"]``, ``meta["auth_env"]``
   (``Authorization: Bearer $VAR``), ``meta["args"]``, ``meta["env"]``, ``meta["cwd"]`` and
-  ``meta["timeout_s"]`` (connect timeout, default 60 s).
-* ``list_tools_all`` / ``list_resources_all`` / ``list_prompts_all`` - paginate.
+  ``meta["timeout_s"]`` (connect timeout, default 60 s). A source the hosted worker marks
+  ``meta["_net_guard"]`` (not operator-seeded) must be an http(s) URL to a public address:
+  ``kintsua.core.netguard`` checks it before connecting and on every request/redirect.
+* ``list_tools_all`` / ``list_resources_all`` / ``list_prompts_all`` - paginate (at most
+  ``MAX_LIST_PAGES`` pages / ``MAX_LIST_ITEMS`` items, else ``MCPConnectError``).
 * ``to_wire(model)`` - JSON-compatible dict in wire (camelCase) form.
 * ``MCPServer`` - the server class for tests/fixtures (``.tool()``, ``.run(transport=...)``).
 * ``MCPConnectError`` - one exception type with a readable message for every transport
@@ -41,11 +44,15 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from kintsua.core.netguard import async_request_hook, check_url
+
 log = logging.getLogger(__name__)
 
 DEFAULT_CONNECT_TIMEOUT_S = 60.0
 DEFAULT_READ_TIMEOUT_S = 300.0
 DEFAULT_USER_AGENT = "kintsua-watcher/0.1 (+https://github.com/hr7657316/Kintusa-Ai)"
+MAX_LIST_PAGES = 200
+MAX_LIST_ITEMS = 10_000
 
 # --- transport imports: 2.x first, then 1.x names ---------------------------------------
 try:  # mcp >= 2
@@ -104,6 +111,7 @@ __all__ = [
     "to_wire",
     "flatten_exception",
     "describe_exception",
+    "error_code",
     "init_result_of",
 ]
 
@@ -273,6 +281,14 @@ def describe_exception(exc: BaseException) -> str:
     return "; ".join(seen)[:2000]
 
 
+def error_code(exc: BaseException) -> int | None:
+    """The JSON-RPC error code of an ``MCPError`` (2.x ``.code``, 1.x ``.error.code``)."""
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(getattr(exc, "error", None), "code", None)
+    return int(code) if isinstance(code, int) else None
+
+
 def _http_status_of(exc: BaseException) -> int | None:
     resp = getattr(exc, "response", None)
     code = getattr(resp, "status_code", None)
@@ -289,6 +305,29 @@ def init_result_of(session: ClientSession) -> Any:
 # --------------------------------------------------------------------------------------
 
 
+def _guard_kwargs(meta: dict[str, Any]) -> dict[str, Any]:
+    """Guarded sources: check every request (including each redirect hop) with
+    ``kintsua.core.netguard``."""
+    if meta.get("_net_guard"):
+        return {"event_hooks": {"request": [async_request_hook]}}
+    return {}
+
+
+def _guarded_client_factory(
+    headers: dict[str, str] | None = None, timeout: Any = None, auth: Any = None
+) -> Any:
+    """``httpx_client_factory`` for the SSE transport of a guarded source."""
+    kw: dict[str, Any] = {"event_hooks": {"request": [async_request_hook]}}
+    if timeout is None:
+        timeout = _httpx_for_mcp.Timeout(DEFAULT_CONNECT_TIMEOUT_S, read=DEFAULT_READ_TIMEOUT_S)
+    kw["timeout"] = timeout
+    if headers is not None:
+        kw["headers"] = headers
+    if auth is not None:
+        kw["auth"] = auth
+    return _httpx_for_mcp.AsyncClient(**kw)
+
+
 @asynccontextmanager
 async def _http_streams(locator: str, meta: dict[str, Any]) -> AsyncIterator[tuple[Any, Any]]:
     headers = build_http_headers(meta, locator=locator)
@@ -298,14 +337,23 @@ async def _http_streams(locator: str, meta: dict[str, Any]) -> AsyncIterator[tup
     if transport == "sse":
         if _sse_client is None:  # pragma: no cover
             raise MCPConnectError("SSE transport is not available in this mcp version")
+        sse_kw: dict[str, Any] = {}
+        if meta.get("_net_guard"):
+            sse_kw["httpx_client_factory"] = _guarded_client_factory
         async with _sse_client(
-            locator, headers=headers, timeout=connect_timeout, sse_read_timeout=read_timeout
+            locator,
+            headers=headers,
+            timeout=connect_timeout,
+            sse_read_timeout=read_timeout,
+            **sse_kw,
         ) as streams:
             yield streams[0], streams[1]
         return
     if MCP_MAJOR >= 2:
         timeout = _httpx_for_mcp.Timeout(connect_timeout, read=read_timeout)
-        async with _httpx_for_mcp.AsyncClient(headers=headers, timeout=timeout) as client:
+        async with _httpx_for_mcp.AsyncClient(
+            headers=headers, timeout=timeout, **_guard_kwargs(meta)
+        ) as client:
             async with _streamable_http_client(locator, http_client=client) as streams:
                 yield streams[0], streams[1]
     else:  # pragma: no cover - mcp 1.x
@@ -343,6 +391,9 @@ async def open_session(
     with a flattened, readable message.
     """
     meta = dict(meta or {})
+    if meta.get("_net_guard"):
+        # a guarded (non-operator) source: http(s) to a public address only, never a command
+        check_url(locator)
     timeout = float(connect_timeout_s or meta.get("timeout_s") or DEFAULT_CONNECT_TIMEOUT_S)
     read_timeout = float(meta.get("read_timeout_s") or DEFAULT_READ_TIMEOUT_S)
     opener = _http_streams if is_http_locator(locator) else _stdio_streams
@@ -409,7 +460,9 @@ async def _http_hint(locator: str, meta: dict[str, Any]) -> str:
         },
     }
     try:
-        async with _httpx_for_mcp.AsyncClient(headers=headers, timeout=10.0) as client:
+        async with _httpx_for_mcp.AsyncClient(
+            headers=headers, timeout=10.0, **_guard_kwargs(meta)
+        ) as client:
             r = await client.post(locator, json=payload)
     except Exception:  # noqa: BLE001 - best effort only
         return ""
@@ -436,7 +489,11 @@ async def _paginate(session: ClientSession, method: str, key: str) -> list[dict[
     items: list[dict[str, Any]] = []
     cursor: str | None = None
     seen_cursors: set[str] = set()
-    for _ in range(1000):  # hard stop against servers that loop their cursor
+    for page in range(MAX_LIST_PAGES + 1):
+        if page == MAX_LIST_PAGES:
+            # a server handing out endless fresh cursors: fail rather than store a partial
+            # listing (which would read as removed tools on the next good poll)
+            raise MCPConnectError(f"{method}: more than {MAX_LIST_PAGES} pages; giving up")
         if cursor is None:
             result = await fn()
         elif takes_params and _PaginatedRequestParams is not None:
@@ -445,6 +502,8 @@ async def _paginate(session: ClientSession, method: str, key: str) -> list[dict[
             result = await fn(cursor=cursor)
         wire = to_wire(result) or {}
         items.extend(wire.get(key) or [])
+        if len(items) > MAX_LIST_ITEMS:
+            raise MCPConnectError(f"{method}: more than {MAX_LIST_ITEMS} items; giving up")
         cursor = wire.get("nextCursor")
         if not cursor or cursor in seen_cursors:
             break

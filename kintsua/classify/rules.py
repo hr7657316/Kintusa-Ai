@@ -60,6 +60,7 @@ RULE_ADDED_OPTIONAL = "added_optional"
 RULE_VERSION_BUMP = "version_bump"
 RULE_ADDED_DESCRIPTION = "added_description"
 RULE_METADATA_ONLY = "metadata_only"
+RULE_REQUIRED_ADDED_SHARED = "required_added_shared"  # context only (see _evaluate_op)
 RULE_TEXT_CHANGED = "text_changed"  # context only: never decides a severity
 RULE_TEXT_ONLY = "text_only"  # the placeholder classify_event() returns for the model
 
@@ -84,6 +85,7 @@ RULES: list[tuple[str, Severity | None, Category | None]] = [
     (RULE_VERSION_BUMP, "safe", "behaviour"),
     (RULE_ADDED_DESCRIPTION, "safe", "docs_only"),
     (RULE_METADATA_ONLY, "safe", "docs_only"),
+    (RULE_REQUIRED_ADDED_SHARED, None, None),
     (RULE_TEXT_CHANGED, None, None),
 ]
 RULE_INDEX: dict[str, int] = {name: i for i, (name, _, _) in enumerate(RULES)}
@@ -206,15 +208,15 @@ class PathInfo:
         if self.dialect == "openapi":
             if self.http_path is not None:
                 return (
-                    f"{self.method.upper()} {self.http_path}"
+                    f"{self.method.upper()} {_frag(self.http_path)}"
                     if self.method
-                    else f"path {self.http_path}"
+                    else f"path {_frag(self.http_path)}"
                 )
             if self.kind == "schema" and self.name:
-                return f"schema {self.name}"
+                return f"schema {_frag(self.name)}"
             if self.kind == "security":
                 return (
-                    f"security scheme '{self.name}'"
+                    f"security scheme {_q(self.name)}"
                     if self.name
                     else "the global security requirements"
                 )
@@ -222,10 +224,10 @@ class PathInfo:
         if self.dialect == "mcp":
             if self.name:
                 noun = MCP_COLLECTIONS.get(self.tokens[0], "tool")
-                return f"{noun} {self.name}"
+                return f"{noun} {_frag(self.name)}"
             return "the server"
         if self.dialect == "package":
-            return display_name or "the package"
+            return _frag(display_name) if display_name else "the package"
         return "the source"
 
 
@@ -759,9 +761,35 @@ def _rename_group(o: _Op) -> tuple[Any, ...]:
     return (info.dialect, info.kind, info.side, info.parent_tokens)
 
 
+def _is_empty(v: Any) -> bool:
+    return v is None or (
+        isinstance(v, str | dict | list) and not (v.strip() if isinstance(v, str) else v)
+    )
+
+
+def _property_count(schema: Any) -> int:
+    """Properties of an input schema: a full JSON Schema (``properties`` dict) or the
+    watcher's ``schema_summary`` (``properties`` list of names)."""
+    if not isinstance(schema, dict):
+        return 0
+    props = schema.get("properties")
+    return len(props) if isinstance(props, dict | list) else 0
+
+
 def _distinctive_schema(s: Any) -> bool:
-    if not isinstance(s, dict) or not s:
+    """True when two identical definitions under different names are evidence of a
+    rename. Keys whose value is empty (``None``, ``""``, ``{}``, ``[]``) carry no identity.
+    A tool (a definition with ``inputSchema``, or the MCP watcher's summary with a
+    ``fingerprint``) needs a description, or an input schema with at least two
+    properties: two undocumented no-argument or one-argument tools are not one tool
+    renamed."""
+    if not isinstance(s, dict):
         return False
+    s = {k: v for k, v in s.items() if not _is_empty(v)}
+    if not s:
+        return False
+    if "inputSchema" in s or "fingerprint" in s:
+        return isinstance(s.get("description"), str) or _property_count(s.get("inputSchema")) >= 2
     if any(
         k in s
         for k in (
@@ -977,8 +1005,27 @@ class Hit:
         return RULE_INDEX[self.rule]
 
 
-def _q(name: str) -> str:
-    return f"'{name}'"
+# Vendor-controlled fragments (names, enum values, defaults, sunset dates, versions) go
+# through ``_frag``: one line, no control characters, bounded. The final summary and hint
+# are flattened and capped again in ``classify_by_rules`` (they become issue titles, issue
+# bodies and weekly-report lines). Markdown escaping is the renderer's job, not ours.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+MAX_FRAGMENT_CHARS = 120
+MAX_SUMMARY_CHARS = 500
+MAX_HINT_CHARS = 1000
+MAX_DEFAULT_CHARS = 200
+MAX_VERSION_CHARS = 40
+
+
+def _frag(value: Any, limit: int = MAX_FRAGMENT_CHARS) -> str:
+    """``value`` as one bounded line of plain text."""
+    s = value if isinstance(value, str) else str(value)
+    s = " ".join(_CONTROL_RE.sub(" ", s).split())
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _q(name: Any) -> str:
+    return f"'{_frag(name)}'"
 
 
 def _join_q(names: list[Any], limit: int = 5) -> str:
@@ -1077,9 +1124,9 @@ def _default_hint(v: Any) -> str | None:
         return None
     for k in ("default", "example"):
         if k in s and s[k] is not None:
-            return f"{k} {json.dumps(s[k], default=str)}"
+            return f"{k} {_frag(json.dumps(s[k], default=str), MAX_DEFAULT_CHARS)}"
     if isinstance(s.get("examples"), list) and s["examples"]:
-        return f"example {json.dumps(s['examples'][0], default=str)}"
+        return f"example {_frag(json.dumps(s['examples'][0], default=str), MAX_DEFAULT_CHARS)}"
     if isinstance(s.get("enum"), list) and s["enum"]:
         return "one of " + _join_q(s["enum"], 4)
     return None
@@ -1100,7 +1147,22 @@ def _hit(rule: str, summary: str, o: _Op, affected: list[str], hint: str | None 
     )
 
 
-def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
+def _inlined_required(ops: list[_Op]) -> frozenset[str]:
+    """Names made required by ``required_added`` ops at operation level (under ``/paths`` or
+    ``/webhooks``): what the watcher reports where a component schema is inlined."""
+    return frozenset(
+        name
+        for o in ops
+        if o.op.op == "required_added" and o.info.dialect == "openapi" and o.info.http_path
+        for name in _required_names(o)
+    )
+
+
+def _evaluate_op(
+    o: _Op, display_name: str | None, inlined_required: frozenset[str] = frozenset()
+) -> list[Hit]:
+    """The hits one (normalised) op produces. ``inlined_required`` is
+    ``_inlined_required`` of the whole event."""
     op, info = o.op, o.info
     where = info.operation(display_name)
     label = info.label(display_name)
@@ -1114,10 +1176,10 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             return [
                 _hit(
                     RULE_REMOVED_OPERATION,
-                    f"Path {info.http_path} was removed{tail}",
+                    f"Path {_frag(info.http_path)} was removed{tail}",
                     o,
                     affected,
-                    f"Remove or replace calls to {info.http_path}",
+                    f"Remove or replace calls to {_frag(info.http_path)}",
                 )
             ]
         if info.kind == "operation":
@@ -1134,30 +1196,30 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             return [
                 _hit(
                     RULE_REMOVED_TOOL,
-                    f"Tool {info.name} was removed",
+                    f"Tool {_frag(info.name)} was removed",
                     o,
                     [where],
-                    f"Stop calling tool {info.name} or switch to a replacement tool",
+                    f"Stop calling tool {_frag(info.name)} or switch to a replacement tool",
                 )
             ]
         if info.kind == "resource":
             return [
                 _hit(
                     RULE_REMOVED_RESOURCE,
-                    f"Resource {info.name} was removed",
+                    f"Resource {_frag(info.name)} was removed",
                     o,
                     [where],
-                    f"Stop reading resource {info.name}",
+                    f"Stop reading resource {_frag(info.name)}",
                 )
             ]
         if info.kind == "prompt":
             return [
                 _hit(
                     RULE_REMOVED_PROMPT,
-                    f"Prompt {info.name} was removed",
+                    f"Prompt {_frag(info.name)} was removed",
                     o,
                     [where],
-                    f"Stop using prompt {info.name}",
+                    f"Stop using prompt {_frag(info.name)}",
                 )
             ]
         name = _field_name(o)
@@ -1215,7 +1277,7 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             return [
                 _hit(
                     RULE_METADATA_ONLY,
-                    f"Spec metadata changed ({'/'.join(info.tokens[:2])})",
+                    f"Spec metadata changed ({_frag('/'.join(info.tokens[:2]))})",
                     o,
                     [],
                 )
@@ -1226,10 +1288,26 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
 
     if kind == "required_added":
         names = _required_names(o)
-        if info.side in ("request", "shared") or info.kind in (
-            "input_schema",
-            "arguments",
-            "parameter",
+        if info.side == "shared" and info.kind == "schema" and set(names) <= inlined_required:
+            # a component schema (components/schemas) is no side by itself: the watcher
+            # also reports the change under every operation that inlines it, where it is
+            # a request input (breaking) or a response field now always present (safe),
+            # and those ops decide. A component used too deep to be inlined has no such
+            # op and stays breaking below.
+            return [
+                _hit(
+                    RULE_REQUIRED_ADDED_SHARED,
+                    f"{label}: {_join_q(names)} now required",
+                    o,
+                    [where],
+                )
+            ]
+        response_like = info.side == "response" or (
+            info.side == "shared" and info.kind == "response"
+        )
+        if not response_like and (
+            info.side in ("request", "shared")
+            or info.kind in ("input_schema", "arguments", "parameter")
         ):
             noun = _noun(info)
             if len(names) == 1:
@@ -1239,7 +1317,7 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             dflt = _default_hint(op.after)
             hint = f"Pass {_join_q(names)} in calls to {label}" + (f" ({dflt})" if dflt else "")
             return [_hit(RULE_REQUIRED_ADDED, summary, o, [where], hint)]
-        if info.side == "response":
+        if response_like:
             return [
                 _hit(
                     RULE_REQUIRED_ADDED_RESPONSE,
@@ -1279,7 +1357,7 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
     if kind == "type_changed":
         if info.side is not None or info.kind in ("tool", "input_schema", "output_schema"):
             name = _field_name(o)
-            bt, at = _describe_type(op.before), _describe_type(op.after)
+            bt, at = _frag(_describe_type(op.before)), _frag(_describe_type(op.after))
             noun = _noun(info).capitalize()
             if info.kind in ("input_schema", "output_schema") and info.field is None:
                 summary = f"{label}: the {'input' if info.side == 'request' else 'output'} schema changed shape"
@@ -1298,7 +1376,7 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             return [
                 _hit(
                     RULE_METADATA_ONLY,
-                    f"Spec metadata changed ({'/'.join(info.tokens[:2])})",
+                    f"Spec metadata changed ({_frag('/'.join(info.tokens[:2]))})",
                     o,
                     [],
                 )
@@ -1306,8 +1384,8 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
         return []
 
     if kind == "renamed":
-        old = _name_of(op.before, _rename_name(o) or _field_name(o)) or "?"
-        new = _name_of(op.after, None) or "?"
+        old = _frag(_name_of(op.before, _rename_name(o) or _field_name(o)) or "?")
+        new = _frag(_name_of(op.after, None) or "?")
         if info.kind in ("tool", "resource", "prompt"):
             noun = MCP_COLLECTIONS.get(info.tokens[0], "tool").capitalize()
             return [
@@ -1377,6 +1455,12 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
         return hits
 
     if kind == "auth_changed":
+        added = _auth_option_added(info, op, label)
+        if added is not None:
+            # an extra way to authenticate: existing credentials keep working, so no
+            # '*' fan-out to every consumer of the source
+            affected = [where] if info.http_path is not None else []
+            return [_hit(RULE_ADDED_OPTIONAL, added, o, affected)]
         if info.http_path is not None:
             summary = f"{label}: authentication requirements changed"
         elif info.name:
@@ -1395,18 +1479,10 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
 
     if kind == "deprecated":
         if info.dialect == "package":
-            frm = _name_of(op.before) or ""
-            to = _name_of(op.after) or ""
-            pkg = display_name or "package"
-            return [
-                _hit(
-                    RULE_DEPRECATED,
-                    _bump_summary(pkg, frm, to, major=True),
-                    o,
-                    [where],
-                    _bump_hint(pkg, frm, to),
-                )
-            ]
+            # the package watcher flags a changed major at /latest with bare majors
+            # ('11' -> '12'), whatever the direction; the event-level rules decide from the
+            # full versions (major_bump, or version_bump for a rollback or yank)
+            return []
         sunset = _sunset_of(op.after)
         tail = f" (sunset {sunset})" if sunset else ""
         target = label if info.field is None else f"{_noun(info)} {_q(_field_name(o))} of {label}"
@@ -1424,12 +1500,14 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
         if info.kind == "path_item":
             methods = _methods_of(op.after)
             affected = [f"{m} {info.http_path}" for m in methods] or [where]
-            return [_hit(RULE_ADDED_OPTIONAL, f"Path {info.http_path} was added", o, affected)]
+            return [
+                _hit(RULE_ADDED_OPTIONAL, f"Path {_frag(info.http_path)} was added", o, affected)
+            ]
         if info.kind == "operation":
             return [_hit(RULE_ADDED_OPTIONAL, f"{label} was added", o, [where])]
         if info.kind in ("tool", "resource", "prompt"):
             noun = MCP_COLLECTIONS.get(info.tokens[0], "tool").capitalize()
-            return [_hit(RULE_ADDED_OPTIONAL, f"{noun} {info.name} was added", o, [where])]
+            return [_hit(RULE_ADDED_OPTIONAL, f"{noun} {_frag(info.name)} was added", o, [where])]
         if info.kind == "doc":
             return [_hit(RULE_ADDED_DESCRIPTION, f"{label}: {info.leaf} was added", o, [where])]
         if info.side in ("request", "shared"):
@@ -1474,7 +1552,7 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             return [
                 _hit(
                     RULE_METADATA_ONLY,
-                    f"Spec metadata changed ({'/'.join(info.tokens[:2])})",
+                    f"Spec metadata changed ({_frag('/'.join(info.tokens[:2]))})",
                     o,
                     [],
                 )
@@ -1488,7 +1566,7 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
             return [
                 _hit(
                     RULE_METADATA_ONLY,
-                    f"Spec metadata changed ({'/'.join(info.tokens[:2])})",
+                    f"Spec metadata changed ({_frag('/'.join(info.tokens[:2]))})",
                     o,
                     [],
                 )
@@ -1499,6 +1577,49 @@ def _evaluate_op(o: _Op, display_name: str | None) -> list[Hit]:
         return [_hit(RULE_TEXT_CHANGED, f"{label}: {what} changed", o, [where])]
 
     return []
+
+
+def _auth_option_added(info: PathInfo, op: ChangeOp, label: str) -> str | None:
+    """A summary when an auth op only adds an option existing consumers need not use: a
+    new security scheme, or a new alternative security requirement while every existing
+    one stays (requirements are OR'd). ``None`` for everything else: a removed or modified
+    scheme, a removed alternative, changed scopes, security newly required where there
+    was none (an empty or inherited list before)."""
+    toks = info.tokens
+    if (
+        info.http_path is None
+        and len(toks) == 3
+        and toks[:2] == ("components", "securitySchemes")
+        and op.before is None
+        and isinstance(op.after, dict)
+    ):
+        return f"Security scheme {_q(toks[2])} was added"
+    alternative = (
+        f"{label}: an alternative security requirement was added"
+        if info.http_path is not None
+        else "An alternative global security requirement was added"
+    )
+    if toks and toks[-1] == "security":
+        b, a = op.before, op.after
+        if (
+            isinstance(b, list)
+            and isinstance(a, list)
+            and b
+            and len(a) > len(b)
+            and all(req in a for req in b)
+        ):
+            return alternative
+        return None
+    if (
+        len(toks) >= 2
+        and toks[-2] == "security"
+        and _is_int(toks[-1])
+        and int(toks[-1]) >= 1  # index 0 added means the list was empty: auth newly required
+        and op.before is None
+        and isinstance(op.after, dict)
+    ):
+        return alternative
+    return None
 
 
 def _enum_delta(op: ChangeOp) -> tuple[list[Any], list[Any]]:
@@ -1520,8 +1641,8 @@ def _enum_delta(op: ChangeOp) -> tuple[list[Any], list[Any]]:
 def _sunset_of(v: Any) -> str | None:
     if isinstance(v, dict):
         for k in ("x-sunset", "sunset", "x-sunset-date", "removal_date", "x-removal-date"):
-            if isinstance(v.get(k), str):
-                return v[k]
+            if isinstance(v.get(k), str) and v[k].strip():
+                return _frag(v[k], MAX_VERSION_CHARS)
     return None
 
 
@@ -1554,25 +1675,32 @@ def is_major_bump(from_version: str | None, to_version: str | None) -> bool:
 def _major_label(v: str | None) -> str:
     t = _version_tuple(v)
     if t is None:
-        return v or "?"
+        return _frag(v, MAX_VERSION_CHARS) if v else "?"
     if t[0] == 0:
         return f"0.{t[1]}.x"
     return f"{t[0]}.x"
 
 
 def _bump_summary(pkg: str, frm: str, to: str, *, major: bool) -> str:
+    pkg, frm, to = _frag(pkg), _frag(frm, MAX_VERSION_CHARS), _frag(to, MAX_VERSION_CHARS)
     if major:
         return f"{pkg} {_major_label(frm)} -> {to or '?'}: major version bump"
+    a, b = _version_tuple(frm), _version_tuple(to)
+    if a is not None and b is not None and b < a:
+        return f"{pkg} {frm} -> {to}: latest version moved back (yanked or rolled back)"
     return f"{pkg} {frm or '?'} -> {to or '?'}: new release"
 
 
 def _bump_hint(pkg: str, frm: str, to: str) -> str:
+    pkg, frm, to = _frag(pkg), _frag(frm, MAX_VERSION_CHARS), _frag(to, MAX_VERSION_CHARS)
     return f"Upgrade {pkg} from {frm or 'the previous major'} to {to or 'the new major'} and follow the migration notes for the {_major_label(to)} series"
 
 
 def _package_versions(event: ChangeEvent) -> tuple[str | None, str | None]:
+    """The event's versions, else the full versions from the ops at ``/latest``; the
+    watcher's ``deprecated`` op there carries bare majors, so it is the last resort."""
     frm, to = event.from_version, event.to_version
-    for op in event.ops:
+    for op in sorted(event.ops, key=lambda o: o.op == "deprecated"):
         toks = split_pointer(op.path)
         if not toks:
             continue
@@ -1633,9 +1761,10 @@ def classify_by_rules(
 ) -> Classification | None:
     """Apply the rules. ``None`` means no rule decided a severity (route to the model)."""
     ops = _post_normalise(detect_renames(normalise_ops(event.ops)))
+    inlined = _inlined_required(ops)
     hits: list[Hit] = []
     for o in ops:
-        hits.extend(_evaluate_op(o, display_name))
+        hits.extend(_evaluate_op(o, display_name, inlined))
     hits.extend(_evaluate_event(event, display_name, ops))
     deciding = [h for h in hits if h.severity is not None]
     if not deciding:
@@ -1654,11 +1783,13 @@ def classify_by_rules(
         summary += f" (+{extra} more change{'s' if extra != 1 else ''})"
     if (
         display_name
-        and not summary.startswith(display_name)
-        and not summary.startswith(f"[{display_name}]")
+        and not summary.startswith(_frag(display_name))
+        and not summary.startswith(f"[{_frag(display_name)}]")
     ):
-        summary = f"[{display_name}] {summary}"
+        summary = f"[{_frag(display_name)}] {summary}"
+    summary = _frag(summary, MAX_SUMMARY_CHARS)
     hint = dominant.hint or next((h.hint for _, h in ordered if h.hint), None)
+    hint = _frag(hint, MAX_HINT_CHARS) if hint else None
     rule_hits = _dedup([h.rule for _, h in ordered] + [h.rule for h in hits if h.severity is None])
     affected = _dedup([p for h in hits for p in h.affected])
     return Classification(
@@ -1694,7 +1825,7 @@ def classify_event(event: ChangeEvent, display_name: str | None = None) -> Class
     else:
         summary = "No classifiable changes; needs review"
     if display_name:
-        summary = f"[{display_name}] {summary}"
+        summary = f"[{_frag(display_name)}] {summary}"
     affected = _dedup([info.operation(display_name) for info in infos])
     return Classification(
         severity="unknown",
