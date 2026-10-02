@@ -1,0 +1,14 @@
+[tool.poetry]
+name = "billing-agent"
+version = "0.1.0"
+description = "Billing agent"
+authors = ["Acme"]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+openai-agents = "^0.2"
+stripe = ">=11,<13"
+httpx = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8"

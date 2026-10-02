@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: dev
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:dev@localhost:5432/postgres
+      DATABASE_URL: postgresql+psycopg://postgres:dev@localhost:5432/kintsua
+      LLM_PROVIDER: fake
+      SANDBOX_BACKEND: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.8.17"
+          enable-cache: true
+      - name: Install
+        run: uv sync --frozen --all-extras
+      - name: Lint
+        run: |
+          uv run ruff check kintsua tests alembic/env.py
+          uv run ruff format --check kintsua tests alembic/env.py
+      - name: Migrations apply cleanly
+        run: |
+          uv run python -c "import psycopg; psycopg.connect('postgresql://postgres:dev@localhost:5432/postgres', autocommit=True).execute('CREATE DATABASE kintsua')"
+          uv run alembic upgrade head
+          uv run alembic check
+      - name: Tests
+        run: uv run pytest -q -m "not network" --timeout 600 --durations=15
+
+  watch-self-test:
+    # The open-source CLI gating a deploy: snapshot a local MCP server and diff it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.8.17"
+      - run: uv sync --frozen
+      - name: kintsua watch snapshot + diff against the fixture MCP server
+        run: |
+          uv run kintsua watch snapshot --server "uv run python tests/fixtures/watchers/mcp_server.py" --name fixture
+          uv run kintsua watch diff --server "uv run python tests/fixtures/watchers/mcp_server.py" --name fixture --github-action
+      - name: a breaking schema change must fail the gate (exit 1)
+        run: |
+          set +e
+          uv run kintsua watch diff --server "uv run python tests/fixtures/watchers/mcp_server.py" --name fixture --env KINTSUA_MCP_VARIANT=v2 --github-action
+          code=$?
+          set -e
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          uv run kintsua watch report --since 1d

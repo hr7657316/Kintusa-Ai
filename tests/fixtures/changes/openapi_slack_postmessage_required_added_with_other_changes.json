@@ -1,0 +1,51 @@
+{
+  "name": "openapi_slack_postmessage_required_added_with_other_changes",
+  "display_name": null,
+  "event": {
+    "source_id": "22222222-2222-4222-8222-222222222222",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "required_added",
+        "path": "/paths/~1chat.postMessage/post/requestBody/content/application~1x-www-form-urlencoded/schema/required",
+        "before": [
+          "channel"
+        ],
+        "after": [
+          "channel",
+          "text"
+        ]
+      },
+      {
+        "op": "text_changed",
+        "path": "/paths/~1chat.postMessage/post/requestBody/content/application~1x-www-form-urlencoded/schema/properties/text/description",
+        "before": "How this field works and whether it is required depends on other fields you use in your API call.",
+        "after": "The formatted text of the message to be published. Required."
+      },
+      {
+        "op": "added",
+        "path": "/paths/~1chat.postMessage/post/requestBody/content/application~1x-www-form-urlencoded/schema/properties/metadata",
+        "before": null,
+        "after": {
+          "type": "string"
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "required_param"
+  },
+  "rule_hits_expected": [
+    "required_added",
+    "added_optional",
+    "text_changed"
+  ],
+  "affected_paths_expected": [
+    "POST /chat.postMessage"
+  ]
+}

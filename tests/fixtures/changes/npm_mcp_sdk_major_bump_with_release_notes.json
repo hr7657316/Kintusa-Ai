@@ -1,0 +1,45 @@
+{
+  "name": "npm_mcp_sdk_major_bump_with_release_notes",
+  "display_name": "@modelcontextprotocol/sdk",
+  "event": {
+    "source_id": "55555555-5555-4555-8555-555555555555",
+    "source_kind": "npm",
+    "from_version": "1.17.5",
+    "to_version": "2.0.0",
+    "ops": [
+      {
+        "op": "text_changed",
+        "path": "/latest",
+        "before": "1.17.5",
+        "after": "2.0.0"
+      },
+      {
+        "op": "deprecated",
+        "path": "/latest",
+        "before": "1",
+        "after": "2"
+      },
+      {
+        "op": "added",
+        "path": "/versions/2.0.0",
+        "before": null,
+        "after": "2.0.0"
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": "## 2.0.0\n\n### Breaking changes\n- `Client.connect()` now requires a `Transport` instance; the string URL overload was removed.\n- `McpServer.tool()` registration callbacks receive `(args, extra)` instead of `(args, ctx)`.\n- Dropped Node 18 support.\n\n### Features\n- Streamable HTTP transport is the default.\n"
+  },
+  "expected": {
+    "severity": "degraded",
+    "category": "deprecation"
+  },
+  "rule_hits_expected": [
+    "major_bump"
+  ],
+  "affected_paths_expected": [
+    "package:@modelcontextprotocol/sdk"
+  ],
+  "migration_hint_contains": "2.0.0",
+  "summary_contains": "@modelcontextprotocol/sdk 1.x -> 2.0.0: major version bump",
+  "note": "ops in NpmWatcher.diff's shape (the deprecated op carries bare majors); the event-level major_bump rule decides from the full versions. Rules give degraded/deprecation; the server also runs the model on the release notes and may escalate"
+}

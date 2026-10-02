@@ -1,0 +1,64 @@
+{
+  "server": {
+    "name": "weather-server",
+    "version": "1.4.0",
+    "protocolVersion": "2025-06-18",
+    "capabilities": {"tools": {"listChanged": false}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {"listChanged": false}}
+  },
+  "tools": {
+    "get_weather": {
+      "description": "Get the current weather for a city",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"},
+          "units": {"type": "string", "enum": ["metric", "imperial"], "default": "metric"},
+          "days": {"type": "integer", "minimum": 1, "maximum": 7}
+        },
+        "required": ["city"]
+      },
+      "annotations": {"readOnlyHint": true}
+    },
+    "search": {
+      "description": "Search the knowledge base",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"},
+          "limit": {"type": "integer"},
+          "filters": {
+            "type": "object",
+            "properties": {
+              "lang": {"type": "string"},
+              "region": {"type": "string"}
+            }
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    "send_email": {
+      "description": "Send an email",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"to": {"type": "string"}, "body": {"type": "string"}},
+        "required": ["to", "body"]
+      }
+    },
+    "stable_tool": {
+      "description": "Never changes",
+      "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}
+    }
+  },
+  "resources": {
+    "weather://cities": {"name": "cities", "description": "Known cities", "mimeType": "application/json"},
+    "weather://legacy": {"name": "legacy", "mimeType": "text/plain"}
+  },
+  "resourceTemplates": {},
+  "prompts": {
+    "forecast": {
+      "description": "Write a forecast",
+      "arguments": [{"name": "city", "required": true}, {"name": "tone", "required": false}]
+    }
+  }
+}

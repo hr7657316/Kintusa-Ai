@@ -1,0 +1,45 @@
+{
+  "name": "openapi_github_issues_assignee_renamed_levenshtein_pair",
+  "display_name": null,
+  "event": {
+    "source_id": "33333333-3333-4333-8333-333333333333",
+    "source_kind": "openapi",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "removed",
+        "path": "/paths/~1repos~1{owner}~1{repo}~1issues/post/requestBody/content/application~1json/schema/properties/assignee",
+        "before": {
+          "type": "string",
+          "nullable": true
+        },
+        "after": null
+      },
+      {
+        "op": "added",
+        "path": "/paths/~1repos~1{owner}~1{repo}~1issues/post/requestBody/content/application~1json/schema/properties/assignees",
+        "before": null,
+        "after": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "breaking",
+    "category": "rename"
+  },
+  "rule_hits_expected": [
+    "renamed"
+  ],
+  "affected_paths_expected": [
+    "POST /repos/{owner}/{repo}/issues"
+  ],
+  "migration_hint_contains": "Rename assignee to assignees"
+}

@@ -1,0 +1,33 @@
+{
+  "name": "mcp_weather_tool_deprecated",
+  "display_name": null,
+  "event": {
+    "source_id": "44444444-4444-4444-8444-444444444444",
+    "source_kind": "mcp",
+    "from_version": null,
+    "to_version": null,
+    "ops": [
+      {
+        "op": "deprecated",
+        "path": "/tools/get_weather",
+        "before": null,
+        "after": {
+          "deprecated": true,
+          "description": "Deprecated: use get_current_conditions."
+        }
+      }
+    ],
+    "raw_diff_ref": "inline",
+    "text": null
+  },
+  "expected": {
+    "severity": "degraded",
+    "category": "deprecation"
+  },
+  "rule_hits_expected": [
+    "deprecated"
+  ],
+  "affected_paths_expected": [
+    "tool:get_weather"
+  ]
+}

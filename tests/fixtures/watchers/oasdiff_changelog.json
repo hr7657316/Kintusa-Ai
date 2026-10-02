@@ -1,0 +1,65 @@
+[
+  {
+    "id": "api-removed-without-deprecation",
+    "text": "api removed without deprecation",
+    "level": 3,
+    "operation": "GET",
+    "operationId": "legacyExport",
+    "path": "/v1/legacy/export",
+    "source": "openapi3_before.json",
+    "section": "paths"
+  },
+  {
+    "id": "new-required-request-parameter",
+    "text": "added the new required 'query' request parameter 'tenant'",
+    "level": 3,
+    "operation": "GET",
+    "operationId": "listPets",
+    "path": "/v1/pets",
+    "source": "openapi3_after.json",
+    "section": "paths",
+    "args": ["query", "tenant"]
+  },
+  {
+    "id": "request-parameter-enum-value-removed",
+    "text": "removed the enum value 'sold' from the 'query' request parameter 'status'",
+    "level": 3,
+    "operation": "GET",
+    "path": "/v1/pets",
+    "args": ["sold", "query", "status"]
+  },
+  {
+    "id": "endpoint-deprecated",
+    "text": "endpoint deprecated",
+    "level": 1,
+    "operation": "DELETE",
+    "path": "/v1/pets/{id}"
+  },
+  {
+    "id": "api-global-security-removed",
+    "text": "the global security scheme 'apiKey' was removed from the API",
+    "level": 1,
+    "section": "security"
+  },
+  {
+    "id": "api-path-added",
+    "text": "endpoint added",
+    "level": 1,
+    "operation": "POST",
+    "path": "/v1/pets/{id}/photos"
+  },
+  {
+    "id": "response-property-type-changed",
+    "text": "the response property 'weight_kg' type/format changed from 'number'/'' to 'string'/''",
+    "level": 3,
+    "operation": "GET",
+    "path": "/v1/pets/{id}"
+  },
+  {
+    "id": "some-future-id-nobody-mapped",
+    "text": "unknown change kind",
+    "level": 2,
+    "operation": "GET",
+    "path": "/v1/pets"
+  }
+]

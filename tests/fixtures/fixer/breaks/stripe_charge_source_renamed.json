@@ -1,0 +1,51 @@
+{
+  "name": "stripe_charge_source_renamed",
+  "description": "Stripe renamed the `source` request parameter of POST /v1/charges to `payment_method`. The agent renames the keyword argument at the one call site.",
+  "source": {
+    "kind": "openapi",
+    "locator": "https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json",
+    "display_name": "Stripe API",
+    "vendor": "stripe"
+  },
+  "event": {
+    "source_kind": "openapi",
+    "from_version": "2024-06-20",
+    "to_version": "2024-09-30",
+    "ops": [
+      {
+        "op": "renamed",
+        "path": "/paths/~1v1~1charges/post/requestBody/content/application~1x-www-form-urlencoded/schema/properties/source",
+        "before": "source",
+        "after": "payment_method"
+      }
+    ],
+    "text": null
+  },
+  "classification": {
+    "severity": "breaking",
+    "category": "rename",
+    "summary": "POST /v1/charges: request parameter `source` was renamed to `payment_method`",
+    "affected_paths": ["POST /v1/charges"],
+    "migration_hint": "Rename the `source` argument of Charge.create to `payment_method`; the value is unchanged.",
+    "rule_hits": ["renamed"]
+  },
+  "dependency": {"kind": "pypi", "name": "stripe", "meta": {"vendor": "stripe", "language": "python"}},
+  "call_sites": [
+    {
+      "file_path": "agent/billing.py",
+      "line": 12,
+      "symbol": "stripe.Charge.create",
+      "operation": "POST /v1/charges",
+      "args_shape": {"keys": ["amount", "currency", "source", "description"]}
+    }
+  ],
+  "patch": [
+    {
+      "path": "agent/billing.py",
+      "old": "        source=source,\n",
+      "new": "        payment_method=source,\n"
+    }
+  ],
+  "agent_reason": "Renamed the `source` keyword argument of stripe.Charge.create to `payment_method`; the value passed is unchanged.",
+  "expected_verdict": {"ok": true, "reason_contains": null}
+}

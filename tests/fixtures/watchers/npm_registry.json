@@ -1,0 +1,16 @@
+{
+  "_id": "@acme/sdk",
+  "name": "@acme/sdk",
+  "description": "Acme SDK for Node",
+  "dist-tags": {"latest": "2.0.0", "next": "3.0.0-beta.1"},
+  "versions": {
+    "1.0.0": {"name": "@acme/sdk", "version": "1.0.0", "engines": {"node": ">=16"}, "repository": {"type": "git", "url": "git+https://github.com/acme/acme-node.git"}},
+    "1.1.0": {"name": "@acme/sdk", "version": "1.1.0", "engines": {"node": ">=16"}, "repository": {"type": "git", "url": "git+https://github.com/acme/acme-node.git"}},
+    "2.0.0": {"name": "@acme/sdk", "version": "2.0.0", "engines": {"node": ">=18"}, "deprecated": "use @acme/sdk-v2 instead", "repository": {"type": "git", "url": "git+https://github.com/acme/acme-node.git"}},
+    "3.0.0-beta.1": {"name": "@acme/sdk", "version": "3.0.0-beta.1", "engines": {"node": ">=20"}}
+  },
+  "time": {"created": "2024-01-01T00:00:00.000Z", "modified": "2026-09-29T00:00:00.000Z", "1.0.0": "2024-01-01T00:00:00.000Z", "1.1.0": "2025-01-01T00:00:00.000Z", "2.0.0": "2026-09-01T00:00:00.000Z"},
+  "repository": {"type": "git", "url": "git+https://github.com/acme/acme-node.git"},
+  "homepage": "https://acme.example.com",
+  "license": "MIT"
+}
