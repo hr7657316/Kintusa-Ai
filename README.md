@@ -22,27 +22,177 @@ Pricing: Free for public repos and up to 5 watched integrations · Pro $29 per w
 
 ## Contents
 
-1. [Quick start (the CLI, no account)](#1-quick-start-the-cli-no-account)
-2. [The GitHub App](#2-the-github-app)
-3. [Runtime SDK](#3-runtime-sdk)
-4. [`.kintsua.yml`](#4-kintsuayml)
-5. [Trust and data boundaries](#5-trust-and-data-boundaries)
-6. [What the fixer refuses](#6-what-the-fixer-refuses)
-7. [Known gaps](#7-known-gaps)
-8. [Architecture](#8-architecture)
-9. [Running it yourself](#9-running-it-yourself)
-10. [HTTP API](#10-http-api)
-11. [Testing](#11-testing)
-12. [Layout](#12-layout)
+1. [Step-by-step guide](#1-step-by-step-guide)
+2. [Quick start (the CLI, no account)](#2-quick-start-the-cli-no-account)
+3. [The GitHub App](#3-the-github-app)
+4. [Runtime SDK](#4-runtime-sdk)
+5. [`.kintsua.yml`](#5-kintsuayml)
+6. [Trust and data boundaries](#6-trust-and-data-boundaries)
+7. [What the fixer refuses](#7-what-the-fixer-refuses)
+8. [Known gaps](#8-known-gaps)
+9. [Architecture](#9-architecture)
+10. [Running it yourself](#10-running-it-yourself)
+11. [HTTP API](#11-http-api)
+12. [Testing](#12-testing)
+13. [Layout](#13-layout)
 
 ---
 
-## 1. Quick start (the CLI, no account)
+## 1. Step-by-step guide
+
+Pick the path that matches what you want to do. Each one is a numbered checklist you can follow top to bottom; the sections after this one are the reference.
+
+| Path | You want to | Time | You need |
+|---|---|---|---|
+| [A. Watch from CI](#path-a-watch-an-mcp-server-or-api-from-ci) | fail a build when an MCP server or API you call changes | 10 minutes | Python 3.12 |
+| [B. Run Kintsua](#path-b-run-kintsua-yourself) | operate the service: watcher, GitHub App, issues, fix PRs | about an hour | Postgres, a GitHub account, an Anthropic or OpenAI key, Docker for fix PRs |
+| [C. Use it on your repo](#path-c-use-kintsua-on-your-repo) | get issues and fix PRs on your agent repo from a running Kintsua | 5 minutes | a running Kintsua (path B) |
+
+> **Before you start.** The package is not on PyPI yet, so every install below comes straight from GitHub. There is no public hosted instance yet either: paths B and C use the instance you run yourself, and `KINTSUA_URL` points at it.
+
+### Path A: watch an MCP server or API from CI
+
+1. **Install the CLI** (base dependencies only, no server pieces):
+   ```bash
+   pip install "kintsua @ git+https://github.com/hr7657316/Kintusa-Ai"
+   kintsua --version
+   ```
+2. **Take a snapshot** of the server or spec your agent calls. This writes `.kintsua/<name>.lock.json` with every tool, its input schema and a fingerprint.
+   ```bash
+   kintsua watch snapshot --server https://mcp.vendor.com/mcp --name vendor
+   # stdio server:      --server "npx -y @vendor/mcp-server"
+   # needs a token:     --auth-env VENDOR_TOKEN        (sent as Authorization: Bearer)
+   # an OpenAPI spec:   --spec https://api.vendor.com/openapi.json
+   ```
+3. **Commit the lockfile.** From now on a schema change shows up as a diff in a pull request.
+   ```bash
+   git add .kintsua && git commit -m "kintsua: snapshot vendor MCP tools"
+   ```
+4. **Check for changes** locally whenever you like. Exit code `1` means a breaking change, `0` means none.
+   ```bash
+   kintsua watch diff --server https://mcp.vendor.com/mcp --name vendor
+   ```
+5. **Gate your CI.** Add a step that runs the same diff on every push. It prints annotations on the run and fails the job on a breaking change.
+   ```yaml
+   # .github/workflows/kintsua.yml
+   name: kintsua
+   on: [push, pull_request]
+   jobs:
+     watch:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+         # use @main once the code is merged to a main branch; today the only branch is:
+         - uses: hr7657316/Kintusa-Ai@claude/zen-meitner-9zwba3
+           with:
+             server: https://mcp.vendor.com/mcp
+             fail-on: breaking            # or degraded
+             snapshot-if-missing: "true"
+             version: " @ git+https://github.com/hr7657316/Kintusa-Ai"   # until it is on PyPI
+   ```
+6. **When it fails,** read the table it prints (tool, change, severity, the rule that fired), update your code, then accept the new upstream state. The `--update` run still reports the change (exit `1`); the runs after it pass:
+   ```bash
+   kintsua watch diff --server https://mcp.vendor.com/mcp --name vendor --update
+   ```
+7. **See what drifted lately:** `kintsua watch report --since 7d` prints a Markdown summary from `.kintsua/history.jsonl`.
+
+### Path B: run Kintsua yourself
+
+**Prerequisites:** Python 3.12, [uv](https://docs.astral.sh/uv/), Postgres 16 (local or Docker), Node 20 (for stdio MCP servers), Docker (only for fix PRs), and a public HTTPS URL for GitHub webhooks (a deployment, or a tunnel such as `cloudflared tunnel --url http://localhost:8000` or ngrok while you try it).
+
+1. **Get the code and dependencies.**
+   ```bash
+   git clone https://github.com/hr7657316/Kintusa-Ai && cd Kintusa-Ai
+   uv sync --all-extras
+   cp .env.example .env
+   ```
+2. **Fill in the basics in `.env`:** `DATABASE_URL`, `BASE_URL` (your public URL, the tunnel URL while testing), `ANTHROPIC_API_KEY` (or `LLM_PROVIDER=openai` and `OPENAI_API_KEY`), and a random `SESSION_SECRET` (`openssl rand -hex 32`). Leave the GitHub values empty for now.
+3. **Create the database and load the 90 seeded sources** (Stripe, GitHub, Slack, Jira, Google discovery docs, public MCP servers, popular SDK packages):
+   ```bash
+   make db        # docker run postgres:16, or skip if you have a local server
+   make migrate   # alembic upgrade head
+   make seed      # python -m kintsua.seed
+   ```
+4. **Run the watcher once and read the drift report.** This is the week-one deliverable on its own: it works before any GitHub setup.
+   ```bash
+   make watch     # polls every seeded source, then prints the Markdown report
+   ```
+   Sources that need a token (several MCP servers) show `unconfigured: environment variable X is not set` until you set that variable.
+5. **Start the service** in two terminals (or `scripts/dev.sh`, or `docker compose up --build`):
+   ```bash
+   make api       # http://localhost:8000: landing page, /report/weekly, /healthz
+   make worker    # every background job; re-polls sources every 15 minutes
+   ```
+6. **Create your GitHub App in one click.** Open `BASE_URL/setup/github` and press the button. GitHub creates the App with the right permissions and events and sends you back to a page that shows `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID` and `GITHUB_OAUTH_CLIENT_SECRET`. Copy them into `.env`, set `GITHUB_APP_SLUG` to the App's name, and restart the API and worker.
+7. **Install the App on a repo** from the App's page on GitHub. Within a few minutes the worker clones it and opens the **install issue**: "Kintsua is watching N of your M external dependencies". If nothing appears, see the troubleshooting table below.
+8. **Sign in** at `BASE_URL/login` (GitHub OAuth), then open `BASE_URL/settings`. For local experiments without OAuth: set `ENV=dev` and `DEV_LOGIN_INSTALLATION_ID=<id>` (the number at the end of the App installation's URL on GitHub) and visit `BASE_URL/auth/dev`.
+9. **Decide how issues open.** Every org starts in review mode: matched changes become *draft* issues listed on the settings page under "Changes affecting this repo", and you press "Open all drafts" to post them. To post issues automatically, set `AUTO_ISSUE=true` for every org, or for one org:
+   ```bash
+   psql "$DATABASE_URL" -c "UPDATE org SET settings = settings || '{\"auto_issue\": true}' WHERE name = 'acme'"
+   ```
+   (Use a plain `postgresql://` URL with psql.)
+10. **Turn on fix PRs** (optional). Build the sandbox image, use the Docker backend, and switch the repo to PR mode, either with "Fix mode" on the settings page or in the repo's `.kintsua.yml` (`fix: {mode: pr}`):
+    ```bash
+    make sandbox-image                  # docker build -t kintsua-sandbox:latest
+    # .env: SANDBOX_BACKEND=docker      (the worker needs access to the Docker socket)
+    ```
+    The fixer only opens a PR for renames, new required parameters and SDK major bumps, and only when the repo's own tests pass after the patch. Otherwise it comments on the issue with the reason ([what the fixer refuses](#7-what-the-fixer-refuses)).
+11. **Deploy for real.** `fly.toml` runs one web and two worker processes from one image and runs migrations on release. Set the secrets listed at the top of `fly.toml`. In production the service refuses to start with a weak `SESSION_SECRET` or without S3 storage for large snapshots. See [running it yourself](#10-running-it-yourself) for every setting.
+
+### Path C: use Kintsua on your repo
+
+1. **Install the App** on the repos that contain your agent (an operator from path B gives you the install link). Nothing else is required.
+2. **Read the install issue.** It lists every external dependency Kintsua found: MCP servers from `.mcp.json` and similar configs, SDK packages, and raw HTTP hosts, each with its call-site count and whether it is watched.
+3. **Watch what it missed.** For a grey (unwatched) row, add the vendor's spec, changelog or remote MCP URL, either under "Dependency map" on `BASE_URL/settings/<owner>/<repo>` or in a `.kintsua.yml` at the repo root:
+   ```yaml
+   sources:
+     - kind: openapi
+       url: https://api.vendor.com/openapi.json
+       hosts: [api.vendor.com]
+     - kind: mcp
+       url: https://mcp.vendor.com/mcp
+   ```
+   Stdio MCP servers in your configs are never run by Kintsua; watch them through their npm/PyPI package or with path A's `--push` (step 8).
+4. **When an issue arrives**, it tells you what changed upstream (before and after), when, which files and lines in your repo call it, and how to fix it. Fix it yourself, or let the fixer do it (step 5). Closing the issue marks the change as handled.
+5. **Let Kintsua open fix PRs:** set Fix mode to `pr` on the settings page, or add `fix: {mode: pr, base: main}` to `.kintsua.yml`. Review the PR like any other: its body says what changed, which call sites it touched, and how it was verified (test command, baseline run, static checks). Kintsua never pushes to a protected branch and never force-pushes.
+6. **Silence noise:** add a pattern under "Mute rules" or in `.kintsua.yml` (`mute: [stripe:/v1/legacy/*, tool:debug_*]`). Matching open issues are closed with a comment.
+7. **Report live failures from production** (optional). Create an SDK key under "Runtime SDK key" (it is shown once), then:
+   ```bash
+   pip install "kintsua @ git+https://github.com/hr7657316/Kintusa-Ai"
+   export KINTSUA_KEY=kts_... KINTSUA_REPO=acme/support-agent KINTSUA_URL=https://your-kintsua-host
+   ```
+   ```python
+   import kintsua
+   session = kintsua.wrap_mcp(session)              # an mcp ClientSession
+   client = kintsua.wrap_http(httpx.AsyncClient())  # or a requests.Session
+   kintsua.hook_langchain()                         # or hook_openai_agents() / hook_google_adk()
+   ```
+   Failed calls then show up on open issues ("12 failed calls in the last hour"), and a tool whose schema keeps changing without notice opens its own issue. No arguments or results are sent.
+8. **Push snapshots from CI** (optional), for servers Kintsua cannot reach itself, such as stdio or internal ones: add `--push` to path A's diff step:
+   ```bash
+   kintsua watch diff --server "npx -y @vendor/mcp" --push --repo acme/support-agent
+   # uses KINTSUA_KEY and KINTSUA_URL from the environment
+   ```
+9. **Remove your data** at any time with "Delete data" on the settings page. It deletes the repo's runtime events, dependencies, call sites and impacts; your GitHub issues and PRs stay.
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| No install issue after installing the App | The worker is running; the App's "Advanced" tab on GitHub shows webhook deliveries with status 200 (otherwise `BASE_URL` is not reachable or `GITHUB_WEBHOOK_SECRET` differs); then look at failed jobs: `psql "$DATABASE_URL" -c "select kind, status, last_error from job order by created_at desc limit 20"`. Re-run an index by hand with `uv run python -m kintsua.indexer.run owner/repo`. |
+| A source shows as failing | Its `last_error` on the settings page or in the `source` table says why: an unset token (`unconfigured: ...`), a refused private address, a vanished spec. Failing sources retry with backoff up to 48 hours. |
+| A change was detected but no issue opened | It is a draft: open it from the settings page, or turn on `AUTO_ISSUE`. Only `breaking` and `degraded` changes that touch one of your call sites become issues; the rest are in the weekly report. |
+| No fix PR | The issue has a comment with the reason: not a fixable category, fix mode is `issue_only`, no test command, or validation failed. |
+| SDK events never arrive | `KINTSUA_KEY`, `KINTSUA_REPO` and `KINTSUA_URL` are set in the agent's environment, and the repo is installed in the same org as the key. |
+| `kintsua watch` exits `3` | It could not connect: wrong URL, the server is down, or it needs `--auth-env`. Exit `4` means there is no lockfile yet: run `snapshot` first. |
+| The API or worker will not start in production | The log names the setting: a placeholder `SESSION_SECRET`, or no `S3_BUCKET` (set `DATA_DIR_SHARED=true` only when every process shares one disk). |
+
+## 2. Quick start (the CLI, no account)
 
 `kintsua watch` is the MCP/OpenAPI watcher and the rules classifier packaged as a CLI (Apache 2.0). It snapshots a server's `tools/list` into a lockfile you commit, so a schema change shows up in a PR diff, and it exits non-zero on breaking changes so it can gate a deploy.
 
 ```bash
-pip install kintsua
+pip install "kintsua @ git+https://github.com/hr7657316/Kintusa-Ai"   # until it is published to PyPI
 
 # snapshot: writes .kintsua/<server>.lock.json (tools, inputSchemas, fingerprints)
 kintsua watch snapshot --server https://mcp.vendor.com/mcp
@@ -65,7 +215,7 @@ The hosted product is one flag away: `kintsua watch diff --push --repo owner/nam
 As a GitHub Action:
 
 ```yaml
-- uses: hr7657316/Kintusa-Ai@main
+- uses: hr7657316/Kintusa-Ai@main   # until main exists: @claude/zen-meitner-9zwba3
   with:
     server: https://mcp.vendor.com/mcp
     fail-on: breaking
@@ -73,7 +223,7 @@ As a GitHub Action:
 
 Exit codes: `0` no gate hit, `1` severity at or above `--fail-on`, `2` usage error or an unreadable lockfile (merge-conflict markers, or a lockfile another server wrote under the same `--name`), `3` could not connect (auth required, bad URL, server down), `4` no lockfile yet (run `snapshot`; the GitHub Action does this itself with `snapshot-if-missing: true`). `--auth-env` applies to `--spec` too, sent as `Authorization: Bearer`.
 
-## 2. The GitHub App
+## 3. The GitHub App
 
 GitHub is the whole v0 user interface: install is the signup, the install issue is the dependency map, issues are alerts, PRs are fixes.
 
@@ -87,7 +237,7 @@ Push to the default branch re-indexes with a 5-minute debounce; an impact whose 
 
 The weekly drift report (`/report/weekly`, also RSS and Markdown) lists every change event by severity, the ones that need a human look, sources that have been failing for 7+ days, and the fixer's merged-as-is rate.
 
-## 3. Runtime SDK
+## 4. Runtime SDK
 
 The SDK sees what tools an agent actually calls and whether they still answer the way they did yesterday. Python only in v0, under 500 lines, one wrapper call, no payloads.
 
@@ -110,7 +260,7 @@ Transport: batched every 5 seconds or 100 events to `POST /v1/ingest`, one retry
 
 Server side, `match_runtime` creates `dependency` and `call_site` rows for tools and hosts the indexer never saw (`discovered_at_runtime`), promotes three or more `schema_mismatch` events for a tool within 24 hours with no documented change into a synthetic breaking change event (the vendor changed something they never documented), and attaches error spikes to open issues ("12 failed calls in the last hour").
 
-## 4. `.kintsua.yml`
+## 5. `.kintsua.yml`
 
 Optional, at the repo root. Add sources the indexer missed, mute noisy ones, choose whether PRs open automatically, set the base branch and the test command.
 
@@ -133,7 +283,7 @@ fix:
 test_command: "uv run pytest -q"   # overrides detection (pyproject / package.json / Makefile)
 ```
 
-## 5. Trust and data boundaries
+## 6. Trust and data boundaries
 
 Every watched source records where it came from (`source.origin`), and that decides what the hosted worker does with it:
 
@@ -144,7 +294,7 @@ Every watched source records where it came from (`source.origin`), and that deci
 - **The public weekly report** lists only operator-seeded sources, never a customer's repo, source, issue or PR, and redacts secrets from error text.
 - **Runtime data stays thin:** the SDK sends tool names, latencies, outcomes and schema fingerprints, never arguments or results (keys only with `sample=True`); secrets in error bodies, URLs and paths are redacted on both the client and the server.
 
-## 6. What the fixer refuses
+## 7. What the fixer refuses
 
 The validator is the product: Kintsua never ships a PR whose tests did not run. The fixer leaves an issue (with a comment saying why) and opens no PR when:
 
@@ -159,7 +309,7 @@ The validator is the product: Kintsua never ships a PR whose tests did not run. 
 
 Kintsua never pushes to a protected branch and never force-pushes. Everything it writes is prefixed `[Kintsua]`, labelled `kintsua`, and lives on `kintsua/*` branches so it can be found and reverted.
 
-## 7. Known gaps
+## 8. Known gaps
 
 - **Static indexing is partial by design.** Dynamic tool names built at runtime, URLs assembled from config or other modules, and monorepos with several services are indexed partially (constants are tracked per file; the first literal assignment wins). The runtime SDK closes these gaps by observing real calls.
 - **SDK symbol to HTTP operation equivalence** is table-driven and covers Stripe, Slack, GitHub (PyGithub/Octokit), OpenAI, Anthropic, Notion, HubSpot, Twilio and SendGrid; other SDK call sites match package-level events (major bumps) but not individual OpenAPI operations.
@@ -171,7 +321,7 @@ Kintsua never pushes to a protected branch and never force-pushes. Everything it
 - **Sandbox egress** is a name-level allowlist unless `SANDBOX_HTTPS_PROXY` is set; agent, test and validation steps run with no network at all.
 - No Slack or email alerts, no languages beyond Python and TypeScript, no self-hosting support, no rollback of agent actions (v1).
 
-## 8. Architecture
+## 9. Architecture
 
 One Python monorepo, one Postgres, one FastAPI service, one worker pool. Five components talk through the database and a job queue, never directly to each other, so each can be built and tested alone. The diagrams below are Mermaid; GitHub renders them inline.
 
@@ -439,7 +589,7 @@ Stack: Python 3.12, FastAPI, SQLAlchemy 2 + Alembic, Postgres 16 (also the queue
 
 Scheduling: a self-perpetuating `tick` job every 15 minutes enqueues `poll_source` for due sources (MCP 6h, OpenAPI 24h, packages 6h, changelog 24h; 1h for sources a paying customer depends on), with exponential backoff per failing source up to 48 hours. The weekly report runs on Mondays and the billing sync on the 1st.
 
-## 9. Running it yourself
+## 10. Running it yourself
 
 Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), Postgres 16 (local or Docker), Node 20 for stdio MCP servers and TypeScript checks, Docker for the fixer sandbox in production.
 
@@ -471,7 +621,7 @@ make watch                                 # python -m kintsua.watchers.run --al
 
 Key environment variables (all in `.env.example`): `DATABASE_URL`, `BASE_URL`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_OAUTH_CLIENT_ID/SECRET`, `SESSION_SECRET`, `DATA_DIR_SHARED`, `JOB_LEASE_S`, `WORKER_SHUTDOWN_GRACE_S`, `NET_GUARD`, `POLL_TIMEOUT_S`, `POLL_HTTP_TIMEOUT_S`, `SOURCE_BACKOFF_BASE_S`, `ANTHROPIC_API_KEY`, `AUTO_ISSUE`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID`.
 
-## 10. HTTP API
+## 11. HTTP API
 
 Eleven endpoints from the spec plus the few the CLI and the setup flow need. Everything else happens in GitHub.
 
@@ -496,7 +646,7 @@ Eleven endpoints from the spec plus the few the CLI and the setup flow need. Eve
 | `GET /setup/github` | | GitHub App manifest flow |
 | `GET /healthz`, `GET /` | public | health, landing page |
 
-## 11. Testing
+## 12. Testing
 
 ```bash
 make test        # uv run pytest -q -m "not network"   (~750 tests, under 2 minutes, needs Postgres)
@@ -507,7 +657,7 @@ What the suite covers: every watcher's `diff` against fixture pairs (MCP, OpenAP
 
 Tests marked `network` (real vendor specs, registries, public MCP servers) run on demand: `uv run pytest -m network`.
 
-## 12. Layout
+## 13. Layout
 
 ```
 kintsua/
