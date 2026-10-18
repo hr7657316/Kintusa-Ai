@@ -1,5 +1,7 @@
 # Kintsua
 
+[![PyPI](https://img.shields.io/pypi/v/kintsua)](https://pypi.org/project/kintsua/) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 **Self-maintaining integrations for AI agents.** Kintsua finds every external API and MCP tool an agent repo depends on, watches those upstreams for breaking changes, opens a GitHub issue within an hour of one landing, and opens a tested fix PR for the common cases.
 
 It is a GitHub App plus a hosted watcher, with an open-source CLI (`kintsua watch`) and a runtime SDK (`import kintsua`) that reports failed tool calls and schema drift from production agents.
@@ -48,13 +50,13 @@ Pick the path that matches what you want to do. Each one is a numbered checklist
 | [B. Run Kintsua](#path-b-run-kintsua-yourself) | operate the service: watcher, GitHub App, issues, fix PRs | about an hour | Postgres, a GitHub account, an Anthropic or OpenAI key, Docker for fix PRs |
 | [C. Use it on your repo](#path-c-use-kintsua-on-your-repo) | get issues and fix PRs on your agent repo from a running Kintsua | 5 minutes | a running Kintsua (path B) |
 
-> **Before you start.** The package is not on PyPI yet, so every install below comes straight from GitHub. There is no public hosted instance yet either: paths B and C use the instance you run yourself, and `KINTSUA_URL` points at it.
+> **Before you start.** The CLI and SDK install from PyPI (`pip install kintsua`, Python 3.12+). There is no public hosted instance yet: paths B and C use the instance you run yourself, and `KINTSUA_URL` points at it.
 
 ### Path A: watch an MCP server or API from CI
 
 1. **Install the CLI** (base dependencies only, no server pieces):
    ```bash
-   pip install "kintsua @ git+https://github.com/hr7657316/Kintusa-Ai"
+   pip install kintsua
    kintsua --version
    ```
 2. **Take a snapshot** of the server or spec your agent calls. This writes `.kintsua/<name>.lock.json` with every tool, its input schema and a fingerprint.
@@ -157,7 +159,7 @@ Pick the path that matches what you want to do. Each one is a numbered checklist
 6. **Silence noise:** add a pattern under "Mute rules" or in `.kintsua.yml` (`mute: [stripe:/v1/legacy/*, tool:debug_*]`). Matching open issues are closed with a comment.
 7. **Report live failures from production** (optional). Create an SDK key under "Runtime SDK key" (it is shown once), then:
    ```bash
-   pip install "kintsua @ git+https://github.com/hr7657316/Kintusa-Ai"
+   pip install kintsua
    export KINTSUA_KEY=kts_... KINTSUA_REPO=acme/support-agent KINTSUA_URL=https://your-kintsua-host
    ```
    ```python
@@ -191,7 +193,7 @@ Pick the path that matches what you want to do. Each one is a numbered checklist
 `kintsua watch` is the MCP/OpenAPI watcher and the rules classifier packaged as a CLI (Apache 2.0). It snapshots a server's `tools/list` into a lockfile you commit, so a schema change shows up in a PR diff, and it exits non-zero on breaking changes so it can gate a deploy.
 
 ```bash
-pip install "kintsua @ git+https://github.com/hr7657316/Kintusa-Ai"   # until it is published to PyPI
+pip install kintsua
 
 # snapshot: writes .kintsua/<server>.lock.json (tools, inputSchemas, fingerprints)
 kintsua watch snapshot --server https://mcp.vendor.com/mcp
