@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Self-maintaining integrations for AI agents: watch every external API and MCP tool your agent depends on, detect breaking changes upstream, and open a tested fix PR."
 readme = "README.md"
 license = "Apache-2.0"
-authors = [{ name = "Kintsua" }]
+authors = [{ name = "Himanshu Raj", email = "himanshuraj.tn@gmail.com" }]
 requires-python = ">=3.12"
 keywords = ["mcp", "openapi", "agents", "breaking-changes", "drift"]
 classifiers = [
