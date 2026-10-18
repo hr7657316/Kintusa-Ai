@@ -89,7 +89,7 @@ Pick the path that matches what you want to do. Each one is a numbered checklist
              server: https://mcp.vendor.com/mcp
              fail-on: breaking            # or degraded
              snapshot-if-missing: "true"
-             version: " @ git+https://github.com/hr7657316/Kintusa-Ai"   # until it is on PyPI
+             version: "==0.1.0"                 # optional pin; defaults to latest on PyPI
    ```
 6. **When it fails,** read the table it prints (tool, change, severity, the rule that fired), update your code, then accept the new upstream state. The `--update` run still reports the change (exit `1`); the runs after it pass:
    ```bash
