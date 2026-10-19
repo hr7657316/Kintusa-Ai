@@ -1,9 +1,0 @@
-{% extends "base.html" %}
-{% block title %}{{ title }} · Kintsua{% endblock %}
-{% block content %}
-<section class="narrow">
-  <h1>{{ title }}</h1>
-  <p class="notice notice-error">{{ message }}</p>
-  <p><a href="/">Back to the start</a>{% if user %} · <a href="/settings">Settings</a>{% endif %}</p>
-</section>
-{% endblock %}

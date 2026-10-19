@@ -1,6 +1,0 @@
-{
-  "mcpServers": {
-    "linear": { "url": "https://mcp.linear.app/sse" },
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] }
-  }
-}

@@ -1,13 +1,13 @@
 """Kintsua: self-maintaining integrations for AI agents.
 
 ``import kintsua`` gives you the runtime SDK (``wrap_mcp``, ``wrap_http``, ``hook_*``);
-``kintsua watch`` is the open-source CLI. The hosted service lives in the other
-subpackages and needs ``pip install "kintsua[server]"``.
+``kintsua watch`` is the open-source CLI. The hosted service (GitHub App, indexer,
+matcher, fixer) is a separate, closed-source codebase that builds on this package.
 """
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "__version__",

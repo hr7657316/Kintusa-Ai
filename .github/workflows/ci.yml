@@ -9,22 +9,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: dev
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-    env:
-      TEST_DATABASE_URL: postgresql+psycopg://postgres:dev@localhost:5432/postgres
-      DATABASE_URL: postgresql+psycopg://postgres:dev@localhost:5432/kintsua
-      LLM_PROVIDER: fake
-      SANDBOX_BACKEND: local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -38,45 +22,19 @@ jobs:
         run: uv sync --frozen --all-extras
       - name: Lint
         run: |
-          uv run ruff check kintsua tests scripts alembic/env.py
-          uv run ruff format --check kintsua tests scripts alembic/env.py
-      - name: Migrations apply cleanly
-        run: |
-          uv run python -c "import psycopg; psycopg.connect('postgresql://postgres:dev@localhost:5432/postgres', autocommit=True).execute('CREATE DATABASE kintsua')"
-          uv run alembic upgrade head
-          uv run alembic check
+          uv run ruff check kintsua tests
+          uv run ruff format --check kintsua tests
       - name: Tests
-        run: uv run pytest -q -m "not network" --timeout 600 --durations=15
-
-  smoke:
-    # The real API and worker processes driven over HTTP by a signed webhook, the CLI and the SDK.
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: dev
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-    env:
-      TEST_DATABASE_URL: postgresql+psycopg://postgres:dev@localhost:5432/postgres
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          version: "0.8.17"
-          enable-cache: true
-      - run: uv sync --frozen --all-extras
-      - name: Live end-to-end smoke test
-        run: uv run python scripts/smoke_e2e.py
+        run: uv run pytest -q -m "not network" --timeout 600 --durations=10
+      - name: Package builds and installs clean
+        run: |
+          uv build
+          python3 -m venv /tmp/clean && /tmp/clean/bin/pip install -q dist/*.whl
+          /tmp/clean/bin/kintsua --version
+          /tmp/clean/bin/python -c "import kintsua; kintsua.wrap_http; kintsua.wrap_mcp"
 
   watch-self-test:
-    # The open-source CLI gating a deploy: snapshot a local MCP server and diff it.
+    # The CLI gating a deploy: snapshot a local MCP server and diff it.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

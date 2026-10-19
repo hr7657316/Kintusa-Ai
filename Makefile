@@ -1,40 +1,19 @@
-.PHONY: install db migrate seed api worker watch test smoke lint fmt sandbox-image dev
+.PHONY: install test test-network lint fmt build
 
 install:
 	uv sync --all-extras
 
-db:
-	docker run -d --name kintsua-pg -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=kintsua -p 5432:5432 postgres:16 || docker start kintsua-pg
-
-migrate:
-	uv run alembic upgrade head
-
-seed:
-	uv run python -m kintsua.seed
-
-api:
-	uv run python -m kintsua.api
-
-worker:
-	uv run python -m kintsua.worker
-
-watch:
-	uv run python -m kintsua.watchers.run --all --report
-
 test:
 	uv run pytest -q -m "not network"
 
-smoke:
-	uv run python scripts/smoke_e2e.py
+test-network:
+	uv run pytest -q -m network
 
 lint:
-	uv run ruff check kintsua tests scripts alembic/env.py && uv run ruff format --check kintsua tests scripts alembic/env.py
+	uv run ruff check kintsua tests && uv run ruff format --check kintsua tests
 
 fmt:
-	uv run ruff check --fix kintsua tests scripts alembic/env.py && uv run ruff format kintsua tests scripts alembic/env.py
+	uv run ruff check --fix kintsua tests && uv run ruff format kintsua tests
 
-sandbox-image:
-	docker build -t kintsua-sandbox:latest -f docker/sandbox.Dockerfile docker
-
-dev: migrate seed
-	( uv run python -m kintsua.worker & ) ; uv run python -m kintsua.api
+build:
+	uv build

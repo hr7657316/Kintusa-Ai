@@ -1,4 +1,0 @@
-google-adk>=1.0
-google-genai
-requests>=2.32
-python-dotenv

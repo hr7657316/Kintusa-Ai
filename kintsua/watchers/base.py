@@ -114,7 +114,12 @@ def get_watcher(kind: str) -> BaseWatcher:
             "changelog": "changelog",
         }.get(kind)
         if mod:
-            importlib.import_module(f"kintsua.watchers.{mod}")
+            try:
+                importlib.import_module(f"kintsua.watchers.{mod}")
+            except (
+                ModuleNotFoundError
+            ) as e:  # package / changelog watchers ship with the hosted service
+                raise KeyError(f"source kind {kind!r} is not available in this build") from e
     if kind not in REGISTRY:
         raise KeyError(f"no watcher for source kind {kind!r}")
     return REGISTRY[kind]()

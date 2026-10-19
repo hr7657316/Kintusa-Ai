@@ -1,7 +1,0 @@
-<div id="fix-mode">
-  <p>Effective mode: <strong>{{ fix_mode }}</strong>{% if repo_fix_mode %} <span class="muted small">(set for this repo)</span>{% else %} <span class="muted small">(org default)</span>{% endif %}</p>
-  <form hx-post="/v1/repos/{{ repo.id }}/fix-mode" hx-trigger="change" hx-target="#fix-mode" hx-swap="outerHTML">
-    <label><input type="radio" name="mode" value="issue_only" {% if fix_mode == "issue_only" %}checked{% endif %}> <strong>issue_only</strong> — open an issue per breaking change, never a PR</label><br>
-    <label><input type="radio" name="mode" value="pr" {% if fix_mode == "pr" %}checked{% endif %}> <strong>pr</strong> — also open a tested fix PR for renames, new required parameters and SDK major bumps</label>
-  </form>
-</div>
